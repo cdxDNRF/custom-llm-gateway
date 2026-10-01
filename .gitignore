@@ -16,3 +16,6 @@ scripts/windows/_config.local.bat
 # 凭据与运行时状态兜底（正常情况下在 ~/.dsh-llm-gateway，这里防误放）
 credentials.json
 state.json
+
+# 快捷方式（曾在测试时误入项目目录）
+*.lnk
