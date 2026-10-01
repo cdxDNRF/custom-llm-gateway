@@ -11,6 +11,7 @@
  */
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { CODEBUDDY, WORKBUDDY } from '../../vendor/src/product.js'
 import { createBuddyProvider } from './buddy.js'
 import { createTraeProvider } from './trae.js'
@@ -45,8 +46,35 @@ export interface GatewayConfig {
   /** 数据根目录。 */
   dataDir: string
   logLevel: 'debug' | 'info' | 'warn' | 'error'
+  /**
+   * 总览服务（Web UI + 聚合端点）的监听地址。
+   *
+   * - `127.0.0.1`（默认）：仅本机可访问，最安全。
+   * - `0.0.0.0`：局域网内任意设备（手机 / 平板 / 其他电脑）可访问，
+   *   手机端的 SillyTavern 等客户端因此能接入。
+   *
+   * ⚠️ 改成 `0.0.0.0` 后**必须同时设置 `accessToken`**：网关持有的是你的
+   * 真实账号池与签到积分，同网段任何人都能借道消耗。启动时会强制校验。
+   */
+  host: string
   /** 总览服务（Web UI）端口。 */
   webPort: number
+  /**
+   * 总览服务的访问令牌（`Bearer` 语义）。
+   *
+   * **只对本服务（Web UI + 聚合端点）生效**，与各供应商端口的
+   * `providers[].accessToken` 相互独立。
+   *
+   * 设置为非空后：
+   *   - 聚合端点 `/v1/*` 要求 `Authorization: Bearer <token>`
+   *   - 管理 API `/api/*` 同样要求（否则同网段可任意开关供应商）
+   *   - **来自 `127.0.0.1` / `::1` 的请求豁免**，浏览器打开控制台不会被拦
+   *     （前端会在首次连接时提示输入令牌并存入 localStorage）
+   *
+   * 监听 `0.0.0.0` 时若此字段为空，启动会**自动生成**一个随机令牌并写回
+   * config.json，避免用户无意中把账号池暴露到局域网。
+   */
+  accessToken?: string
   /** 各供应商配置。 */
   providers: Record<string, ProviderEntryConfig>
   /** ZCode captcha 用的浏览器路径（仅 zcode 需要）。 */
@@ -94,7 +122,9 @@ export async function loadConfig(): Promise<GatewayConfig> {
   return {
     dataDir,
     logLevel: parsed.logLevel ?? DEFAULT_CONFIG.logLevel,
+    host: parsed.host ?? DEFAULT_CONFIG.host,
     webPort: parsed.webPort ?? DEFAULT_CONFIG.webPort,
+    ...(parsed.accessToken ? { accessToken: parsed.accessToken } : {}),
     providers,
     ...(parsed.zcodeChromePath ? { zcodeChromePath: parsed.zcodeChromePath } : {}),
   }
@@ -104,10 +134,47 @@ export async function loadConfig(): Promise<GatewayConfig> {
 export const DEFAULT_CONFIG: GatewayConfig = {
   dataDir: '',
   logLevel: 'info',
+  // 默认只听回环：不设 accessToken 也安全。要上局域网请改 host 为 0.0.0.0，
+  // 启动时会强制要求令牌（缺失则自动生成并写回 config.json）。
+  host: '127.0.0.1',
   webPort: 8790,
   providers: Object.fromEntries(
     PROVIDER_CATALOG.map((e) => [e.id, { enabled: e.defaultEnabled, port: e.defaultPort }]),
   ),
+}
+
+/**
+ * 生成一个随机访问令牌（32 字符 hex）。
+ *
+ * 用 `crypto.randomUUID()` 去掉连字符而不是自拼随机数：与项目其它地方
+ * （trae 的 machine_id 生成）保持同一风格，且无需引入依赖。
+ */
+export function generateAccessToken(): string {
+  return randomUUID().replace(/-/g, '')
+}
+
+/**
+ * 把总览服务的 host / accessToken 持久化进 config.json。
+ *
+ * 与 `setProviderEnabled` 同样采用「读-改-写」：该文件同时承载供应商开关，
+ * 整体覆盖会丢掉其它字段。读失败时以默认值为底（首次启动已写过文件，
+ * 这里是兜底）。
+ */
+export function persistOverviewSettings(
+  dataDir: string,
+  patch: { host?: string; accessToken?: string },
+): void {
+  const configPath = configPathFor(dataDir)
+  let config: Record<string, unknown> = {}
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as unknown
+    if (typeof parsed === 'object' && parsed !== null) config = parsed as Record<string, unknown>
+  } catch {
+    // 读不到/损坏：以空对象为底，仅写入本次要改的字段。
+  }
+  if (patch.host !== undefined) config.host = patch.host
+  if (patch.accessToken !== undefined) config.accessToken = patch.accessToken
+  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8')
 }
 
 /** 持久化某个供应商的开关（写入 config.json；重启后生效）。 */

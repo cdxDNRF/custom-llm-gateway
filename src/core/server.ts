@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { collectCompletion, streamChunksToSse, toGenerateOptions, type OpenAiChatRequest } from './protocol.js'
 import { recentLogs } from './logger.js'
+import { lanAddresses } from './net.js'
 import type { Provider } from './provider.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -23,6 +24,11 @@ export interface OverviewServerOptions {
   providers: Provider[]
   port: number
   host?: string
+  /**
+   * 访问令牌（`Bearer` 语义）。非空时管理 API 与聚合端点都要求携带，
+   * **但来自回环地址的请求豁免**（见 `authorized`）。
+   */
+  accessToken?: string
   /** 各供应商的监听端口，用于在 Web UI 上显示接入地址。 */
   providerPorts: Record<string, number>
   /** 数据目录（读写 config.json 实现开关持久化）。 */
@@ -34,6 +40,24 @@ export interface OverviewServerOptions {
 import type { ProviderRuntime } from './provider-runtime.js'
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024
+
+/**
+ * 判断一个远端地址是否属于本机回环。
+ *
+ * 覆盖 Node 可能给出的几种写法：
+ *   - `127.0.0.1` / `127.x.x.x`（整个 127/8 都是回环）
+ *   - `::1`（IPv6 回环）
+ *   - `::ffff:127.0.0.1`（IPv4-mapped IPv6，双栈监听时最常见）
+ *
+ * ⚠️ 不要用 `=== '127.0.0.1'` 判断：在 `host: '0.0.0.0'` 的双栈监听下，
+ * Node 常把本机连接报成 `::ffff:127.0.0.1` 或 `::1`，那样回环豁免会失效。
+ */
+function isLoopback(address: string | undefined): boolean {
+  if (address === undefined) return false
+  if (address === '::1') return true
+  const ipv4 = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address
+  return /^127\./.test(ipv4)
+}
 
 async function readBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
@@ -63,6 +87,7 @@ export class OverviewServer {
   private readonly providers: Provider[]
   private readonly port: number
   private readonly host: string
+  private readonly accessToken: string | undefined
   private readonly providerPorts: Record<string, number>
   private readonly dataDir: string
   private readonly runtime: ProviderRuntime | undefined
@@ -71,6 +96,7 @@ export class OverviewServer {
     this.providers = options.providers
     this.port = options.port
     this.host = options.host ?? '127.0.0.1'
+    this.accessToken = options.accessToken
     this.providerPorts = options.providerPorts
     this.dataDir = options.dataDir
     this.runtime = options.runtime
@@ -78,6 +104,37 @@ export class OverviewServer {
 
   get baseUrl(): string {
     return `http://${this.host}:${this.port}`
+  }
+
+  /**
+   * 是否放行该请求。
+   *
+   * ## 回环豁免（重要）
+   *
+   * 令牌校验**跳过来自 `127.0.0.1` / `::1` 的请求**。原因：控制台前端是静态
+   * 页面，浏览器不可能自动带上令牌；若回环也要令牌，用户在本机打开
+   * `http://127.0.0.1:8790/` 会直接看到 401，连"在哪填令牌"都不知道。
+   *
+   * 安全性没有因此下降：能连到回环的进程本来就已经在本机执行代码，
+   * 那种场景下的防御没有意义。令牌的作用是挡住**局域网内其它设备**。
+   *
+   * ## 支持两种携带方式
+   *
+   * - `Authorization: Bearer <token>`（OpenAI 客户端 / 酒馆 / curl）
+   * - `?token=<token>` 查询参数（便于浏览器直接打开控制台）
+   */
+  private authorized(request: IncomingMessage, url: URL): boolean {
+    if (this.accessToken === undefined) return true
+    if (isLoopback(request.socket.remoteAddress)) return true
+
+    const header = request.headers.authorization
+    if (typeof header === 'string') {
+      const match = /^Bearer\s+(.+)$/i.exec(header.trim())
+      if (match?.[1] === this.accessToken) return true
+    }
+    // 浏览器直开控制台时的退路（前端会把它转存到 localStorage 后重定向）。
+    const queryToken = url.searchParams.get('token')
+    return queryToken === this.accessToken
   }
 
   async start(): Promise<void> {
@@ -135,14 +192,20 @@ export class OverviewServer {
     if (request.method === 'OPTIONS') {
       response.writeHead(204, {
         'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
+        'access-control-allow-methods': 'GET, POST, OPTIONS, DELETE',
         'access-control-allow-headers': 'authorization, content-type',
       })
       response.end()
       return
     }
 
-    // ─────────── 静态前端 ───────────
+    // ─────────── 静态前端（**不加鉴权**）───────────
+    //
+    // 顺序很重要：静态资源必须在鉴权之前返回。否则手机打开
+    // `http://<局域网IP>:8790/` 会直接收到 401 JSON，页面上连"在哪填令牌"
+    // 的入口都没有，用户会以为服务坏了。
+    //
+    // 静态文件只有 HTML/CSS/JS 三个壳，不含任何凭据或账号数据，公开无风险。
     if (request.method === 'GET' && (path === '/' || path === '/index.html')) {
       this.serveFile(response, join(WEB_DIR, 'index.html'), 'text/html; charset=utf-8')
       return
@@ -159,6 +222,19 @@ export class OverviewServer {
         : ext === 'js' ? 'application/javascript; charset=utf-8'
           : 'application/octet-stream'
       this.serveFile(response, join(WEB_DIR, name), mime)
+      return
+    }
+
+    // ─────────── 鉴权（局域网访问时必需；回环豁免）───────────
+    if (!this.authorized(request, url)) {
+      sendJson(response, 401, {
+        error: {
+          message: 'unauthorized: 缺少或错误的访问令牌。'
+            + '请在请求头带上 Authorization: Bearer <token>（令牌见启动日志或 config.json 的 accessToken 字段）。',
+          type: 'unauthorized',
+          code: 'unauthorized',
+        },
+      })
       return
     }
 
@@ -334,7 +410,29 @@ export class OverviewServer {
         return this.describeProvider(p)
       }),
     )
-    sendJson(response, 200, { providers })
+
+    // ── 局域网接入信息（**每次请求实时计算**）──
+    //
+    // ⚠️ 绝对不能在启动时算一次就缓存：校园网 IP 会变（DHCP 续租、换楼层、
+    // 换热点）。缓存下来的旧地址格式完全正常，只是没人应答——用户照着填
+    // 进手机会"静默连不上"，是最难排查的一类问题。
+    //
+    // 所以这里每次请求都重新读网卡，前端 20 秒轮询一次，IP 一变就能看到。
+    const lan = lanAddresses()
+    sendJson(response, 200, {
+      providers,
+      // 手机/平板该填的地址（由服务端探测，浏览器无法得知电脑的网卡 IP）
+      lan: {
+        addresses: lan,
+        port: this.port,
+        host: this.host,
+        // 是否真的开放了局域网（不然前端会提示"仅本机"）
+        exposed: this.host !== '127.0.0.1' && this.host !== 'localhost' && this.host !== '::1',
+        // 令牌固定不变，这里回传给前端便于一键复制（回环访问已通过鉴权，
+        // 且局域网访问本就需要令牌才能拿到本响应）。
+        ...(this.accessToken !== undefined ? { accessToken: this.accessToken } : {}),
+      },
+    })
   }
 
   private async describeProvider(p: Provider): Promise<unknown> {
@@ -357,6 +455,8 @@ export class OverviewServer {
           capabilities: p.capabilities,
           permanentLocked: p.capabilities.permanentLock ? p.permanentLocked() : false,
           port: this.portFor(p.id) ?? null,
+          // ⚠️ 供应商端口按设计**恒绑回环**（见 README 的"只开放聚合端点"决定），
+          // 故这里始终显示 127.0.0.1：局域网访问统一走 8790 聚合端点。
           baseUrl: port !== undefined ? `http://127.0.0.1:${port}/v1` : null,
           accounts,
           ...(accountsError ? { accountsError } : {}),

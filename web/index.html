@@ -15,6 +15,7 @@
   </div>
   <div class="topbar-actions">
     <span id="conn" class="pill pill-muted">连接中…</span>
+    <button id="set-token" class="btn" title="设置/清除访问令牌（局域网访问需要；本机 127.0.0.1 访问可留空）">🔑 令牌</button>
     <button id="checkin-all" class="btn" title="对所有支持签到的供应商各签一次（今天已领的会跳过）">✓ 一键签到</button>
     <button id="refresh-models-all" class="btn" title="从上游重新拉取所有供应商的模型目录">↻ 重拉模型目录</button>
     <button id="refresh-all" class="btn" title="对所有账号执行一次静默续期">续期全部账号</button>
@@ -32,8 +33,11 @@
 
   <section class="panel">
     <div class="panel-head">
-      <h2>接入方式</h2>
-      <p class="hint">把下面的地址填进客户端（OpenCode / Cline / Continue / Cherry Studio…）的 OpenAI 兼容 provider 配置。</p>
+      <h2>接入方式 <span id="lan-updated"></span></h2>
+      <p class="hint">
+        手机 / 平板 / 酒馆请用「🌐 局域网接入」里的地址（IP 实时探测，校园网变化后会自动更新）。
+        本机客户端用 127.0.0.1 的地址。地址与令牌都可点击复制。
+      </p>
     </div>
     <div id="endpoints" class="endpoints"></div>
   </section>

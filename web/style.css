@@ -118,6 +118,26 @@ main { padding: 20px 22px 60px; max-width: 1180px; margin: 0 auto; }
 .endpoint-label { font-size: 13px; }
 .endpoint-note { color: var(--text-dim); font-size: 11.5px; }
 
+/* ── 局域网接入卡片 ── */
+/* 布局要用块级：卡片里有多行说明 + 可复制的地址，flex 居中会把它们挤成一行。 */
+.endpoint-lan { align-items: flex-start; border-color: #2f4a3a; background: #131a16; }
+.endpoint-lan .endpoint-label { color: #9fe3b8; }
+/* 「你正在用的那个地址」高亮——手机打开时最该填的就是它。 */
+.endpoint-current { border-color: #3d7a55; box-shadow: 0 0 0 1px #3d7a5533; }
+.endpoint-warn { align-items: flex-start; border-color: #4a3f24; background: #1a1710; }
+.endpoint-warn .endpoint-label { color: var(--warn); }
+
+/* 可点击复制的地址/令牌 */
+.copyable {
+  cursor: pointer; user-select: all;
+  border-bottom: 1px dashed #4a5570;
+}
+.copyable:hover { color: #d7e0ff; border-bottom-color: #7c8bb5; }
+.copyable:active { background: #232a3a; }
+
+/* 「地址实时探测」时间戳：让用户确信看到的是当前 IP 而非缓存 */
+#lan-updated { color: var(--text-dim); font-size: 11px; font-weight: normal; margin-left: 6px; }
+
 .logs {
   margin: 0; max-height: 300px; overflow: auto;
   background: #0c0e12; border: 1px solid var(--border); border-radius: 8px;

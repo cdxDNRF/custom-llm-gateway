@@ -3,6 +3,61 @@
 
 const $ = (sel) => document.querySelector(sel)
 
+/**
+ * 访问令牌（局域网访问时必需）。
+ *
+ * 三种来源，优先级从高到低：
+ *   1. URL 的 `?token=xxx`（手机首次打开控制台时用，省去手输）
+ *   2. localStorage（之后每次自动带上）
+ *   3. 用户在页面上手动输入
+ *
+ * 命中来源 1 时会立刻转存到 localStorage 并把 URL 里的令牌抹掉——
+ * 避免它留在浏览器历史/收藏里。
+ *
+ * 本机 127.0.0.1 访问时服务端会豁免校验，这里带不带都不影响。
+ */
+const TOKEN_KEY = 'dsh-gateway-token'
+
+function readToken() {
+  try {
+    const fromUrl = new URLSearchParams(location.search).get('token')
+    if (fromUrl) {
+      localStorage.setItem(TOKEN_KEY, fromUrl)
+      // 抹掉地址栏里的令牌，保持 URL 干净（刷新后从 localStorage 读）。
+      const clean = location.pathname + location.hash
+      history.replaceState(null, '', clean)
+      return fromUrl
+    }
+    return localStorage.getItem(TOKEN_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+let accessToken = readToken()
+
+function setToken(value) {
+  accessToken = String(value || '').trim()
+  try {
+    if (accessToken) localStorage.setItem(TOKEN_KEY, accessToken)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    // 隐私模式下 localStorage 可能不可用：退化为仅本次会话有效。
+  }
+}
+
+/** 弹窗让用户输入令牌；返回是否拿到了非空值。 */
+function promptForToken(message) {
+  const current = accessToken
+  const value = window.prompt(
+    message || '请输入访问令牌（局域网访问需要；本机 127.0.0.1 可留空）',
+    current,
+  )
+  if (value === null) return false
+  setToken(value)
+  return accessToken.length > 0
+}
+
 function toast(message, kind = '') {
   const el = $('#toast')
   el.textContent = message
@@ -16,11 +71,29 @@ function toast(message, kind = '') {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { 'content-type': 'application/json' }, ...options })
+  const headers = { 'content-type': 'application/json', ...(options.headers || {}) }
+  if (accessToken) headers.authorization = `Bearer ${accessToken}`
+
+  let response = await fetch(path, { ...options, headers })
+
+  // 401：令牌缺失/错误。提示用户输入一次并重试，避免页面直接显示报错。
+  if (response.status === 401) {
+    const retry = promptForToken('访问令牌无效或缺失，请重新输入（令牌见网关启动日志或 config.json）')
+    if (retry) {
+      response = await fetch(path, {
+        ...options,
+        headers: { ...headers, authorization: `Bearer ${accessToken}` },
+      })
+    }
+  }
+
   const text = await response.text()
   let body
   try { body = text ? JSON.parse(text) : {} } catch { body = { raw: text } }
-  if (!response.ok) throw new Error(body.error || body.message || `HTTP ${response.status}`)
+  if (!response.ok) {
+    const message = body.error?.message || body.error || body.message || `HTTP ${response.status}`
+    throw new Error(typeof message === 'string' ? message : JSON.stringify(message))
+  }
   return body
 }
 
@@ -447,35 +520,128 @@ async function startLogin(provider) {
 
 async function load() {
   try {
-    const { providers } = await api('/api/overview')
+    const { providers, lan } = await api('/api/overview')
     const box = $('#providers')
     box.innerHTML = ''
     for (const provider of providers) box.appendChild(renderProvider(provider))
 
-    const endpoints = $('#endpoints')
-    endpoints.innerHTML = providers.map((p) => `
-      <div class="endpoint">
-        <div>
-          <div class="endpoint-label">${escapeHtml(p.displayName)} <span class="endpoint-note">（独立端点）</span></div>
-          <div class="endpoint-note">模型 id 用裸名，例如 <code style="font-size:11px">glm-5.3</code></div>
-        </div>
-        <code>${escapeHtml(p.baseUrl || '未启动')}</code>
-      </div>
-    `).join('') + `
-      <div class="endpoint">
-        <div>
-          <div class="endpoint-label">聚合端点 <span class="endpoint-note">（一次接入全部）</span></div>
-          <div class="endpoint-note">模型 id 写成 <code style="font-size:11px">供应商/模型</code>，例如 buddy/glm-5.3</div>
-        </div>
-        <code>http://127.0.0.1:${location.port || 8790}/v1</code>
-      </div>
-    `
+    renderEndpoints(providers, lan)
 
     $('#conn').className = 'pill pill-ok'
     $('#conn').textContent = `正常 · ${providers.length} 个供应商`
   } catch {
     $('#conn').className = 'pill pill-err'
     $('#conn').textContent = '网关无响应'
+  }
+}
+
+/** 小工具：把文本放进可点击复制的 <code>（点击即复制，手机上尤其好用）。 */
+function copyable(text, title) {
+  return `<code class="copyable" data-copy="${escapeHtml(text)}" title="${escapeHtml(title || '点击复制')}">${escapeHtml(text)}</code>`
+}
+
+/**
+ * 渲染「接入方式」面板。
+ *
+ * ## 为什么 IP 要从服务端拿
+ *
+ * 浏览器**无法得知运行网关那台电脑的网卡 IP**——`location.hostname` 只是
+ * "当前访问用的地址"。手机通过 `10.198.81.112` 打开时它是局域网 IP，但
+ * 本机用 `127.0.0.1` 打开时它又是回环地址，而手机恰恰需要的是前者。
+ *
+ * 所以地址由服务端 `/api/overview` 实时探测下发（手机不能自己猜）。
+ * 校园网 IP 会变，服务端每次请求都重新读网卡，前端 20 秒轮询一次，
+ * **IP 一变这里就自动更新**，不需要重启网关。
+ */
+function renderEndpoints(providers, lan) {
+  const box = $('#endpoints')
+  const port = (lan && lan.port) || location.port || '8790'
+  const addresses = (lan && Array.isArray(lan.addresses)) ? lan.addresses : []
+  const exposed = Boolean(lan && lan.exposed)
+  const token = (lan && lan.accessToken) || accessToken || ''
+
+  // 当前这个页面是用哪个地址打开的？若是局域网 IP，把它排到最前
+  // （手机打开时，最该填的就是它自己正在用的这个地址）。
+  const currentHost = location.hostname
+  const sorted = [...addresses].sort((a, b) => {
+    if (a.address === currentHost) return -1
+    if (b.address === currentHost) return 1
+    return 0
+  })
+
+  let html = ''
+
+  // ── 局域网接入卡片（核心）──
+  if (!exposed) {
+    html += `
+      <div class="endpoint endpoint-warn">
+        <div>
+          <div class="endpoint-label">局域网接入 <span class="endpoint-note">（当前未开放）</span></div>
+          <div class="endpoint-note">
+            网关正监听 <code style="font-size:11px">${escapeHtml((lan && lan.host) || '127.0.0.1')}</code>，
+            手机等局域网设备无法访问。要在 <code style="font-size:11px">config.json</code>
+            里设置 <code style="font-size:11px">"host": "0.0.0.0"</code> 后重启网关。
+          </div>
+        </div>
+      </div>`
+  } else if (sorted.length === 0) {
+    html += `
+      <div class="endpoint endpoint-warn">
+        <div>
+          <div class="endpoint-label">局域网接入 <span class="endpoint-note">（未找到可用地址）</span></div>
+          <div class="endpoint-note">已开放局域网监听，但没探测到非回环 IPv4 地址。请检查网卡是否已连接。</div>
+        </div>
+      </div>`
+  } else {
+    for (const entry of sorted) {
+      const isCurrent = entry.address === currentHost
+      const base = `http://${entry.address}:${port}`
+      html += `
+        <div class="endpoint endpoint-lan${isCurrent ? ' endpoint-current' : ''}">
+          <div>
+            <div class="endpoint-label">
+              🌐 局域网接入 <span class="endpoint-note">（${escapeHtml(entry.iface || '网卡')}${isCurrent ? ' · 你正在用它' : ''}）</span>
+            </div>
+            <div class="endpoint-note">
+              控制台 ${copyable(`${base}/`, '点击复制控制台地址')}
+              &nbsp;·&nbsp;
+              API 基址 ${copyable(`${base}/v1`, '点击复制 API 基址')}
+            </div>
+            <div class="endpoint-note">
+              模型 id 写成 <code style="font-size:11px">供应商/模型</code>，例如 <code style="font-size:11px">trae/deepseek-v4.1-flash</code>
+            </div>
+            ${token ? `<div class="endpoint-note">API Key 填令牌 ${copyable(token, '点击复制访问令牌')}</div>` : ''}
+          </div>
+        </div>`
+    }
+  }
+
+  // ── 本机接入 ──
+  html += providers.map((p) => `
+    <div class="endpoint">
+      <div>
+        <div class="endpoint-label">${escapeHtml(p.displayName)} <span class="endpoint-note">（独立端点）</span></div>
+        <div class="endpoint-note">模型 id 用裸名，例如 <code style="font-size:11px">glm-5.3</code></div>
+      </div>
+      <code>${escapeHtml(p.baseUrl || '未启动')}</code>
+    </div>
+  `).join('')
+
+  html += `
+    <div class="endpoint">
+      <div>
+        <div class="endpoint-label">聚合端点 <span class="endpoint-note">（本机，一次接入全部）</span></div>
+        <div class="endpoint-note">模型 id 写成 <code style="font-size:11px">供应商/模型</code>，例如 buddy/glm-5.3</div>
+      </div>
+      <code>http://127.0.0.1:${escapeHtml(String(port))}/v1</code>
+    </div>`
+
+  box.innerHTML = html
+
+  // 刷新时间戳：让用户知道地址是实时的（IP 变了会在下一轮自动更新）。
+  const stamp = $('#lan-updated')
+  if (stamp) {
+    stamp.textContent = `地址实时探测 · 更新于 ${new Date().toLocaleTimeString()}`
   }
 }
 
@@ -549,6 +715,49 @@ $('#refresh-all').addEventListener('click', async () => {
   } catch (error) {
     toast(String(error.message || error), 'err')
   }
+})
+
+// ── 点击复制（手机上尤其好用，不用长按选中）──
+document.addEventListener('click', async (event) => {
+  const el = event.target.closest('.copyable')
+  if (!el) return
+  const text = el.dataset.copy || el.textContent || ''
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // clipboard API 在非 HTTPS（如 http://10.x.x.x）下常被浏览器禁用。
+    // 退回到 selection + execCommand，仍能在手机上工作。
+    try {
+      const range = document.createRange()
+      range.selectNodeContents(el)
+      const selection = window.getSelection()
+      selection.removeAllRanges()
+      selection.addRange(range)
+      document.execCommand('copy')
+      selection.removeAllRanges()
+    } catch {
+      toast('复制失败，请手动长按选中', 'err')
+      return
+    }
+  }
+  toast('已复制：' + text, 'ok')
+})
+
+// ── 令牌设置（局域网访问时必需）──
+//
+// 留空表示清除。清除后重新载入，让"连接中…"如实反映当前是否还被拦。
+$('#set-token').addEventListener('click', async () => {
+  const current = accessToken
+  const value = window.prompt(
+    '访问令牌（局域网访问需要；本机 127.0.0.1 访问可留空）\n'
+    + '令牌见网关启动日志，或 config.json 的 accessToken 字段。\n\n'
+    + '留空并确定 = 清除已保存的令牌。',
+    current,
+  )
+  if (value === null) return
+  setToken(value)
+  toast(accessToken ? '令牌已保存' : '令牌已清除', 'ok')
+  await load().catch(() => {})
 })
 
 load()
