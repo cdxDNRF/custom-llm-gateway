@@ -9,7 +9,10 @@ function toast(message, kind = '') {
   el.className = `toast ${kind}`
   el.hidden = false
   clearTimeout(toast._timer)
-  toast._timer = setTimeout(() => { el.hidden = true }, 4200)
+  // 多行内容（批量操作逐条汇报）多留一会儿，否则来不及看；最多 12 秒。
+  const lines = String(message).split('\n').length
+  const ms = Math.min(4200 + Math.max(0, lines - 1) * 700, 12000)
+  toast._timer = setTimeout(() => { el.hidden = true }, ms)
 }
 
 async function api(path, options = {}) {
@@ -504,6 +507,35 @@ $('#refresh-models-all').addEventListener('click', async () => {
     toast(String(error.message || error), 'err')
   } finally {
     button.disabled = false
+  }
+})
+
+$('#checkin-all').addEventListener('click', async () => {
+  const button = $('#checkin-all')
+  button.disabled = true
+  const original = button.textContent
+  button.textContent = '签到中…'
+  try {
+    const { total, claimed, results } = await api('/api/checkin-all', { method: 'POST', body: '{}' })
+    if (total === 0) {
+      toast('没有可签到的供应商（需已启用且支持签到）', 'err')
+      return
+    }
+    // 逐条展示，让「今天已领」「不支持」「失败」一目了然，而不是一个笼统的“完成”。
+    const lines = results.map((r) => {
+      const mark = r.ok ? '✓' : '✗'
+      const what = r.status === 'already-claimed' ? '今天已领' : (r.message || r.status)
+      const amount = r.amount !== undefined ? `（+${r.amount}）` : ''
+      return `${mark} ${r.displayName}${amount}: ${what}`
+    })
+    const failed = results.filter((r) => !r.ok).length
+    toast(`签到完成：${claimed}/${total} 成功\n${lines.join('\n')}`, failed === 0 ? 'ok' : 'err')
+    await load()
+  } catch (error) {
+    toast(String(error.message || error), 'err')
+  } finally {
+    button.disabled = false
+    button.textContent = original
   }
 })
 

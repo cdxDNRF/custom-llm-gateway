@@ -198,6 +198,50 @@ export class OverviewServer {
       return
     }
 
+    // ── 全局一键签到：把所有「支持签到且正在运行」的供应商一次签完 ──
+    //
+    // 各卡片原本已有单家「一键签到」，但用户需要一个总入口（对齐 DSH 插件）。
+    // 语义要点：
+    //   - 只签能签的（capabilities.dailyCheckin 且已启用），不因个别失败中断
+    //   - 汇总每家的 ok/status/message，前端能逐条展示
+    //   - already-claimed 视为成功（幂等：今天已领也算好结果）
+    if (path === '/api/checkin-all' && request.method === 'POST') {
+      const results: {
+        id: string
+        displayName: string
+        ok: boolean
+        status: string
+        message?: string
+        amount?: number
+      }[] = []
+      for (const p of this.liveProviders()) {
+        if (p.capabilities.dailyCheckin !== true) continue
+        try {
+          const r = await p.checkin()
+          results.push({
+            id: p.id,
+            displayName: p.displayName,
+            ok: r.ok,
+            status: r.status,
+            ...(r.message ? { message: r.message } : {}),
+            ...(r.amount !== undefined ? { amount: r.amount } : {}),
+          })
+        } catch (error) {
+          // 单家异常不影响其余。
+          results.push({
+            id: p.id,
+            displayName: p.displayName,
+            ok: false,
+            status: 'failed',
+            message: String(error),
+          })
+        }
+      }
+      const claimed = results.filter((r) => r.ok).length
+      sendJson(response, 200, { ok: true, total: results.length, claimed, results })
+      return
+    }
+
     if (path === '/api/models/refresh-all' && request.method === 'POST') {
       // 一键重拉全部供应商的模型目录（对应「上游更新了模型」的场景）。
       const results: Record<string, unknown> = {}
