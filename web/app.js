@@ -61,20 +61,21 @@ function renderProvider(provider) {
       </div>
       <div class="empty">${escapeHtml(provider.note || '')}</div>
       <div class="card-actions">
-        <button class="btn btn-sm btn-primary" data-act="enableProvider">启用（写配置）</button>
+        <button class="btn btn-sm btn-primary" data-act="enableProvider">启用</button>
       </div>
-      <div class="empty">启用后需重启网关生效；随后在此登录账号。</div>
+      <div class="empty">点击即启用并开始监听，无需重启；随后在此登录账号。</div>
     `
     card.addEventListener('click', async (event) => {
       const button = event.target.closest('button[data-act="enableProvider"]')
       if (!button) return
       button.disabled = true
       try {
-        await api('/api/config/enable', {
+        const result = await api('/api/config/enable', {
           method: 'POST',
           body: JSON.stringify({ id: provider.id, enabled: true }),
         })
-        toast(`${provider.displayName} 已写入配置。请重启网关（Win 端：停止(Win) 后再点 (Win)；WSL 端：stop.sh 后 start.sh）`, 'ok')
+        toast(`${provider.displayName} ${result.note || '已启用'}`, 'ok')
+        await refresh()
       } catch (error) {
         toast(String(error.message || error), 'err')
       } finally {
@@ -102,11 +103,15 @@ function renderProvider(provider) {
         <div class="card-title">${escapeHtml(provider.displayName)}</div>
         <div class="card-id">${escapeHtml(provider.id)} · 端口 ${provider.port ?? '—'}</div>
       </div>
-      ${caps.permanentLock ? `
+      <div class="card-head-right">
+        ${caps.permanentLock ? `
         <label class="switch" title="锁定永久积分：只使用不会过期的积分，避免浪费即将作废的额度">
           <input type="checkbox" data-act="lock" ${provider.permanentLocked ? 'checked' : ''}>
           <span>锁定永久积分</span>
         </label>` : ''}
+        <button class="btn btn-sm btn-danger-ghost" data-act="disableProvider"
+                title="停用后立即释放端口。已登录的账号仍保存在本地，随时可再启用。">停用</button>
+      </div>
     </div>
     <div class="tags">${tags}</div>
     <div class="card-actions">
@@ -181,6 +186,24 @@ function renderProvider(provider) {
     button.disabled = true
     try {
       switch (act) {
+        case 'disableProvider': {
+          // 停用：立即释放端口、停止该供应商（不必重启网关）。
+          // 用 confirm 明确一点：账号数据不会被删，随时可再启用。
+          const okToDisable = confirm(
+            `停用 ${provider.displayName}？\n\n` +
+            `• 立即停止监听并释放端口 ${provider.port ?? ''}\n` +
+            `• 已登录的账号仍保存在本地，重新启用后可直接使用\n` +
+            `• 已接入该端点的客户端会连不上，直到重新启用`,
+          )
+          if (!okToDisable) break
+          const result = await api('/api/config/enable', {
+            method: 'POST',
+            body: JSON.stringify({ id: provider.id, enabled: false }),
+          })
+          toast(`${provider.displayName} ${result.note || '已停用'}`, 'ok')
+          await load()
+          break
+        }
         case 'login': await startLogin(provider); break
         case 'balance':
           expandedView.set(provider.id, 'balance')

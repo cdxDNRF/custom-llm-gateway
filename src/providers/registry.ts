@@ -137,6 +137,36 @@ export function readProviderEnabled(dataDir: string, id: string): boolean | unde
   }
 }
 
+/** 单个供应商的创建工厂（按目录 id）。 */
+function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): (() => Promise<Provider>) | undefined {
+  const table: Record<string, () => Promise<Provider>> = {
+    buddy: () => createBuddyProvider({ product: CODEBUDDY, dataDir: dir, logLevel: level }),
+    workbuddy: () => createBuddyProvider({ product: WORKBUDDY, dataDir: dir, logLevel: level }),
+    trae: () => createTraeProvider({ dataDir: dir, logLevel: level }),
+    qoder: () => createQoderProvider({ dataDir: dir, logLevel: level }),
+    qodercn: () => createQoderCnProvider(dir, level),
+    codearts: () => CodeArtsProvider.create(dir, level),
+    lobsterai: () => createLobsteraiProvider(dir, level),
+    cline: () => createClineProvider(dir, level),
+    loomy: () => createLoomyProvider(dir, level),
+    raccoon: () => createRaccoonProvider(dir, level),
+    minimax: () => createMinimaxProvider(dir, level),
+    zcode: () => createZcodeProvider(dir, level),
+  }
+  return table[id]
+}
+
+/**
+ * 按 id 创建单个供应商（供运行时热启用用）。
+ * 与 createProviders 共用同一张工厂表，避免两处走样。
+ */
+export async function createProviderById(config: GatewayConfig, id: string): Promise<Provider> {
+  if (catalogEntry(id) === undefined) throw new Error(`未知供应商 ${id}`)
+  const factory = factoryFor(id, config.dataDir, config.logLevel)
+  if (factory === undefined) throw new Error(`供应商 ${id} 没有创建工厂`)
+  return factory()
+}
+
 /** 创建全部已启用的供应商。 */
 export async function createProviders(config: GatewayConfig): Promise<Provider[]> {
   const providers: Provider[] = []

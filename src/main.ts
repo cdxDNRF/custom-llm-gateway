@@ -13,6 +13,7 @@
 import { loadConfig, createProviders } from './providers/registry.js'
 import { ProviderServer } from './core/provider-server.js'
 import { OverviewServer } from './core/server.js'
+import { ProviderRuntime } from './core/provider-runtime.js'
 
 async function main(): Promise<void> {
   const config = await loadConfig()
@@ -31,6 +32,9 @@ async function main(): Promise<void> {
     console.warn('⚠️  没有任何已启用的供应商，请检查 config.json 的 providers 段。')
   }
 
+  // ── 运行时管理器（让控制台的启用/停用立即生效，不必重启）──
+  const runtime = new ProviderRuntime(config, providers)
+
   // ── 每个供应商一个独立端点 ──
   const providerServers: ProviderServer[] = []
   const providerPorts: Record<string, number> = {}
@@ -45,6 +49,7 @@ async function main(): Promise<void> {
     try {
       await server.start()
       providerServers.push(server)
+      runtime.attachInitial(provider, server)
       providerPorts[provider.id] = entry.port
     } catch (error) {
       // 端口占用等：不阻塞其余供应商启动。
@@ -58,6 +63,7 @@ async function main(): Promise<void> {
     port: config.webPort,
     providerPorts,
     dataDir: config.dataDir,
+    runtime,
   })
   await overview.start()
 
@@ -75,7 +81,7 @@ async function main(): Promise<void> {
   // ── 定时续期：每 30 分钟（与 DSH 插件一致）──
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000
   const timer = setInterval(() => {
-    for (const provider of providers) {
+    for (const provider of runtime.currentProviders()) {
       void provider.refreshAll().catch((error: unknown) => {
         provider.gateway.logger.warn('定时续期失败:', error)
       })
@@ -88,8 +94,9 @@ async function main(): Promise<void> {
     console.log(`\n收到 ${signal}，正在停止…`)
     clearInterval(timer)
     await overview.stop().catch(() => {})
+    // 逐个停（含运行时热启用起来的那些）——先停监听再 dispose。
+    for (const id of runtime.runningIds()) await runtime.disable(id).catch(() => {})
     for (const server of providerServers) await server.stop().catch(() => {})
-    for (const provider of providers) await provider.dispose().catch(() => {})
     process.exit(0)
   }
   process.on('SIGINT', () => void shutdown('SIGINT'))

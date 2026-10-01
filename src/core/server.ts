@@ -27,7 +27,11 @@ export interface OverviewServerOptions {
   providerPorts: Record<string, number>
   /** 数据目录（读写 config.json 实现开关持久化）。 */
   dataDir: string
+  /** 运行时管理器：让启用/停用立即生效（热插拔）。 */
+  runtime?: ProviderRuntime
 }
+
+import type { ProviderRuntime } from './provider-runtime.js'
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024
 
@@ -55,11 +59,13 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
 
 export class OverviewServer {
   private server: Server | undefined
+  /** 启动时创建的固定集合（无 runtime 时的回落）。 */
   private readonly providers: Provider[]
   private readonly port: number
   private readonly host: string
   private readonly providerPorts: Record<string, number>
   private readonly dataDir: string
+  private readonly runtime: ProviderRuntime | undefined
 
   constructor(options: OverviewServerOptions) {
     this.providers = options.providers
@@ -67,6 +73,7 @@ export class OverviewServer {
     this.host = options.host ?? '127.0.0.1'
     this.providerPorts = options.providerPorts
     this.dataDir = options.dataDir
+    this.runtime = options.runtime
   }
 
   get baseUrl(): string {
@@ -97,8 +104,16 @@ export class OverviewServer {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 
+  /**
+   * 当前**实际在运行**的供应商集合。
+   * 有 runtime 时以它为准（热启用/停用后立即正确）；否则回落启动时集合。
+   */
+  private liveProviders(): Provider[] {
+    return this.runtime?.currentProviders() ?? this.providers
+  }
+
   private findProvider(id: string): Provider | undefined {
-    return this.providers.find((p) => p.id === id)
+    return this.liveProviders().find((p) => p.id === id)
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -140,7 +155,10 @@ export class OverviewServer {
       await this.apiOverview(response)
       return
     }
-    // ── 供应商启动开关（写 config.json；重启后生效）──
+    // ── 供应商启动开关：**立即生效**（热插拔），同时写 config.json 持久化 ──
+    //
+    // 第一版只写配置并要求重启，用户的反馈是「有启用没有关闭」——停用根本
+    // 无处可点。现在真的启停：停用会释放端口，启用会立刻建实例并监听。
     if (path === '/api/config/enable' && request.method === 'POST') {
       const body = await this.safeJson(request)
       const id = String(body.id ?? '')
@@ -151,8 +169,29 @@ export class OverviewServer {
       }
       try {
         const { setProviderEnabled } = await import('../providers/registry.js')
+        const { catalogEntry } = await import('../providers/catalog.js')
+        const entryInfo = catalogEntry(id)
+        if (entryInfo === undefined) {
+          sendJson(response, 400, { error: `未知供应商 ${id}` })
+          return
+        }
+        // 先落盘（重启后仍是用户选的状态），再热切换运行时。
         await setProviderEnabled(this.dataDir, id, enabled)
-        sendJson(response, 200, { ok: true, id, enabled, note: '已写入配置，重启网关后生效' })
+        let applied: 'running' | 'stopped' | 'config-only' = 'config-only'
+        if (this.runtime !== undefined) {
+          if (enabled) {
+            await this.runtime.enable(id)
+            applied = 'running'
+          } else {
+            await this.runtime.disable(id)
+            applied = 'stopped'
+          }
+        }
+        const note =
+          applied === 'running' ? '已启用并立即开始监听'
+          : applied === 'stopped' ? '已停用，端口已释放'
+          : '已写入配置（重启网关后生效）'
+        sendJson(response, 200, { ok: true, id, enabled, applied, note })
       } catch (error) {
         sendJson(response, 400, { error: String(error) })
       }
@@ -162,7 +201,7 @@ export class OverviewServer {
     if (path === '/api/models/refresh-all' && request.method === 'POST') {
       // 一键重拉全部供应商的模型目录（对应「上游更新了模型」的场景）。
       const results: Record<string, unknown> = {}
-      for (const p of this.providers) {
+      for (const p of this.liveProviders()) {
         try {
           results[p.id] = await p.refreshModels()
         } catch (error) {
@@ -217,7 +256,7 @@ export class OverviewServer {
   private async apiOverview(response: ServerResponse): Promise<void> {
     const { PROVIDER_CATALOG } = await import('../providers/catalog.js')
     const { readProviderEnabled } = await import('../providers/registry.js')
-    const byId = new Map(this.providers.map((p) => [p.id, p]))
+    const byId = new Map(this.liveProviders().map((p) => [p.id, p]))
     const providers = await Promise.all(
       PROVIDER_CATALOG.map(async (entry) => {
         const p = byId.get(entry.id)
@@ -437,7 +476,7 @@ export class OverviewServer {
   private async aggregateModels(response: ServerResponse): Promise<void> {
     const data: unknown[] = []
     const created = Math.floor(Date.now() / 1000)
-    for (const provider of this.providers) {
+    for (const provider of this.liveProviders()) {
       try {
         const models = await provider.adapter.listModels(provider.id)
         for (const model of models) {
