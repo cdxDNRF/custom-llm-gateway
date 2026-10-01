@@ -50,6 +50,40 @@ function renderProvider(provider) {
   const card = document.createElement('div')
   card.className = 'card'
 
+  // 未启用的供应商：只有名称/说明/开关，点开关写配置并提示重启
+  if (provider.running === false) {
+    card.innerHTML = `
+      <div class="card-head">
+        <div>
+          <div class="card-title">${escapeHtml(provider.displayName)}</div>
+          <div class="card-id">${escapeHtml(provider.id)} · 端口 ${provider.port}（未启用）</div>
+        </div>
+      </div>
+      <div class="empty">${escapeHtml(provider.note || '')}</div>
+      <div class="card-actions">
+        <button class="btn btn-sm btn-primary" data-act="enableProvider">启用（写配置）</button>
+      </div>
+      <div class="empty">启用后需重启网关生效；随后在此登录账号。</div>
+    `
+    card.addEventListener('click', async (event) => {
+      const button = event.target.closest('button[data-act="enableProvider"]')
+      if (!button) return
+      button.disabled = true
+      try {
+        await api('/api/config/enable', {
+          method: 'POST',
+          body: JSON.stringify({ id: provider.id, enabled: true }),
+        })
+        toast(`${provider.displayName} 已写入配置。请重启网关（Win 端：停止(Win) 后再点 (Win)；WSL 端：stop.sh 后 start.sh）`, 'ok')
+      } catch (error) {
+        toast(String(error.message || error), 'err')
+      } finally {
+        button.disabled = false
+      }
+    })
+    return card
+  }
+
   const caps = provider.capabilities
   const tags = [
     caps.login && 'OAuth 登录',

@@ -25,6 +25,8 @@ export interface OverviewServerOptions {
   host?: string
   /** 各供应商的监听端口，用于在 Web UI 上显示接入地址。 */
   providerPorts: Record<string, number>
+  /** 数据目录（读写 config.json 实现开关持久化）。 */
+  dataDir: string
 }
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -57,12 +59,14 @@ export class OverviewServer {
   private readonly port: number
   private readonly host: string
   private readonly providerPorts: Record<string, number>
+  private readonly dataDir: string
 
   constructor(options: OverviewServerOptions) {
     this.providers = options.providers
     this.port = options.port
     this.host = options.host ?? '127.0.0.1'
     this.providerPorts = options.providerPorts
+    this.dataDir = options.dataDir
   }
 
   get baseUrl(): string {
@@ -136,6 +140,25 @@ export class OverviewServer {
       await this.apiOverview(response)
       return
     }
+    // ── 供应商启动开关（写 config.json；重启后生效）──
+    if (path === '/api/config/enable' && request.method === 'POST') {
+      const body = await this.safeJson(request)
+      const id = String(body.id ?? '')
+      const enabled = body.enabled !== false
+      if (id.length === 0) {
+        sendJson(response, 400, { error: '缺少 id' })
+        return
+      }
+      try {
+        const { setProviderEnabled } = await import('../providers/registry.js')
+        await setProviderEnabled(this.dataDir, id, enabled)
+        sendJson(response, 200, { ok: true, id, enabled, note: '已写入配置，重启网关后生效' })
+      } catch (error) {
+        sendJson(response, 400, { error: String(error) })
+      }
+      return
+    }
+
     if (path === '/api/models/refresh-all' && request.method === 'POST') {
       // 一键重拉全部供应商的模型目录（对应「上游更新了模型」的场景）。
       const results: Record<string, unknown> = {}
@@ -192,8 +215,36 @@ export class OverviewServer {
   }
 
   private async apiOverview(response: ServerResponse): Promise<void> {
+    const { PROVIDER_CATALOG } = await import('../providers/catalog.js')
+    const { readProviderEnabled } = await import('../providers/registry.js')
+    const byId = new Map(this.providers.map((p) => [p.id, p]))
     const providers = await Promise.all(
-      this.providers.map(async (p) => {
+      PROVIDER_CATALOG.map(async (entry) => {
+        const p = byId.get(entry.id)
+        if (p === undefined) {
+          // 未启用的供应商：来自目录，capabilities 用占位（前端只显示开关与说明）
+          return {
+            id: entry.id,
+            displayName: entry.displayName,
+            note: entry.note,
+            enabledInConfig: readProviderEnabled(this.dataDir, entry.id) ?? entry.defaultEnabled,
+            running: false,
+            capabilities: null,
+            port: this.providerPorts[entry.id] ?? entry.defaultPort,
+            baseUrl: null,
+            accounts: [],
+            permanentLocked: false,
+          }
+        }
+        return this.describeProvider(p)
+      }),
+    )
+    sendJson(response, 200, { providers })
+  }
+
+  private async describeProvider(p: Provider): Promise<unknown> {
+    {
+      {
         let accounts: unknown[] = []
         let accountsError: string | undefined
         try {
@@ -204,6 +255,9 @@ export class OverviewServer {
         return {
           id: p.id,
           displayName: p.displayName,
+          note: '',
+          enabledInConfig: true,
+          running: true,
           capabilities: p.capabilities,
           permanentLocked: p.capabilities.permanentLock ? p.permanentLocked() : false,
           port: this.providerPorts[p.id] ?? null,
@@ -211,9 +265,8 @@ export class OverviewServer {
           accounts,
           ...(accountsError ? { accountsError } : {}),
         }
-      }),
-    )
-    sendJson(response, 200, { providers })
+      }
+    }
   }
 
   private async handleProviderAction(

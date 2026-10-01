@@ -57,6 +57,7 @@ async function main(): Promise<void> {
     providers: providers.filter((p) => providerPorts[p.id] !== undefined),
     port: config.webPort,
     providerPorts,
+    dataDir: config.dataDir,
   })
   await overview.start()
 
