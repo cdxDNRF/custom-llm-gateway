@@ -1,0 +1,23 @@
+{
+  "name": "dsh-llm-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地多供应商 LLM 网关：复用 dsh-codearts-auth 的认证/协议层，把 CodeBuddy / WorkBuddy / Trae / Qoder 等包装成 OpenAI 兼容 API",
+  "scripts": {
+    "start": "node src/main.js",
+    "check": "node --check src/main.js"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-credentials": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "jose": "^6.2.8",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "5.9.3"
+  }
+}

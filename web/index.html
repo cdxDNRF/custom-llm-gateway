@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-llm-gateway · 多供应商 LLM 网关</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>dsh-llm-gateway</h1>
+    <span class="sub">本地多供应商 LLM 网关</span>
+  </div>
+  <div class="topbar-actions">
+    <span id="conn" class="pill pill-muted">连接中…</span>
+    <button id="refresh-models-all" class="btn" title="从上游重新拉取所有供应商的模型目录">↻ 重拉模型目录</button>
+    <button id="refresh-all" class="btn" title="对所有账号执行一次静默续期">续期全部账号</button>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>供应商</h2>
+      <p class="hint">每个供应商独立监听一个端口，可直接接入任意 OpenAI 兼容客户端；也可用聚合端点一次接入全部。</p>
+    </div>
+    <div id="providers" class="grid"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>接入方式</h2>
+      <p class="hint">把下面的地址填进客户端（OpenCode / Cline / Continue / Cherry Studio…）的 OpenAI 兼容 provider 配置。</p>
+    </div>
+    <div id="endpoints" class="endpoints"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>运行日志</h2>
+      <p class="hint">最近 300 条（登录、签到、限流切换等都会出现在这里）。</p>
+    </div>
+    <pre id="logs" class="logs"></pre>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# 依赖
+node_modules/
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+
+# vendor 同步的本地状态（备份与来源标记）
+vendor/.backup-*/
+vendor/.upstream-revision
+
+# Windows 本地配置（个人路径覆盖，见 scripts/windows/_config.bat）
+scripts/windows/_config.local.bat
+
+# 凭据与运行时状态兜底（正常情况下在 ~/.dsh-llm-gateway，这里防误放）
+credentials.json
+state.json

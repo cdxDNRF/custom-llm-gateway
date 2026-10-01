@@ -1,0 +1,17 @@
+{
+  "_说明": "复制到 ~/.dsh-llm-gateway/config.json 后按需修改；首次启动会自动生成默认值。",
+
+  "logLevel": "info",
+  "webPort": 8790,
+
+  "_providers说明": "每个供应商独立端口。enabled=false 可关掉；accessToken 设置后该端口要求 Bearer 校验。",
+  "providers": {
+    "buddy":     { "enabled": true, "port": 3901 },
+    "workbuddy": { "enabled": true, "port": 3902 },
+    "trae":      { "enabled": true, "port": 3903 },
+    "qoder":     { "enabled": true, "port": 3904 }
+  },
+
+  "_accessToken示例": "留空表示不校验（仅本机回环时通常可接受，但同机其它程序可借道消耗你的额度）",
+  "_accessToken": "如果你要加校验，写成：\"buddy\": { \"enabled\": true, \"port\": 3901, \"accessToken\": \"你的令牌\" }"
+}
