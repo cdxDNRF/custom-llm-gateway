@@ -43,10 +43,39 @@ DAEMON_PIDFILE=/tmp/dsh-llm-gateway-daemon.pid
 PORT="${GATEWAY_PORT:-8790}"
 HEALTH="http://127.0.0.1:${PORT}/api/overview"
 
-# ① 已经健康 → 什么都不做
+# ① 已经健康 → 判断是不是**本端（WSL）自己**在跑
+#
+# ⚠️ 真实缺陷（2026-10-01）：早期只看 HTTP 是否通，于是**Windows 端**网关在跑时
+# 这里也会打印「网关已在运行」并 exit 0，用户以为 WSL 端起来了，实际那是 Win 端。
+# 两端是同一组端口、互斥的，必须区分：只有「守护 pidfile 活着」才算本端在跑。
 if curl -s -m 2 -o /dev/null "$HEALTH" 2>/dev/null; then
-  echo "网关已在运行：http://127.0.0.1:${PORT}/"
-  exit 0
+  if [ -f "$DAEMON_PIDFILE" ] && kill -0 "$(cat "$DAEMON_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "网关已在运行：http://127.0.0.1:${PORT}/"
+    exit 0
+  fi
+  # 服务通、但本端守护没跑 → 端口被**另一端**（Windows 端）占着。
+  cat >&2 <<EOF
+8790 已被占用，但**不是 WSL 端**在跑 —— 很可能是 Windows 端网关。
+两端共用同一组端口，同时只能运行一个。
+
+  ① 直接用 Windows 端（现在就能用）
+     控制台：http://127.0.0.1:${PORT}/
+
+  ② 改用 WSL 端
+     先在 Windows 上停止：桌面「dsh-llm-gateway 停止(Win)」
+     然后再执行本脚本。
+
+  查看当前是哪一端：Windows 桌面「状态(Win)」，或本机 bash scripts/status.sh。
+EOF
+  exit 1
+fi
+
+# ①b 服务不通但端口被占（对方正在启动/半死状态）→ 直接给同样提示，别盲目拉守护。
+#     用 bash 内建的 /dev/tcp 探测：连得上说明有东西在听（不一定应 HTTP）。
+if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
+  echo "8790 端口被占用，但 HTTP 无响应 —— 可能是另一端正在启动，或残留进程未回收。" >&2
+  echo "请稍等几秒重试；若持续如此，在 Windows 侧检查是否有网关进程。" >&2
+  exit 1
 fi
 
 # ② 守护进程活着但服务没起来 → 等它自己重启（最多 40 秒）

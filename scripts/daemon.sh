@@ -85,6 +85,21 @@ RESTART_DELAY=5
 rapid_failures=0
 
 while true; do
+  # ── 预检端口（真实缺陷，2026-10-01）──
+  #
+  # 早期实现直接拉起 node，撞上 EADDRINUSE 后靠「连续 5 次秒退」兜底 ——
+  # 日志里只留下 5 条 EADDRINUSE 和一句「请看日志排查」，用户不明所以。
+  # 而且刚停掉 Windows 端时，WSL2 的转发端点要几秒才回收，
+  # 这期间启动必然失败（实测）—— 属于**预期内的等待**，不该记为「秒退」。
+  #
+  # 这里先探测 8790：被占就明确说明并等待，不计入秒退。
+  if (exec 3<>"/dev/tcp/127.0.0.1/8790") 2>/dev/null; then
+    exec 3<&- 2>/dev/null || true
+    echo "[daemon $(date '+%F %T')] 8790 已被占用（另一端的网关在跑，或其转发端点尚未回收）—— 等待 10 秒后重试。" >> "$LOG"
+    sleep 10
+    continue
+  fi
+
   started=$(date +%s)
   echo "[daemon $(date '+%F %T')] 启动网关…" >> "$LOG"
   # 用固定的 node 显式执行 tsx（不依赖 .bin/tsx 的 shebang —— 那条 shebang 在
