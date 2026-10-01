@@ -105,6 +105,18 @@ export class OverviewServer {
   }
 
   /**
+   * 某供应商的端口。
+   *
+   * ⚠️ 必须优先问 runtime：`providerPorts` 是 main.ts 启动时的**快照**，
+   * 热启用起来的供应商不在其中——直接读它会得到 undefined，前端就渲染成
+   * 「已启用但没有地址」（端口 —、底部列表显示未启动）。这是实际发生过的 bug。
+   */
+  private portFor(id: string, fallback?: number): number | undefined {
+    if (this.runtime?.isListening(id) === true) return this.runtime.portOf(id)
+    return this.providerPorts[id] ?? fallback
+  }
+
+  /**
    * 当前**实际在运行**的供应商集合。
    * 有 runtime 时以它为准（热启用/停用后立即正确）；否则回落启动时集合。
    */
@@ -313,7 +325,7 @@ export class OverviewServer {
             enabledInConfig: readProviderEnabled(this.dataDir, entry.id) ?? entry.defaultEnabled,
             running: false,
             capabilities: null,
-            port: this.providerPorts[entry.id] ?? entry.defaultPort,
+            port: this.portFor(entry.id, entry.defaultPort),
             baseUrl: null,
             accounts: [],
             permanentLocked: false,
@@ -335,6 +347,7 @@ export class OverviewServer {
         } catch (error) {
           accountsError = String(error)
         }
+        const port = this.portFor(p.id)
         return {
           id: p.id,
           displayName: p.displayName,
@@ -343,8 +356,8 @@ export class OverviewServer {
           running: true,
           capabilities: p.capabilities,
           permanentLocked: p.capabilities.permanentLock ? p.permanentLocked() : false,
-          port: this.providerPorts[p.id] ?? null,
-          baseUrl: this.providerPorts[p.id] ? `http://127.0.0.1:${this.providerPorts[p.id]}/v1` : null,
+          port: this.portFor(p.id) ?? null,
+          baseUrl: port !== undefined ? `http://127.0.0.1:${port}/v1` : null,
           accounts,
           ...(accountsError ? { accountsError } : {}),
         }

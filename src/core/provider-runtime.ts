@@ -105,8 +105,19 @@ export class ProviderRuntime {
     })
   }
 
-  /** 供 overview 查端口：优先看运行时，回落配置。 */
+  /**
+   * 当前端口：**运行中才算**，否则回落配置里的端口（供未启用卡片展示）。
+   *
+   * 为什么要区分：`main.ts` 的 providerPorts 只是启动时的快照，
+   * 热启用起来的供应商不在里面——若 overview 读快照，就会出现
+   * 「running=true 但 port=null」的自相矛盾（用户看到的：已启用却没地址）。
+   */
   portOf(id: string): number | undefined {
     return this.config.providers[id]?.port
+  }
+
+  /** 该供应商此刻是否真的在监听（含热启用起来的）。 */
+  isListening(id: string): boolean {
+    return this.running.has(id)
   }
 }
