@@ -63,15 +63,32 @@ function Show-ErrorBox([string]$message) {
 #
 #   改用「真去 bind 一下」：能绑上才是真空闲。这一判据对 WSL 转发同样成立
 #   （转发不占 Windows 的监听套接字，但占住了绑定能力）。
+#
+# ⚠️ 真实缺陷（2026-10-02 用户报障「win 打不开了」，本次修复）：
+#   上一版只绑 `[IPAddress]::Loopback`（127.0.0.1）来判空闲。而网关自从支持
+#   局域网（host: 0.0.0.0）后监听的是 **0.0.0.0**。在 Windows 上，一个已
+#   监听 0.0.0.0:p 的套接字**不会**阻止再绑 127.0.0.1:p（两者可共存），
+#   于是判据得出「8790 空闲」→ 脚本继续启动第二个实例 → 新实例 bind 0.0.0.0
+#   失败并退出 → 又因为 -WindowStyle Hidden，用户看不到任何输出。
+#   叠加下面那个「启动后就绪校验」的循环：`$proc.HasExited` 为真即 break，
+#   而 `$ready` 仍为 $false → 走到失败分支弹「启动失败」。
+#   用户视角：网关本来好好的在跑，双击启动却弹报错或毫无反应。
+#
+#   修法：两种地址都试着绑一遍，**任一绑不上就算被占用**。
+#   - Any（0.0.0.0）：覆盖「已监听 0.0.0.0」的常规情况
+#   - Loopback：覆盖「已监听 127.0.0.1」的情况（WSL 转发端点、仅回环实例）
+#   注意必须分别 Start/Stop：TcpListener 绑 Any 与绑 Loopback 是两件事。
 function Test-PortBindable([int]$port) {
-    try {
-        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
-        $listener.Start()
-        $listener.Stop()
-        return $true
-    } catch {
-        return $false
+    foreach ($ip in @([System.Net.IPAddress]::Any, [System.Net.IPAddress]::Loopback)) {
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new($ip, $port)
+            $listener.Start()
+            $listener.Stop()
+        } catch {
+            return $false
+        }
     }
+    return $true
 }
 
 # ── 首次运行：装依赖（隐藏窗口执行，等它完成）──
