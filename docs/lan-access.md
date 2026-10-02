@@ -1,16 +1,22 @@
-# 局域网接入：让手机 / 平板用上网关
+# 手机接入网关：局域网 + Tailscale 随处访问
 
-> 目标：手机上的 **SillyTavern（酒馆）**、浏览器或任意 OpenAI 兼容 App，
-> 通过局域网直连电脑上正在跑的网关。2026-10-02 实测通过。
+> 目标：手机 / 平板 / 酒馆（SillyTavern）接入电脑上正在跑的网关。
+> 两种方式：**局域网**（同 Wi-Fi 免费直连）与 **Tailscale**（随处可访问、
+> 不依赖局域网、不暴露公网）。2026-10-02 均实测通过。
 
-## 一句话
+## 两种方式怎么选
 
-把 `config.json` 的 `host` 从 `127.0.0.1` 改成 `0.0.0.0`，重启网关；
-启动日志会打印**局域网地址**和**访问令牌**，把它们填进手机即可。
+| 方式 | 场景 | 手机要装 App 吗 | 公网风险 |
+|---|---|---|---|
+| **局域网**（见一~六章） | 手机和电脑在**同一 Wi-Fi/网段** | 不用 | 无 |
+| **Tailscale**（见七章） | 手机**不在家/不在同一网络**也能用 | 要装 Tailscale | 无（tailnet-only） |
 
-只开放 **8790 聚合端点**（`/v1`）；各供应商端口（3901…）仍锁在回环，缩小暴露面。
+两者可并存，互不影响。**只开放 8790 聚合端点**（`/v1`）；各供应商端口
+（3901…）仍锁在回环，缩小暴露面。
 
 ---
+
+## 一句话（局域网）
 
 ## 一、开起来（两步）
 
@@ -198,12 +204,83 @@ Invoke-WebRequest -Uri 'http://10.198.81.112:8790/' -UseBasicParsing -TimeoutSec
 
 ---
 
-## 七、相关代码位置
+## 七、Tailscale：随处访问（不依赖局域网，零公网风险）
+
+> 手机出门在外、连的是蜂窝数据或别人的 Wi-Fi 时，用这条。**不暴露公网**：
+> 只有登录了你 Tailscale 账号的设备能连。
+
+### 原理
+
+Tailscale 在电脑和手机之间建一条加密的 overlay 网络（tailnet），给你一个
+**固定**的 HTTPS 地址。电脑上跑 `tailscale serve`，把 tailnet 的 443 端口
+反代到本机 8790；手机装上 Tailscale App、登录同一账号后即可访问。
+
+### 1. 电脑端（Windows）一次性配置
+
+Tailscale 已装好且登录后，执行：
+
+```powershell
+tailscale serve --bg --https=443 http://127.0.0.1:8790
+```
+
+用 `tailscale status` 查本机的 tailnet 名字：
+
+```
+100.x.y.z  <你的机器名>  <你的账号>@  windows  -
+```
+
+得到的访问地址是：
+
+```
+https://<你的机器名>.<你的tailnet后缀>.ts.net
+```
+
+> 机器名/后缀/账号以你自己的 `tailscale status` 输出为准，**别照抄示例**。
+> 关掉：`tailscale serve --https=443 off`。
+
+### 2. 手机端
+
+1. 装 **Tailscale** App（App Store / Google Play）
+2. 登录电脑上**同一个账号**（即电脑端 Tailscale 登录的账号）
+3. 打开 Tailscale App，确保能看到这台电脑在线
+
+### 3. 酒馆 / 客户端填法
+
+| 项 | 填什么 |
+|---|---|
+| API 地址 / Base URL | `https://<你的机器名>.<你的tailnet后缀>.ts.net/v1` |
+| API Key | 访问令牌（与局域网同一个） |
+| 模型 | `trae/deepseek-v4.1-flash`（聚合端点带供应商前缀） |
+
+### 4. 实测（2026-10-02）
+
+| 场景 | 结果 |
+|---|---|
+| tailnet URL + 令牌 `/v1/models` | ✅ 200（74 模型） |
+| tailnet URL 无令牌 `/v1/models` | ✅ 401（强制令牌） |
+| tailnet URL 无令牌 `/api/overview` | ✅ 401 |
+| tailnet URL + 令牌 `/api/overview` | ✅ 200 |
+| tailnet URL 真实推理 | ✅ `TAILNET-OK` |
+| 公网（非 tailnet）访问 | ✅ 不可达（零公网暴露） |
+
+### 5. 安全要点
+
+- **用 `serve`，不要用 `funnel`**。`funnel` 会把服务暴露到公网，且实测会
+  绕过鉴权（见下）。
+- 经 Tailscale 反代进来的请求，网关**强制校验令牌**（不会因为来源是
+  127.0.0.1 而豁免——这是 2026-10-02 修掉的安全漏洞，见 [server.ts](src/core/server.ts) 的
+  `isTailscaleForwarded()`）。
+- tailnet 是你自己的私有网络，只有你账号下的设备能进；但令牌仍应妥善保管，
+  不要贴进聊天记录或提交 git。
+
+---
+
+## 八、相关代码位置
 
 | 位置 | 作用 |
 |---|---|
 | `src/providers/registry.ts` | `GatewayConfig.host` / `accessToken` 解析、自动生成令牌、`persistOverviewSettings` |
-| `src/core/server.ts` | `OverviewServer` 的 host 监听、`authorized()`（含回环豁免）、`isLoopback()` |
+| `src/core/server.ts` | `OverviewServer` 的 host 监听、`authorized()`（含回环豁免 + Tailscale 反代识别）、`isLoopback()`、`isTailscaleForwarded()` |
 | `src/main.ts` | 接线配置、`lanAddresses()` 打印局域网地址与令牌 |
 | `web/app.js` | 令牌的三种来源、`api()` 自动带 `Authorization`、401 重试 |
 | `web/index.html` | 顶栏「🔑 令牌」按钮 |
