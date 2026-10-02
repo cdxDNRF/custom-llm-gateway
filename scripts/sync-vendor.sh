@@ -75,6 +75,22 @@ echo "④ 覆盖 vendor/src…"
 rsync -a --delete "$TMP/codearts/src/" "$HERE/vendor/src/"
 echo "$UPSTREAM_HEAD" > "$STAMP"
 
+# ④b 密钥清洗（安全要求，勿删）：
+# 上游的 loomy-product.ts 仍带讯飞 AccessKey 字面量，同步会原样带回来、
+# 随下次提交进公开仓库。这里按**字段形态**强制清空这两个字段 ——
+# 真值由网关从 <数据目录>/loomy.env 或环境变量注入（src/providers/extended.ts）。
+# ⚠️ 本脚本会被提交进仓库，因此**不得**包含真实密钥字面量，只能模式匹配。
+LOOMY_PRODUCT="$HERE/vendor/src/loomy-product.ts"
+if [ -f "$LOOMY_PRODUCT" ]; then
+  sed -i -E "s/(accessKeyId: *')[^']*'/\1'/; s/(accessKeySecret: *')[^']*'/\1'/" "$LOOMY_PRODUCT"
+  if grep -qE "accessKey(Id|Secret): *'[^']+'" "$LOOMY_PRODUCT"; then
+    echo "   ✗ loomy-product.ts 仍含非空 accessKeyId/accessKeySecret 字面量，" >&2
+    echo "     上游格式可能已变化。请手工清空后再提交（防止真实密钥进公开仓库）。" >&2
+    exit 1
+  fi
+  echo "   ✓ loomy-product.ts 密钥字段已确认为空（真值走本地 loomy.env 注入）"
+fi
+
 echo "⑤ 类型检查（自有代码）…"
 if [ ! -x ./node_modules/.bin/tsc ]; then
   echo "   跳过（未装 typescript）"

@@ -11,10 +11,19 @@
  *
  * ## 数据来源
  *
- * - base URL / AccessKey / appId：`C:\Program Files\Loomy\resources\.env.prod`
+ * - base URL / appId：`C:\Program Files\Loomy\resources\.env.prod`
  *   Loomy 官方也只是「随客户端分发 + AES 混淆」，本质同样是公开的。
  * - 兜底模型表：2026-09-26 用本机登录态实测 `GET /api/v1/models` 取得
  *   （11 条中 `type==='chat'` 的 8 条）。
+ *
+ * ## ⚠️ AccessKey 不在本文件里（安全要求）
+ *
+ * AccessKeyId / AccessKeySecret 曾以字面量写在这里，随首次提交进入公开
+ * Git 历史。它们虽来自 Loomy 官方客户端，但属**有效签名密钥**，公开仓库
+ * 不应携带 —— 现已清空，由网关在创建 Loomy provider 时注入：
+ * 见 `src/providers/extended.ts` 的 `loadLoomyAccessKeys`（环境变量或
+ * `<数据目录>/loomy.env`）。`scripts/sync-vendor.sh` 同步上游后会自动
+ * 重新清空本文件的两个密钥字段（上游仍带字面量）。
  *
  * ## ⚠️ AccessKey 的定位
  *
@@ -120,9 +129,10 @@ export const LOOMY: LoomyProduct = {
   displayName: 'Loomy (讯飞)',
   apiBase: LOOMY_API_BASE,
   accountBase: LOOMY_ACCOUNT_BASE,
-  // 取自 `.env.prod`（VITE_XFYUN_ACCESS_KEY_ID / _SECRET / _APP_ID）。
-  accessKeyId: 'REDACTED',
-  accessKeySecret: 'REDACTED',
+  // ⚠️ 密钥不在代码里（见文件头「AccessKey 不在本文件里」）：
+  // 由网关从环境变量 / <数据目录>/loomy.env 注入后使用，此处必须保持空串。
+  accessKeyId: '',
+  accessKeySecret: '',
   appId: 'GM3LOOMY',
   defaultCredentialRef: 'LOOMY_ACCESS_TOKEN',
   fallbackModels: LOOMY_FALLBACK_MODELS,

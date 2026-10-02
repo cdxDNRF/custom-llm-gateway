@@ -123,6 +123,17 @@ http://127.0.0.1:8790/ 提供：
 > 的代码已在 `vendor/` 里，增加新供应商只需照 `src/providers/buddy.ts` 写一个新文件
 > （约 200 行接线代码），**不需要改动 vendor**。
 
+### Loomy（讯飞）密钥配置
+
+Loomy 的讯飞 AccessKey **不在仓库里**（曾硬编码进公开历史，已清除）。
+启用 Loomy 前在数据目录建 `loomy.env`（或设同名环境变量），缺配置时 Loomy 保持禁用、其余供应商不受影响：
+
+```
+# ~/.dsh-llm-gateway/loomy.env
+LOOMY_ACCESS_KEY_ID=你的ID
+LOOMY_ACCESS_KEY_SECRET=你的SECRET
+```
+
 ---
 
 ## 架构
@@ -263,6 +274,7 @@ assistant 消息**必须带 `reasoning_content`**（缺失上游会 400）；工
 npx tsc --noEmit -p tsconfig.json
 
 # 从上游同步 vendor（会覆盖 vendor/src，不要在其中直接改代码）
+# 同步脚本会自动清空上游带入的讯飞密钥字面量并做二次检查（带密钥即中止）
 cd /tmp && rm -rf codearts && git clone --depth 1 https://gitee.com/iJetLi/deepseek-harness-codearts.git codearts
 rsync -a --delete --exclude .git --exclude lib --exclude node_modules \
       /tmp/codearts/src/ ~/dsh-llm-gateway/vendor/src/

@@ -17,5 +17,11 @@ scripts/windows/_config.local.bat
 credentials.json
 state.json
 
+# 运行时数据目录与本地密钥（config.json 曾被误跟踪，已 untrack —— 不要恢复）
+.dsh-llm-gateway/
+loomy.env
+.env
+.env.*
+
 # 快捷方式（曾在测试时误入项目目录）
 *.lnk

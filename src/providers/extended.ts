@@ -8,6 +8,8 @@
  *   - qodercn：与 qoder 同一个 QoderAdapter / QoderAuth，差异全在 QODER_CN 产品配置
  *   - zcode：适配器无注入 mintCaptcha 时自建常驻浏览器（约 200MB）；需 ZCODE_CHROME_PATH
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from '../../vendor/src/account-pool.js'
@@ -300,6 +302,55 @@ export async function createClineProvider(
 
 // ─────────────────────────── Loomy ───────────────────────────
 
+/**
+ * 读取讯飞 AccessKey（Loomy 账号端点 HMAC 签名用）。
+ *
+ * ⚠️ 密钥**不在仓库里**：曾硬编码在 `vendor/src/loomy-product.ts` 并随首次
+ * 提交进入公开历史，现已清空，改为从两处本地配置读取（按序取先到）：
+ *
+ * 1. 环境变量 `LOOMY_ACCESS_KEY_ID` / `LOOMY_ACCESS_KEY_SECRET`
+ * 2. `<数据目录>/loomy.env`（`KEY=VALUE` 行，未跟踪，权限 0600）
+ *
+ * 两处都没有时抛错 —— registry 对单个供应商初始化失败有隔离（只挡 Loomy，
+ * 不影响其它家），缺配置即「Loomy 不可用」，这正是期望行为。
+ *
+ * 注意 `loomy.env` 默认在 `~/.dsh-llm-gateway/`（或 `GATEWAY_HOME` 指向的
+ * 数据目录），而仓库里那份 `.dsh-llm-gateway/config.json` 只在用仓库目录
+ * 作 `GATEWAY_HOME` 时才会被读到 —— 两处互不影响。
+ */
+async function loadLoomyAccessKeys(dataDir: string): Promise<{ id: string; secret: string }> {
+  const fromEnv = process.env.LOOMY_ACCESS_KEY_ID ?? ''
+  const fromEnvSecret = process.env.LOOMY_ACCESS_KEY_SECRET ?? ''
+  if (fromEnv.length > 0 && fromEnvSecret.length > 0) {
+    return { id: fromEnv, secret: fromEnvSecret }
+  }
+
+  const envPath = resolve(dataDir, 'loomy.env')
+  try {
+    const lines = readFileSync(envPath, 'utf8').split(/\r?\n/)
+    const values = new Map<string, string>()
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed.length === 0 || trimmed.startsWith('#')) continue
+      const eq = trimmed.indexOf('=')
+      if (eq <= 0) continue
+      const key = trimmed.slice(0, eq).trim()
+      const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+      if (key.length > 0) values.set(key, value)
+    }
+    const id = values.get('LOOMY_ACCESS_KEY_ID') ?? ''
+    const secret = values.get('LOOMY_ACCESS_KEY_SECRET') ?? ''
+    if (id.length > 0 && secret.length > 0) return { id, secret }
+  } catch {
+    // 文件不存在：走下方统一报错。
+  }
+
+  throw new Error(
+    'Loomy 讯飞 AccessKey 未配置（LOOMY_ACCESS_KEY_ID / LOOMY_ACCESS_KEY_SECRET）。'
+    + `请在 ${envPath} 写入 KEY=VALUE 两行，或设置同名环境变量；未配置时 Loomy 保持禁用。`,
+  )
+}
+
 export async function createLoomyProvider(
   dataDir: string,
   logLevel?: 'debug' | 'info' | 'warn' | 'error',
@@ -310,6 +361,10 @@ export async function createLoomyProvider(
   const { LOOMY } = await import('../../vendor/src/loomy-product.js')
   const { claimLoomyDailyQuota, fetchLoomyCreditBalance } = await import('../../vendor/src/loomy-credits.js')
   const { parseLoomyRemoteModels } = await import('../../vendor/src/loomy-adapter.js')
+  // 密钥必须先于任何 Auth/Adapter 构造注入（它们拿到的 product 引用是共享的）。
+  const keys = await loadLoomyAccessKeys(dataDir)
+  LOOMY.accessKeyId = keys.id
+  LOOMY.accessKeySecret = keys.secret
   const auth = new LoomyAuth(gateway.ctx as never, { product: LOOMY })
   const adapter = new LoomyAdapter({
     credentialRef: credentialRef(LOOMY.defaultCredentialRef),
