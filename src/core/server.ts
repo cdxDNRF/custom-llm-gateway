@@ -109,14 +109,23 @@ export class OverviewServer {
   /**
    * 是否放行该请求。
    *
-   * ## 回环豁免（重要）
+   * ## 回环豁免（重要，且必须谨慎）
    *
    * 令牌校验**跳过来自 `127.0.0.1` / `::1` 的请求**。原因：控制台前端是静态
    * 页面，浏览器不可能自动带上令牌；若回环也要令牌，用户在本机打开
    * `http://127.0.0.1:8790/` 会直接看到 401，连"在哪填令牌"都不知道。
    *
-   * 安全性没有因此下降：能连到回环的进程本来就已经在本机执行代码，
-   * 那种场景下的防御没有意义。令牌的作用是挡住**局域网内其它设备**。
+   * ⚠️ **Tailscale serve 与 Funnel 的反代都以 127.0.0.1 转发到本机**，会让
+   * 远程请求的 `remoteAddress` 变成回环地址。若无条件按回环放行，等于给
+   * 经 Tailscale 进来的请求**全部免令牌**——这是真实发生过的漏洞（实测：
+   * 匿名经 Funnel 访问 /v1/models 与 /api/overview 均返回 200）。
+   *
+   * 因此回环豁免必须叠加一个判据：**带 Tailscale 身份头（Tailscale-User-Login）
+   * 的请求是经 Tailscale 反代转发来的远程请求，不得享受回环豁免**，必须走
+   * 令牌校验。这样：
+   *   - 本机直接访问（127.0.0.1，无身份头）→ 豁免，浏览器免令牌开控制台
+   *   - 经 Tailscale serve/funnel 进来（带身份头，哪怕 remoteAddress 是回环）
+   *     → 强制令牌
    *
    * ## 支持两种携带方式
    *
@@ -125,7 +134,9 @@ export class OverviewServer {
    */
   private authorized(request: IncomingMessage, url: URL): boolean {
     if (this.accessToken === undefined) return true
-    if (isLoopback(request.socket.remoteAddress)) return true
+    // 带 Tailscale 身份头 = 远程转发来的请求，不享受回环豁免。
+    const isTailscaleForwarded = this.isTailscaleForwarded(request)
+    if (isLoopback(request.socket.remoteAddress) && !isTailscaleForwarded) return true
 
     const header = request.headers.authorization
     if (typeof header === 'string') {
@@ -135,6 +146,22 @@ export class OverviewServer {
     // 浏览器直开控制台时的退路（前端会把它转存到 localStorage 后重定向）。
     const queryToken = url.searchParams.get('token')
     return queryToken === this.accessToken
+  }
+
+  /**
+   * 请求是否经 Tailscale 反代（serve 或 funnel）转发而来。
+   *
+   * tailscaled 反代时会在请求头注入 Tailscale 身份信息，实测字段：
+   *   `Tailscale-Headers-Info`, `Tailscale-User-Login`, `Tailscale-User-Name`,
+   *   `X-Forwarded-For`, `X-Forwarded-Proto` 等。
+   *
+   * 判据用 `Tailscale-User-Login`（存在即代表经 Tailscale 转发、有身份）。
+   * 注意 Funnel（公网匿名）访问**不带** User-Login，但 B-1 方案只开 serve
+   * （tailnet-only），公网根本进不来，所以这里只需覆盖 serve 场景。
+   * 若将来再开 funnel，需另行按「缺身份头 + 反代来源」补强。
+   */
+  private isTailscaleForwarded(request: IncomingMessage): boolean {
+    return request.headers['tailscale-user-login'] !== undefined
   }
 
   async start(): Promise<void> {
