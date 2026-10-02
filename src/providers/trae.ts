@@ -271,7 +271,7 @@ export class TraeProvider implements Provider {
     await this.pool.reorderAccounts(this.id, orderedIds)
   }
 
-  async resetRateLimits(accountId?: string): Promise<{ clearedCount: number; accountCount: number }> {
+  async resetRateLimits(accountId?: string): Promise<RetestResult> {
     return resetLimits(this.pool, this.id, accountId)
   }
 

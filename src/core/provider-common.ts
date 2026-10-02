@@ -8,8 +8,33 @@
  */
 import type { AccountPool } from '../../vendor/src/account-pool.js'
 import type { ProviderAccountEntry } from '../../vendor/src/types.js'
-import { retestAccount, resetAccount, resetAllAccounts, retestAllAccounts } from '../../vendor/src/account-probe.js'
+import { retestAccount, retestAllAccounts } from '../../vendor/src/account-probe.js'
 import type { ModelView, RetestResult } from './provider.js'
+
+/**
+ * 从限流报错文案里兜底解析出重置时刻。
+ *
+ * ## 为什么需要它
+ *
+ * vendor 的 `parseRateLimitError` 先 `JSON.parse(body)`，而腾讯侧限流报错常是
+ * **纯文本**（如 `buddy: 您的使用量已超出频率限制，将在 2026-10-02 12:55:34
+ * UTC+8 重置…`）——JSON.parse 抛异常后，因探测路径没传 status，最终返回 null，
+ * 重置时刻丢失（前端显示「仍受限但无时间」）。
+ *
+ * 但文案里**其实带着完整时间**。这里用同一套正则从 message 文本里抠出来，
+ * 与 vendor 的 `RESET_TIME_PATTERN` 保持同构（见 llm-adapter.ts）。
+ *
+ * 返回毫秒时间戳；解析不到返回 undefined（调用方保留原值或显示「无时间」）。
+ */
+const RESET_TIME_IN_MESSAGE = /(?:将在|reset at)\s+([\d-]+\s+[\d:]+)\s+(UTC[+-]\d+(?::\d+)?)/i
+
+function extractResetTimeFromMessage(message: string | undefined): number | undefined {
+  if (message === undefined) return undefined
+  const m = RESET_TIME_IN_MESSAGE.exec(message)
+  if (!m) return undefined
+  const ms = Date.parse(`${m[1]} ${m[2]}`)
+  return Number.isNaN(ms) ? undefined : ms
+}
 
 /** 适配器里 `listAllModels()` 的返回形状（不受黑名单影响）。 */
 interface AdapterWithAllModels {
@@ -119,16 +144,80 @@ export async function refreshModels(
   return { count: models.length }
 }
 
-/** 重置限流标记（accountId 省略时重置该供应商全部账号）。 */
+/**
+ * 强制重测：先清掉本地限流标记，再立刻对受限模型**真实发一次请求**。
+ *
+ * ## 为什么需要它（用户报障 2026-10-02）
+ *
+ * 旧的「重置限流标记」只删本地记录，但**限流状态在腾讯/字节等服务端**，
+ * 客户端没有任何 API 能解除。于是出现用户描述的循环：
+ *
+ *   点重置（标记消失）→ 调用 → 上游仍回 429 → 适配器把标记写回 → UI 又显示限流
+ *
+ * 按钮给的是"已重置"的成功提示，实际什么都没改变——误导且无法自救。
+ *
+ * 本函数把动作改成诚实版本：清标记后**立刻重测**，让上游来裁决——
+ *   - 真恢复了 → 标记保持清除，账号立即可用；
+ *   - 仍受限   → 标记写回**上游给出的最新重置时刻**，前端如实展示
+ *                「该模型仍受限，何时恢复」，不再假装重置成功。
+ */
 export async function resetLimits(
   pool: AccountPool,
   provider: string,
   accountId?: string,
-): Promise<{ clearedCount: number; accountCount: number }> {
-  const result = accountId === undefined
-    ? await resetAllAccounts(pool as never, provider)
-    : await resetAccount(pool as never, accountId)
-  return { clearedCount: result.clearedCount, accountCount: result.accountCount }
+): Promise<RetestResult> {
+  // ① 记下当前所有「账号 × 受限模型」——这是本轮要真测的清单。
+  const targets = new Map<string, string[]>()
+  for (const entry of pool.listAccountsByProvider(provider)) {
+    if (accountId !== undefined && entry.id !== accountId) continue
+    const models = Object.keys(entry.modelRateLimits ?? {})
+    if (models.length > 0) targets.set(entry.id, models)
+  }
+  if (targets.size === 0) {
+    return { accounts: [], clearedCount: 0, stillLimitedCount: 0 }
+  }
+
+  // ② 清掉这些标记。目的有二：
+  //    a) `getAvailableAccount` 不再把账号藏起来——重测路径与真实调用路径一致；
+  //    b) 重测结束后若确实恢复，标记保持清除（而不是残留旧时刻）。
+  for (const [id, models] of targets) {
+    await pool.clearModelRateLimits(id, models)
+  }
+
+  // ③ 触发真实探测。vendor 的 `retestAccount` 以 entry.modelRateLimits 为
+  //    待测清单（现在已被清空，直接调它会测不到东西），所以先把清单**写回**，
+  //    让它对这些模型逐一发真实请求；它自己会在测完后：
+  //    通过 → 清除；仍受限 → 写回上游给出的最新重置时刻（滚动语义）。
+  //    这正好就是本函数要的语义，无需在网关层复制探测实现。
+  for (const [id, models] of targets) {
+    for (const modelId of models) {
+      await pool.updateModelRateLimit(id, modelId, Date.now()) // 立即到期占位
+    }
+  }
+  const accounts: RetestResult['accounts'] = []
+  for (const [id] of targets) {
+    const r = await retestAccount(pool as never, id)
+    accounts.push({
+      accountId: r.accountId,
+      ...(r.nickname !== undefined ? { nickname: r.nickname } : {}),
+      tested: r.tested,
+      cleared: r.cleared,
+      stillLimited: r.stillLimited.map((m) => ({
+        modelId: m.modelId,
+        ...(m.message !== undefined ? { message: m.message } : {}),
+        ...(() => {
+          const t = m.resetTimeMs ?? extractResetTimeFromMessage(m.message)
+          return t !== undefined ? { resetTimeMs: t } : {}
+        })(),
+      })),
+      ...(r.error !== undefined ? { error: r.error } : {}),
+    })
+  }
+  return {
+    accounts,
+    clearedCount: accounts.reduce((sum, a) => sum + a.cleared.length, 0),
+    stillLimitedCount: accounts.reduce((sum, a) => sum + a.stillLimited.length, 0),
+  }
 }
 
 /**
@@ -158,7 +247,14 @@ export async function retest(
       stillLimited: a.stillLimited.map((m) => ({
         modelId: m.modelId,
         ...(m.message !== undefined ? { message: m.message } : {}),
-        ...(m.resetTimeMs !== undefined ? { resetTimeMs: m.resetTimeMs } : {}),
+        // ⚠️ vendor 的 parseRateLimitError 在纯文本报错（非 JSON 体）上会
+        // 丢失重置时刻（JSON.parse 抛异常 → 没传 status → 返回 null）。但
+        // 上游文案里其实带着完整时间（「将在 YYYY-MM-DD HH:mm:ss UTC±x 重置」）。
+        // 这里兜底解析，避免前端把「仍受限但无重置时间」显示成空白。
+        ...(() => {
+          const t = m.resetTimeMs ?? extractResetTimeFromMessage(m.message)
+          return t !== undefined ? { resetTimeMs: t } : {}
+        })(),
       })),
       ...(a.error !== undefined ? { error: a.error } : {}),
     })),

@@ -201,7 +201,7 @@ function renderProvider(provider) {
     <div class="more" data-role="more" hidden>
       <button class="btn btn-sm" data-act="refreshModels">重拉模型目录</button>
       <button class="btn btn-sm" data-act="retest">重测账号</button>
-      <button class="btn btn-sm" data-act="reset">重置限流标记</button>
+      <button class="btn btn-sm" data-act="reset">强制重测限流</button>
       <button class="btn btn-sm" data-act="enableAllModels">全部模型启用</button>
       <button class="btn btn-sm" data-act="disableAllModels">全部模型停用</button>
     </div>
@@ -324,8 +324,21 @@ function renderProvider(provider) {
           break
         }
         case 'reset': {
+          toast('强制重测中：清标记后立刻对受限模型真实发一次请求…')
           const { result } = await api(`/api/p/${provider.id}/accounts/reset`, { method: 'POST', body: '{}' })
-          toast(`已重置 ${result.clearedCount} 条限流标记`, 'ok')
+          const cleared = result.clearedCount ?? 0
+          const still = result.stillLimitedCount ?? 0
+          if (still === 0) {
+            toast(`重测完成：${cleared} 个模型已恢复可用`, 'ok')
+          } else {
+            const parts = (result.accounts || []).flatMap((a) =>
+              (a.stillLimited || []).map((m) => {
+                const t = m.resetTimeMs ? `（至 ${fmtTime(m.resetTimeMs)}）` : ''
+                return `${m.modelId}${t}`
+              }),
+            )
+            toast(`仍受限 ${still} 个（上游未放行，无法强制解除）：\n${parts.join('\n')}`, 'err')
+          }
           await load()
           break
         }
