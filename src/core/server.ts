@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { collectCompletion, streamChunksToSse, toGenerateOptions, type OpenAiChatRequest } from './protocol.js'
 import { recentLogs } from './logger.js'
 import { lanAddresses } from './net.js'
+import { corsHeaders } from './cors.js'
 import type { Provider } from './provider.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -217,11 +218,7 @@ export class OverviewServer {
     const path = url.pathname
 
     if (request.method === 'OPTIONS') {
-      response.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS, DELETE',
-        'access-control-allow-headers': 'authorization, content-type',
-      })
+      response.writeHead(204, corsHeaders(request))
       response.end()
       return
     }

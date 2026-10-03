@@ -18,6 +18,7 @@ import {
   type OpenAiChatRequest,
 } from './protocol.js'
 import type { Provider } from './provider.js'
+import { corsHeaders } from './cors.js'
 
 export interface ProviderServerOptions {
   provider: Provider
@@ -127,11 +128,7 @@ export class ProviderServer {
     const url = new URL(request.url ?? '/', this.baseUrl)
 
     if (request.method === 'OPTIONS') {
-      response.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'authorization, content-type',
-      })
+      response.writeHead(204, corsHeaders(request))
       response.end()
       return
     }
