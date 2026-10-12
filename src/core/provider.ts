@@ -156,10 +156,11 @@ export interface Provider {
   reorderAccounts(orderedIds: readonly string[]): Promise<void>
 
   /**
-   * 重置账号的限流标记：**清标记后立刻对受限模型真实发一次请求**，
-   * 用上游的裁决决定是否真恢复。返回与 {@link retest} 同构的结果。
+   * 重置账号的限流标记：**只清本地标记、不发请求**（零额度消耗）。
+   *
+   * 想用上游裁决来判断"是否真的解禁"请用 {@link retest}——它才发真实请求。
    */
-  resetRateLimits(accountId?: string): Promise<RetestResult>
+  resetRateLimits(accountId?: string): Promise<{ clearedCount: number; accountCount: number }>
 
   /** 重测账号：对带限流标记的模型真实发一次最小请求，判断是否真的还受限。 */
   retest(accountId?: string): Promise<RetestResult>

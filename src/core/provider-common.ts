@@ -145,79 +145,41 @@ export async function refreshModels(
 }
 
 /**
- * 强制重测：先清掉本地限流标记，再立刻对受限模型**真实发一次请求**。
+ * 重置限流标记：**只清本地标记，不发任何请求**。
  *
- * ## 为什么需要它（用户报障 2026-10-02）
+ * ## 与 {@link retest} 的分工（用户要求，2026-10-12）
  *
- * 旧的「重置限流标记」只删本地记录，但**限流状态在腾讯/字节等服务端**，
- * 客户端没有任何 API 能解除。于是出现用户描述的循环：
+ * 曾经本函数被改成「清标记 + 立刻强制重测」，因为只清标记会被上游立刻
+ * 写回（限流状态在服务端，客户端解不掉）。但那样**每次重置都真实消耗一次
+ * 上游额度**，只想快速清个标记时代价过大。
  *
- *   点重置（标记消失）→ 调用 → 上游仍回 429 → 适配器把标记写回 → UI 又显示限流
+ * 现在是两个独立动作，各司其职：
+ *   - **本函数（重置）**：秒级完成、零额度消耗。适用于「我要让账号重新参与
+ *     选号」——若上游其实已解禁，下次调用即可成功；若仍受限，调用时会自动
+ *     重新记账（标记回来是**正确行为**，不是 bug）。
+ *   - **`retest()`（重测）**：真实发请求，用上游裁决决定是否解除。适用于
+ *     「不确定到底解没解禁」。
  *
- * 按钮给的是"已重置"的成功提示，实际什么都没改变——误导且无法自救。
- *
- * 本函数把动作改成诚实版本：清标记后**立刻重测**，让上游来裁决——
- *   - 真恢复了 → 标记保持清除，账号立即可用；
- *   - 仍受限   → 标记写回**上游给出的最新重置时刻**，前端如实展示
- *                「该模型仍受限，何时恢复」，不再假装重置成功。
+ * ⚠️ 用户须知：重置后若立刻又被标记，说明**上游确实还在限流**，只能等到
+ * 上游给的重置时刻。这是服务端状态，不是网关能绕过的。
  */
 export async function resetLimits(
   pool: AccountPool,
   provider: string,
   accountId?: string,
-): Promise<RetestResult> {
-  // ① 记下当前所有「账号 × 受限模型」——这是本轮要真测的清单。
-  const targets = new Map<string, string[]>()
-  for (const entry of pool.listAccountsByProvider(provider)) {
+): Promise<{ clearedCount: number; accountCount: number }> {
+  const entries = pool.listAccountsByProvider(provider)
+  let clearedCount = 0
+  let accountCount = 0
+  for (const entry of entries) {
     if (accountId !== undefined && entry.id !== accountId) continue
-    const models = Object.keys(entry.modelRateLimits ?? {})
-    if (models.length > 0) targets.set(entry.id, models)
-  }
-  if (targets.size === 0) {
-    return { accounts: [], clearedCount: 0, stillLimitedCount: 0 }
-  }
-
-  // ② 清掉这些标记。目的有二：
-  //    a) `getAvailableAccount` 不再把账号藏起来——重测路径与真实调用路径一致；
-  //    b) 重测结束后若确实恢复，标记保持清除（而不是残留旧时刻）。
-  for (const [id, models] of targets) {
-    await pool.clearModelRateLimits(id, models)
-  }
-
-  // ③ 触发真实探测。vendor 的 `retestAccount` 以 entry.modelRateLimits 为
-  //    待测清单（现在已被清空，直接调它会测不到东西），所以先把清单**写回**，
-  //    让它对这些模型逐一发真实请求；它自己会在测完后：
-  //    通过 → 清除；仍受限 → 写回上游给出的最新重置时刻（滚动语义）。
-  //    这正好就是本函数要的语义，无需在网关层复制探测实现。
-  for (const [id, models] of targets) {
-    for (const modelId of models) {
-      await pool.updateModelRateLimit(id, modelId, Date.now()) // 立即到期占位
+    const cleared = await pool.clearModelRateLimits(entry.id)
+    if (cleared > 0) {
+      clearedCount += cleared
+      accountCount++
     }
   }
-  const accounts: RetestResult['accounts'] = []
-  for (const [id] of targets) {
-    const r = await retestAccount(pool as never, id)
-    accounts.push({
-      accountId: r.accountId,
-      ...(r.nickname !== undefined ? { nickname: r.nickname } : {}),
-      tested: r.tested,
-      cleared: r.cleared,
-      stillLimited: r.stillLimited.map((m) => ({
-        modelId: m.modelId,
-        ...(m.message !== undefined ? { message: m.message } : {}),
-        ...(() => {
-          const t = m.resetTimeMs ?? extractResetTimeFromMessage(m.message)
-          return t !== undefined ? { resetTimeMs: t } : {}
-        })(),
-      })),
-      ...(r.error !== undefined ? { error: r.error } : {}),
-    })
-  }
-  return {
-    accounts,
-    clearedCount: accounts.reduce((sum, a) => sum + a.cleared.length, 0),
-    stillLimitedCount: accounts.reduce((sum, a) => sum + a.stillLimited.length, 0),
-  }
+  return { clearedCount, accountCount }
 }
 
 /**

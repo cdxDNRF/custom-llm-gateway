@@ -201,7 +201,7 @@ function renderProvider(provider) {
     <div class="more" data-role="more" hidden>
       <button class="btn btn-sm" data-act="refreshModels">重拉模型目录</button>
       <button class="btn btn-sm" data-act="retest">重测账号</button>
-      <button class="btn btn-sm" data-act="reset">强制重测限流</button>
+      <button class="btn btn-sm" data-act="reset" title="只清本地限流标记：秒级完成、不耗额度。若上游仍在限流，下次调用会自动重新标记——想确认真实状态请用「重测账号」">重置限流标记</button>
       <button class="btn btn-sm" data-act="enableAllModels">全部模型启用</button>
       <button class="btn btn-sm" data-act="disableAllModels">全部模型停用</button>
     </div>
@@ -324,20 +324,20 @@ function renderProvider(provider) {
           break
         }
         case 'reset': {
-          toast('强制重测中：清标记后立刻对受限模型真实发一次请求…')
           const { result } = await api(`/api/p/${provider.id}/accounts/reset`, { method: 'POST', body: '{}' })
           const cleared = result.clearedCount ?? 0
-          const still = result.stillLimitedCount ?? 0
-          if (still === 0) {
-            toast(`重测完成：${cleared} 个模型已恢复可用`, 'ok')
+          if (cleared === 0) {
+            toast('没有需要重置的限流标记', 'ok')
           } else {
-            const parts = (result.accounts || []).flatMap((a) =>
-              (a.stillLimited || []).map((m) => {
-                const t = m.resetTimeMs ? `（至 ${fmtTime(m.resetTimeMs)}）` : ''
-                return `${m.modelId}${t}`
-              }),
+            // ⚠️ 如实说明：这只是清了本地记录，上游的限流状态没变。
+            // 若上游确实仍在限流，下次调用会自动重新标记 —— 那是正常行为，
+            // 不是重置失败。想让上游裁决请用「重测账号」。
+            toast(
+              `已清除 ${cleared} 条本地限流标记（不影响上游状态）\n`
+              + '若上游仍在限流，下次调用会自动重新标记；'
+              + '想确认真实是否解禁请点「重测账号」',
+              'ok',
             )
-            toast(`仍受限 ${still} 个（上游未放行，无法强制解除）：\n${parts.join('\n')}`, 'err')
           }
           await load()
           break
@@ -618,10 +618,13 @@ function renderEndpoints(providers, lan) {
             <div class="endpoint-note">
               控制台 ${copyable(`${base}/`, '点击复制控制台地址')}
               &nbsp;·&nbsp;
-              API 基址 ${copyable(`${base}/v1`, '点击复制 API 基址')}
+              OpenAI ${copyable(`${base}/v1`, '点击复制 OpenAI 基址')}
+              &nbsp;·&nbsp;
+              Anthropic ${copyable(`${base}/v1/messages`, '点击复制 Anthropic 地址')}
             </div>
             <div class="endpoint-note">
               模型 id 写成 <code style="font-size:11px">供应商/模型</code>，例如 <code style="font-size:11px">trae/deepseek-v4.1-flash</code>
+              （Anthropic 客户端把 Base URL 填 <code style="font-size:11px">${escapeHtml(base)}</code>）
             </div>
             ${token ? `<div class="endpoint-note">API Key 填令牌 ${copyable(token, '点击复制访问令牌')}</div>` : ''}
           </div>
@@ -629,24 +632,51 @@ function renderEndpoints(providers, lan) {
     }
   }
 
-  // ── 本机接入 ──
-  html += providers.map((p) => `
+  // ── 供应商独立端点（OpenAI 与 Anthropic 同端口、不同路径）──
+  html += providers.map((p) => {
+    const base = p.baseUrl || ''
+    // ⚠️ 独立端口的 Anthropic 地址由 OpenAI 地址推导（同 host:port，换路径）：
+    // 网关在这两个路径上挂了同一套管线，模型都写裸名。
+    const anth = base.replace(/\/v1$/, '/v1/messages')
+    return `
     <div class="endpoint">
       <div>
         <div class="endpoint-label">${escapeHtml(p.displayName)} <span class="endpoint-note">（独立端点）</span></div>
+        <div class="endpoint-note">
+          <b>OpenAI</b> ${p.baseUrl ? copyable(base, '点击复制 OpenAI 地址') : '未启动'}
+          &nbsp;·&nbsp;
+          <b>Anthropic</b> ${p.baseUrl ? copyable(anth, '点击复制 Anthropic 地址') : '—'}
+        </div>
         <div class="endpoint-note">模型 id 用裸名，例如 <code style="font-size:11px">glm-5.3</code></div>
       </div>
-      <code>${escapeHtml(p.baseUrl || '未启动')}</code>
-    </div>
-  `).join('')
+    </div>`
+  }).join('')
 
+  // ── 聚合端点：两种协议都列出来（用户要求：Anthropic 地址放前端）──
+  const aggBase = `http://127.0.0.1:${escapeHtml(String(port))}`
   html += `
-    <div class="endpoint">
+    <div class="endpoint endpoint-lan">
       <div>
-        <div class="endpoint-label">聚合端点 <span class="endpoint-note">（本机，一次接入全部）</span></div>
-        <div class="endpoint-note">模型 id 写成 <code style="font-size:11px">供应商/模型</code>，例如 buddy/glm-5.3</div>
+        <div class="endpoint-label">聚合端点 · OpenAI <span class="endpoint-note">（本机，一次接入全部）</span></div>
+        <div class="endpoint-note">
+          Base URL ${copyable(`${aggBase}/v1`, '点击复制')}
+          &nbsp;·&nbsp; 完整地址 ${copyable(`${aggBase}/v1/chat/completions`, '点击复制')}
+        </div>
+        <div class="endpoint-note">模型 id 写成 <code style="font-size:11px">供应商/模型</code>，例如 <code style="font-size:11px">buddy/glm-5.3</code></div>
       </div>
-      <code>http://127.0.0.1:${escapeHtml(String(port))}/v1</code>
+    </div>
+    <div class="endpoint endpoint-lan">
+      <div>
+        <div class="endpoint-label">聚合端点 · Anthropic <span class="endpoint-note">（Claude Code / Cline 等）</span></div>
+        <div class="endpoint-note">
+          Base URL（填在 <code style="font-size:11px">ANTHROPIC_BASE_URL</code>）${copyable(aggBase, '点击复制')}
+          &nbsp;·&nbsp; 完整地址 ${copyable(`${aggBase}/v1/messages`, '点击复制')}
+        </div>
+        <div class="endpoint-note">
+          模型同样写 <code style="font-size:11px">供应商/模型</code>；
+          API Key 填访问令牌（客户端若要求 <code style="font-size:11px">x-api-key</code> 同样用它）
+        </div>
+      </div>
     </div>`
 
   box.innerHTML = html
