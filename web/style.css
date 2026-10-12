@@ -185,11 +185,22 @@ main { padding: 20px 22px 60px; max-width: 1180px; margin: 0 auto; }
 .switch input { accent-color: var(--accent); cursor: pointer; }
 
 /* ── 「更多」操作区 ── */
+/*
+ * ⚠️ `[hidden]` 必须显式覆盖 display，否则 `hidden` 属性完全失效
+ * （真实缺陷，2026-10-12 用户报障「更多按钮是摆设」）：
+ * HTML 的 `hidden` 只等价于浏览器默认样式 `display:none`，而**作者样式表里
+ * 的 `display:flex` 优先级更高**，于是：
+ *   · 面板从一开始就一直是展开的（加了 hidden 也没用）
+ *   · 点「更多」切换 hidden 属性毫无视觉效果 → 按钮成了摆设
+ * 修法：用 `.more[hidden] { display: none }`（属性选择器，优先级高于 `.more`）
+ * 让 hidden 真正生效。
+ */
 .more {
   display: flex; flex-wrap: wrap; gap: 6px;
   padding: 8px; border: 1px dashed var(--border); border-radius: 8px;
   background: #14171e;
 }
+.more[hidden] { display: none; }
 
 /* ── 账号序号（顺序 = 选号优先级）── */
 .order {
