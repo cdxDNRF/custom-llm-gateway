@@ -16,6 +16,12 @@ import { collectCompletion, streamChunksToSse, toGenerateOptions, type OpenAiCha
 import { recentLogs } from './logger.js'
 import { lanAddresses } from './net.js'
 import { corsHeaders } from './cors.js'
+import {
+  anthropicToOpenAiRequest,
+  streamChunksToAnthropicSse,
+  openAiCompletionToAnthropic,
+  type AnthropicMessagesRequest,
+} from './anthropic.js'
 import type { Provider } from './provider.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -395,6 +401,13 @@ export class OverviewServer {
       await this.aggregateChat(request, response)
       return
     }
+    // ── Anthropic Messages 协议（Claude 系客户端：Claude Code / Cline / 部分酒馆）──
+    //
+    // 与 OpenAI 端点并存，同一套供应商管线。模型写法同样是 `供应商/模型`。
+    if (path === '/v1/messages' && request.method === 'POST') {
+      await this.aggregateMessages(request, response)
+      return
+    }
 
     sendJson(response, 404, { error: `未知路径 ${path}` })
   }
@@ -743,6 +756,99 @@ export class OverviewServer {
     } catch (error) {
       response.write(`data: ${JSON.stringify({ error: { message: String(error) } })}\n\n`)
       response.write('data: [DONE]\n\n')
+      response.end()
+    }
+  }
+
+  /**
+   * `POST /v1/messages`：Anthropic Messages 协议（Claude 系客户端用）。
+   *
+   * 实现策略：把 Anthropic 请求翻译成内部的 OpenAI 形状 → **复用同一条
+   * 供应商管线** → 输出再翻译回 Anthropic 事件/JSON。故适配器、限流换号、
+   * 账号池逻辑全部不变（见 `anthropic.ts` 的模块说明）。
+   *
+   * ⚠️ Anthropic 的错误体形状是 `{type:'error', error:{type,message}}`，
+   * 与 OpenAI 的 `{error:{message}}` 不同；Claude 客户端按前者解析，故这里
+   * 单独构造。
+   */
+  private async aggregateMessages(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const sendAnthropicError = (status: number, type: string, message: string): void => {
+      sendJson(response, status, { type: 'error', error: { type, message } })
+    }
+
+    let body: AnthropicMessagesRequest
+    try {
+      body = JSON.parse(await readBody(request)) as AnthropicMessagesRequest
+    } catch (error) {
+      sendAnthropicError(400, 'invalid_request_error', `请求体不是合法 JSON：${String(error)}`)
+      return
+    }
+
+    const raw = typeof body.model === 'string' ? body.model : ''
+    const slash = raw.indexOf('/')
+    if (slash <= 0) {
+      sendAnthropicError(
+        400,
+        'invalid_request_error',
+        `在聚合端点上请使用 "供应商/模型" 形式，例如 "buddy/glm-5.3"（当前：${raw}）`,
+      )
+      return
+    }
+    const providerId = raw.slice(0, slash)
+    const modelId = raw.slice(slash + 1)
+    const provider = this.findProvider(providerId)
+    if (!provider) {
+      sendAnthropicError(404, 'not_found_error', `未知供应商 ${providerId}`)
+      return
+    }
+
+    const openAiBody = anthropicToOpenAiRequest({ ...body, model: modelId })
+    const generate = toGenerateOptions(openAiBody, {
+      provider: providerId,
+      model: modelId,
+      sessionId: `gw-msg-${providerId}-${Date.now().toString(36)}`,
+    })
+    // Anthropic 的消息 id 惯例是 `msg_` 前缀。
+    const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+
+    let chunks: AsyncIterable<never>
+    try {
+      chunks = provider.adapter.stream(generate) as AsyncIterable<never>
+    } catch (error) {
+      sendAnthropicError(502, 'api_error', String(error))
+      return
+    }
+
+    // 非流式：聚合成 OpenAI 完成对象后翻译
+    if (body.stream !== true) {
+      try {
+        const completion = await collectCompletion(chunks, { id, model: raw, created: Math.floor(Date.now() / 1000) })
+        sendJson(response, 200, openAiCompletionToAnthropic(completion))
+      } catch (error) {
+        sendAnthropicError(502, 'api_error', String(error))
+      }
+      return
+    }
+
+    // 流式：翻译成 Anthropic 事件序列（以 message_stop 收尾，**不发** [DONE]）
+    response.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'access-control-allow-origin': '*',
+      'x-accel-buffering': 'no',
+    })
+    try {
+      for await (const frame of streamChunksToAnthropicSse(chunks, { id, model: raw })) {
+        response.write(frame)
+      }
+      response.end()
+    } catch (error) {
+      // 流已开始，无法改状态码；按 Anthropic 的 error 事件下发。
+      response.write(`event: error\ndata: ${JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message: String(error) },
+      })}\n\n`)
       response.end()
     }
   }

@@ -19,6 +19,12 @@ import {
 } from './protocol.js'
 import type { Provider } from './provider.js'
 import { corsHeaders } from './cors.js'
+import {
+  anthropicToOpenAiRequest,
+  streamChunksToAnthropicSse,
+  openAiCompletionToAnthropic,
+  type AnthropicMessagesRequest,
+} from './anthropic.js'
 
 export interface ProviderServerOptions {
   provider: Provider
@@ -168,7 +174,87 @@ export class ProviderServer {
       return
     }
 
+    // ── /v1/messages：Anthropic Messages 协议（模型写裸名，本端口只有一个供应商）──
+    if (request.method === 'POST' && url.pathname === '/v1/messages') {
+      await this.handleMessages(request, response)
+      return
+    }
+
     sendError(response, 404, `未知路径：${url.pathname}`, 'not_found')
+  }
+
+  /**
+   * Anthropic Messages 协议入口（供应商端口版）。
+   *
+   * 与 8790 聚合端点同一套翻译（见 `anthropic.ts`），区别只在模型名：
+   * 本端口只有一个供应商，故用**裸名**（与 `/v1/chat/completions` 一致），
+   * 同时也接受 `供应商/模型` 写法（自动剥前缀，便于用户从聚合端点抄配置）。
+   */
+  private async handleMessages(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const sendAnthropicError = (status: number, type: string, message: string): void => {
+      sendJson(response, status, { type: 'error', error: { type, message } })
+    }
+
+    let body: AnthropicMessagesRequest
+    try {
+      body = JSON.parse(await readBody(request)) as AnthropicMessagesRequest
+    } catch (error) {
+      sendAnthropicError(400, 'invalid_request_error', `请求体不是合法 JSON：${String(error)}`)
+      return
+    }
+    if (typeof body.model !== 'string' || body.model.length === 0) {
+      sendAnthropicError(400, 'invalid_request_error', '缺少 model 字段')
+      return
+    }
+
+    const { adapterProvider, model } = adapterFor(this.provider.id, body.model)
+    const openAiBody = anthropicToOpenAiRequest({ ...body, model })
+    const generate = toGenerateOptions(openAiBody, {
+      provider: adapterProvider,
+      model,
+      sessionId: `gw-${this.provider.id}-${Date.now().toString(36)}`,
+    })
+    const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+
+    let chunks: AsyncIterable<Parameters<typeof collectCompletion>[0] extends AsyncIterable<infer T> ? T : never>
+    try {
+      chunks = this.provider.adapter.stream(generate) as typeof chunks
+    } catch (error) {
+      sendAnthropicError(502, 'api_error', this.describeUpstreamError(error))
+      return
+    }
+
+    if (body.stream !== true) {
+      try {
+        const completion = await collectCompletion(chunks, { id, model: body.model, created: Math.floor(Date.now() / 1000) })
+        sendJson(response, 200, openAiCompletionToAnthropic(completion))
+      } catch (error) {
+        sendAnthropicError(502, 'api_error', this.describeUpstreamError(error))
+      }
+      return
+    }
+
+    response.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'access-control-allow-origin': '*',
+      'x-accel-buffering': 'no',
+    })
+    try {
+      for await (const frame of streamChunksToAnthropicSse(chunks, { id, model: body.model })) {
+        response.write(frame)
+      }
+      response.end()
+    } catch (error) {
+      const message = this.describeUpstreamError(error)
+      this.provider.gateway.logger.warn('流式中断:', message)
+      response.write(`event: error\ndata: ${JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message },
+      })}\n\n`)
+      response.end()
+    }
   }
 
   private async handleChat(request: IncomingMessage, response: ServerResponse): Promise<void> {
