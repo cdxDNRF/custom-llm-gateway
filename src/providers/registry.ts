@@ -24,6 +24,7 @@ import {
   createMinimaxProvider,
   createQoderCnProvider,
   createZcodeProvider,
+  createGeminiProvider,
 } from './extended.js'
 import { CodeArtsProvider } from './codearts.js'
 import { PROVIDER_CATALOG, catalogEntry } from './catalog.js'
@@ -219,6 +220,7 @@ function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): 
     raccoon: () => createRaccoonProvider(dir, level),
     minimax: () => createMinimaxProvider(dir, level),
     zcode: () => createZcodeProvider(dir, level),
+    gemini: () => createGeminiProvider(dir, level),
   }
   return table[id]
 }
@@ -255,6 +257,7 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createRaccoonProvider(dir, level),
     () => createMinimaxProvider(dir, level),
     () => createZcodeProvider(dir, level),
+    () => createGeminiProvider(dir, level),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)
 

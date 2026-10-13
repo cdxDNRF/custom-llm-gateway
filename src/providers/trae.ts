@@ -82,6 +82,20 @@ export class TraeProvider implements Provider {
         }
       },
       refresh: async () => {
+        // ⚠️⚠️ **必须按账号池里的 ref 续期**（与 qoder 同一缺陷，2026-10-13 一并修）。
+        //
+        // `auth.refresh()` 读产品的**默认** ref（`TRAE_ACCESS_TOKEN`），而账号池里
+        // 每个账号的凭据存在自己的 ref（如 `TRAE_ACCOUNT_0DD1B943`）。两者不一致时
+        // 续期必然失败，且报错文案会误导成「未登录」——凭据其实就在池里。
+        const available = await pool.getAvailableAccount('trae', '')
+        if (available) {
+          await this.auth.refreshAccountCredential(
+            available.entry.credentialRef,
+            pool,
+            available.entry.id,
+          )
+          return
+        }
         await this.auth.refresh()
       },
       fetchRemoteModels: () => this.auth.fetchModels(pool),

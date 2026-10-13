@@ -2,7 +2,7 @@
  * 全部供应商的目录：id / 展示名 / 默认端口 / 默认开关 / 能力说明。
  *
  * 设计（用户要求）：**像 DSH 插件一样提供"供应商启动开关"** ——
- * 12 家全部在目录里登记，但新接入的默认 `enabled:false`（未登录也没必要占端口），
+ * 13 家全部在目录里登记，但新接入的默认 `enabled:false`（未登录也没必要占端口），
  * 用户在 Web 控制台点开关即可启用（写入 config.json 后下次启动生效）。
  *
  * 端口规划：3901 起连续分配，与既有四家保持不变。
@@ -30,6 +30,7 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   { id: 'raccoon',    displayName: 'Raccoon (商汤)',        defaultPort: 3910, defaultEnabled: false, note: '本地页承载微信/短信登录' },
   { id: 'minimax',    displayName: 'MiniMax Code',          defaultPort: 3911, defaultEnabled: false, note: 'Anthropic Messages 协议；不支持图片输入' },
   { id: 'zcode',      displayName: 'ZCode (智谱)',          defaultPort: 3912, defaultEnabled: false, note: '每次请求需浏览器产 captcha；需设 ZCODE_CHROME_PATH' },
+  { id: 'gemini',     displayName: 'Gemini (Google)',       defaultPort: 3913, defaultEnabled: false, note: 'OAuth 登录；需设 CMDC_PAK_GOOGLE_CLIENT_ID/SECRET' },
 ]
 
 export function catalogEntry(id: string): ProviderCatalogEntry | undefined {

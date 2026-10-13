@@ -700,3 +700,107 @@ export async function createZcodeProvider(
     },
   })
 }
+
+// ─────────────────────────── Gemini（Cloud Code Assist） ───────────────────────────
+
+/**
+ * Gemini Code Assist（Google Antigravity 客户端协议）。
+ *
+ * 与其它家的差异：
+ *   - **OAuth 授权码流程**（`startLogin` 返回 loginUrl，用户在浏览器里同意；
+ *     回调由插件内置的本地 HTTP 服务承接）。⚠️ 该流程需要 `GEMINI_DEFAULT_CLIENT_ID`
+ *     / `..._SECRET`，它们**已从 vendor 中清空**（上游硬编码的 Google OAuth 凭据会被
+ *     GitHub Push Protection 拒绝推送，见 sync-vendor.sh 的 ④c 步）。
+ *     故**未设环境变量时登录会失败**——这是有意为之：凭据由使用者提供。
+ *     设置 `CMDC_PAK_GOOGLE_CLIENT_ID` / `CMDC_PAK_GOOGLE_CLIENT_SECRET` 即可启用。
+ *   - 需要先探测 project 号（`loadCodeAssist`），适配器内部已处理并有跨请求缓存。
+ *   - 无每日签到；额度查询走 `retrieveUserQuotaSummary`。
+ */
+export async function createGeminiProvider(
+  dataDir: string,
+  logLevel?: 'debug' | 'info' | 'warn' | 'error',
+): Promise<Provider> {
+  const { gateway, pool } = await makeBase('gemini', dataDir, logLevel)
+  const { GeminiAuth } = await import('../../vendor/src/gemini-auth.js')
+  const { GeminiAdapter } = await import('../../vendor/src/gemini-adapter.js')
+  const { GEMINI } = await import('../../vendor/src/gemini.js')
+  const auth = new GeminiAuth(gateway.ctx as never, { product: GEMINI })
+
+  /**
+   * ⚠️ project 探测缓存**必须由接线侧长期持有**（适配器注释明确要求）：
+   * 每次调用现造等于没有跨请求缓存，每轮推理都会多打一次 `loadCodeAssist`。
+   */
+  const projectCache = new Map<string, string>()
+
+  const adapter = new GeminiAdapter({
+    credentialRef: credentialRef(GEMINI.defaultCredentialRef),
+    resolveCredential: async (modelId?: string) => {
+      const available = await pool.getAvailableAccount('gemini', modelId ?? '')
+      if (available) return available.credential as never
+      const raw = gateway.credentials.get(GEMINI.defaultCredentialRef)
+      try { return raw === undefined ? undefined : JSON.parse(raw) } catch { return undefined }
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount('gemini', '')
+      if (available) {
+        await auth.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
+      } else {
+        await auth.refresh()
+      }
+    },
+    accountPool: pool,
+    product: GEMINI,
+    projectCache,
+    logger: { warn: (message: string) => gateway.logger.warn(message) },
+  }) as LlmAdapter
+
+  return new GenericImpl({
+    id: 'gemini',
+    displayName: 'Gemini (Google)',
+    capabilities: {
+      login: true, dailyCheckin: false, balance: true,
+      permanentLock: false, multiAccount: true, refresh: true,
+    },
+    adapter, pool, gateway,
+    loginImpl: async () => {
+      const id = `gemini-${shortId()}`
+      const refName = `GEMINI_ACCOUNT_${shortId().toUpperCase()}`
+      await pool.addAccount({
+        id, provider: 'gemini', nickname: id, enabled: true,
+        credentialRef: refName, refreshable: false, createdAt: Date.now(),
+      })
+      try {
+        // gemini.startLogin 不带 pool：result 是凭据本体，要自己 persist（同 raccoon）。
+        const started = await auth.startLogin()
+        started.result.then(async (credential) => {
+          // ⚠️ persistLogin 只返回 `{ accountId? }`（没有 expires/refreshable）——
+          //    与 raccoon 的 persistLogin 形状不同，别照抄。
+          //    Gemini 凭据含 refresh_token 时才算可续期，用它决定 refreshable。
+          await auth.persistLogin(credential, { refName })
+          const refreshable = typeof credential.refresh_token === 'string' && credential.refresh_token.length > 0
+          await pool.updateAccount(id, {
+            refreshable,
+            // 展示名优先用邮箱（`sub` 是 21 位数字，拼出来用户认不出）。
+            ...(typeof credential.email === 'string' && credential.email.length > 0
+              ? { nickname: credential.email }
+              : {}),
+          })
+          gateway.logger.info(`账号 ${id} 登录成功`)
+        }).catch(async (e) => {
+          await pool.removeAccount(id).catch(() => {})
+          gateway.logger.warn(`账号 ${id} 登录失败:`, e)
+        })
+        return { loginUrl: started.loginUrl, accountId: id, completed: Promise.resolve({ ok: true }) }
+      } catch (error) {
+        // ⚠️ 凭据未配置时 startLogin 会抛错（见函数头）。清掉占位账号，
+        //    避免留下一个永远登录不成的幽灵账号。
+        await pool.removeAccount(id).catch(() => {})
+        const hint = '（提示：Gemini 需要设置 CMDC_PAK_GOOGLE_CLIENT_ID / CMDC_PAK_GOOGLE_CLIENT_SECRET）'
+        throw new Error(`${error instanceof Error ? error.message : String(error)}${hint}`)
+      }
+    },
+    refreshAll: async () => {
+      await auth.refreshAll(pool)
+    },
+  })
+}

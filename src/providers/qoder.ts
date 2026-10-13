@@ -24,6 +24,7 @@ import {
   retest,
 } from '../core/provider-common.js'
 import { createGatewayContext, withStateDir, type GatewayContext } from '../core/context.js'
+import { qoderFetch } from '../core/qoder-transport.js'
 import type {
   AccountView,
   BalanceView,
@@ -66,7 +67,10 @@ export class QoderProvider implements Provider {
     this.gateway = gateway
     this.pool = pool
     this.defaultRef = QODER.defaultCredentialRef
-    this.auth = new QoderAuth(gateway.ctx as never, { product: QODER })
+    // ⚠️ auth 也必须用 Qoder 专用传输：续期走 `openapi.qoder.sh`，
+    //    该 host 与推理 host 同样在 TLS 1.3 下被重置（实测 ECONNRESET，
+    //    TLS 1.2 → HTTP 404 正常）。不注入就会「续期网络失败：fetch failed」。
+    this.auth = new QoderAuth(gateway.ctx as never, { product: QODER, fetcher: qoderFetch })
 
     // 同 buddy：直接构造适配器类，不注册到 DSH 的 ctx.llm。
     this.adapter = new QoderAdapter({
@@ -83,10 +87,34 @@ export class QoderProvider implements Provider {
         }
       },
       refresh: async () => {
+        // ⚠️⚠️ **必须按账号池里的 ref 续期**（真实缺陷，2026-10-13）。
+        //
+        // `auth.refresh()` 读的是产品的**默认** ref（`QODER_ACCESS_TOKEN`），
+        // 而账号池里每个账号的凭据存在自己的 ref（如 `QODER_ACCOUNT_51965821`）。
+        // 两者不一致时 `refresh()` 必然抛「未配置凭据，请先登录」——**文案是误导**，
+        // 凭据其实齐全且就在池里。触发条件是凭据过期（`isQoderExpired`），
+        // 表现为「用着用着突然全部模型都报未登录、重登也没用」。
+        //
+        // 修法：优先用 `refreshAccountCredential(该账号的 ref, pool, id)` 续期；
+        // 只有池里没有可用账号时才退回默认 ref（单凭据场景）。
+        const available = await pool.getAvailableAccount(QODER.id, '')
+        if (available) {
+          await this.auth.refreshAccountCredential(
+            available.entry.credentialRef,
+            pool,
+            available.entry.id,
+          )
+          return
+        }
         await this.auth.refresh()
       },
       accountPool: pool,
       product: QODER,
+      // ⚠️ Qoder 专用传输：**只对 qoder 用 TLS 1.2**。
+      //    Windows 上默认 TLS 1.3 到 qoder 主机的握手会被中断（实测 10.8s 超时，
+      //    而 TLS 1.2 稳定 461ms）。诊断与理由见 src/core/qoder-transport.ts。
+      //    其余供应商保持默认 —— 不做全局降级。
+      fetchImpl: qoderFetch,
     }) as LlmAdapter
   }
 
