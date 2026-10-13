@@ -1,4 +1,6 @@
 import type { DpopPrivateJwk } from './oauth.js'
+import type { BadgePreference } from './badge-preferences.js'
+import type { TokenLedgerSnapshot, TokenLedgerHistoryDay, TokenLedgerModelRow } from './token-ledger.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -52,11 +54,36 @@ export interface ProviderAccountEntry {
   credentialRef: string
   /** 创建时间（毫秒时间戳） */
   createdAt: number
-  /** 凭据过期时间（毫秒时间戳），用于展示 */
+  /**
+   * 凭据过期时间（毫秒时间戳），用于展示。
+   *
+   * ⚠️ **不保证是 `Date` 可表示的值**（最终审计登记的「同族未加固格」）：
+   * 本字段来自**用户可编辑的备份文件**，而 `sanitizeAccounts` **不过滤它**
+   * （与 `modelRateLimits` 不同 —— 那个已由 `isValidResetAtMs` 加固，见
+   * `src/jet-hub-store.ts`）。故池里可能存在 `1e308` 这类超出 `Date` 范围的值。
+   *
+   * 当前**无崩溃可达**（已核实）：唯一对它调 `new Date()` 的是
+   * `src/raccoon-auth.ts` 的 `refreshAll`，而那条分支被 `isRaccoonExpired(credential)`
+   * 门控 —— 那个判据从**凭据**算过期、不读池值 ⇒ 池里坏值不可达；
+   * 客户端 `jet-hub.js` 的判据是 `typeof === 'number' && > 0 && <= Date.now()`，
+   * 对 `1e308` 恒 false，也安全。
+   *
+   * ⚠️ **但这是「补了 A 格、漏了同族 B 格」的形态**：将来若有人把某处判据改成读
+   * 池值，或在 UI 里加 `new Date(account.expiresAt)` 的格式化，就会与
+   * `modelRateLimits` 那个 `RangeError` 缺陷**完全同型**地炸。
+   * ⇒ 新增读取点前先确认值域，或**在此处统一加固**（加过滤）。
+   */
   expiresAt?: number
   /** 是否可静默续期 */
   refreshable: boolean
-  /** 每个模型的重置时间，key=模型ID（毫秒时间戳） */
+  /**
+   * 每个模型的重置时间，key=模型ID（毫秒时间戳）。
+   *
+   * ⚠️ 值域由 `isValidResetAtMs`（`src/jet-hub-store.ts`）保证：**有限、正、
+   * 且在 `Date` 范围内**（上界 8.64e15）。任何写入/读取点都必须走该谓词，
+   * 不要内联 `Number.isFinite(v) && v > 0` —— 那会漏掉「超出 Date 范围」这一格，
+   * 导致 `new Date(v).toISOString()` 抛 `RangeError`（真实缺陷，见该谓词注释）。
+   */
   modelRateLimits?: Record<string, number>
   /**
    * TRAE 签到设备轮换代次（仅 `trae` provider 使用）。
@@ -72,6 +99,32 @@ export interface ProviderAccountEntry {
    * 缺省/0 = 使用凭据原始 `device_id`，既有账号行为完全不变。
    */
   traeCheckinDeviceGeneration?: number
+  /**
+   * **opencode** 账号的出口代理（空/缺省 = 直连）。
+   *
+   * ⚠️ 代理是**账号维度**的：一个 NAT 后的多台 PC 共享同一出口 IP，而
+   * OpenCode Zen 的匿名通道按**出口 IP** 限流、认证通道按**账号**限流，
+   * 故「让各账号真正分开」只能给各账号各配一条出口。
+   *
+   * 空串是合法值（= 用户显式清除了代理，回到「与其它无代理账号共享本机
+   * 出口」），**不可**用 falsy 判据把它与「未设置」混为一谈 ——
+   * 那会让面板上的「清除代理」点了没反应。
+   */
+  opencodeProxy?: string
+  /**
+   * **opencode** 账号的指纹代次（见 `src/opencode.ts` 的 `deriveProjectId`）。
+   *
+   * 只存**整数代次**而非指纹本体：project id 由 `(api_key, generation)`
+   * 唯一决定，用户点「轮换」时 +1 即可整体换一份新 project id，
+   * 无需让调用方拼哈希（与 `traeCheckinDeviceGeneration` 同款取舍）。
+   *
+   * ⚠️ 接线层必须**以本字段为权威**重新派生 project id（`max(本字段,
+   * 凭据内代次)`），不能直接透传凭据里的 `fingerprint` ——
+   * 否则代次涨了而 project id 不变，且不报错，是最难排查的一类静默失效。
+   *
+   * 缺省/0 = 用凭据里派生的初始指纹。
+   */
+  opencodeFingerprintGeneration?: number
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -80,6 +133,28 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
   refreshError?: string
   /** 来源（env/file 等） */
   source?: string
+  /**
+   * 账号名（用户名，如 `mylzscy4`）。
+   *
+   * ## 为什么不在 `ProviderAccountEntry` 上
+   *
+   * 账号池（`jet-hub/state.json`）的条目**不存**这个值 —— 它只在**凭据**里
+   * （`user_info.displayName`）。本字段是 `account.list` 在返回前**现从该账号
+   * 自己的 credential ref 里读出来**的派生值，故属于「状态」而非「存储」。
+   *
+   * 为什么不写回池：凭据可能被用户在别处更新（换账号名）、且池的
+   * `sanitizeAccounts`（`src/jet-hub-store.ts`）只保留
+   * `id`/`provider`/`credentialRef` 三个字段，写进去也会被丢掉。
+   */
+  accountName?: string
+  /**
+   * 脱敏手机号（`159****0100`）。
+   *
+   * ⚠ 由 17 位 `user_id` 前 11 位**派生**（上游不下发手机号字段），
+   * 取不到合法前缀时**不设该字段** —— 宁可不显示，也不猜。详见
+   * `src/zcode.ts` 的 `phoneFromUserId`。
+   */
+  phone?: string
 }
 
 /** Jet Hub 在 ctx.settings 中的 schema */
@@ -110,6 +185,19 @@ export interface RpcCreateAccountRequest {
    * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
    */
   phone?: string
+  /**
+   * 登录渠道（**仅 ZCode 需要**）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，凭据落点不同（见
+   * `zcode-login.ts` 的 `ZCODE_LOGIN_PROVIDER` 注释）：
+   *
+   * - `'bigmodel'`（缺省）：智谱开放平台（国内），授权页 `bigmodel.cn`
+   * - `'zai'`：z.ai 国际版，授权页 `chat.z.ai`
+   *
+   * ⚠️ **缺省必须视为 `'bigmodel'`**：既有调用方不传该字段，
+   * 行为必须逐字节不变。
+   */
+  zcodeProvider?: 'bigmodel' | 'zai'
 }
 export interface RpcCreateAccountResponse {
   accountId: string
@@ -130,6 +218,20 @@ export interface RpcCreateAccountResponse {
    * 行为必须逐字节不变。
    */
   loginMode?: 'url' | 'sms'
+  /**
+   * 本次「添加账号」**没有新建条目**，而是复用了池里已有的账号。
+   *
+   * ## 现状（2026-10-05 起 zcode 不再产生它）
+   *
+   * 曾经 ZCode 会「复用本机官方客户端写的凭据」而返回该值；那条能力已随
+   * 「不读本机 IDE 数据」的决策整体删除 ⇒ **当前没有任何 provider 会返回
+   * `true`**。
+   *
+   * ⚠️ 字段与前端的 `res.reused` 分支**仍然保留**：那是**契约防御** ——
+   * 判据写成「后端若声明复用，则 `loginUrl` 为空串是正常的」，
+   * 比反过来假设「空串必是错误」更稳，且不必为一次能力下线去改前端渲染分支。
+   */
+  reused?: boolean
 }
 
 export interface RpcPollLoginRequest {
@@ -167,8 +269,18 @@ export interface RpcRefreshAccountRequest {
   accountId: string
 }
 export interface RpcRefreshAccountResponse {
+  /**
+   * ⚠️ **只可能为 `true`**：续期失败**不回**本响应，而是回
+   * `{ok:false, error:{code:'bad-request', message}}`（Gitee issue IKJOZA）。
+   *
+   * 此前失败被包成 `{ok:true, value:{success:false}}`，而客户端
+   * `unwrapRpcResult` 只判 `ok` —— 只判 `ok` 的调用方会把失败读成成功
+   * （报告方一个工具因此把 17/18 次失败显示成「✅」）。
+   *
+   * ⇒ 判定失败**只有一个**判据：顶层 `ok === false`（或 catch 住 `unwrapRpcResult`
+   * 抛出的 `Error`，其 `message` 即 `error.message`）。
+   */
   success: boolean
-  error?: string
 }
 
 /**
@@ -226,6 +338,40 @@ export interface RpcRetestResponse {
   clearedCount: number
 }
 
+/**
+ * 「测试」单个账号：**无条件**真发一次请求（不依赖是否存在限流标记）。
+ *
+ * 与 {@link RpcRetestAccountRequest} 的区别是**触发条件**：重测只测那些已经有
+ * `modelRateLimits` 标记的模型（无标记即零请求），测试则不看标记、直接挑一个
+ * 模型发出去。它补齐的是「账号到底还能不能用」在没有历史 429 时**没有手动
+ * 探活入口**的缺口。
+ */
+export interface RpcTestAccountRequest {
+  accountId: string
+  /** 指定要测的模型 id；省略则由服务端推断（见 `testAccount` 的 `testModelFor`）。 */
+  modelId?: string
+}
+
+/**
+ * 「测试」结果。
+ *
+ * ⚠️ 它**不带** `cleared` / `tested` 字段，这是刻意的：测试不写任何存储
+ * （不清标记、不写回新的重置时刻），所以没有「清除了几条」可报。
+ * 结果里的 `resetTimeMs` 仅供展示。
+ */
+export interface RpcTestAccountResponse {
+  accountId: string
+  nickname?: string
+  /** 实际发出请求用的模型 id；推断失败时为空串。 */
+  modelId: string
+  /** 服务端接受并完成了这次请求。 */
+  ok: boolean
+  /** 失败时的可读原因（`仍受限：…` / `无法确认：…`）。 */
+  message?: string
+  /** 失败且上游给出重置时刻时带出（**不落盘**）。 */
+  resetTimeMs?: number
+}
+
 /** 重置单个账号的限流标记（不测试，直接清除）。 */
 export interface RpcResetAccountRequest {
   accountId: string
@@ -267,6 +413,27 @@ export interface RpcCreditsStatusResponse {
 /** RPC: 一键领取积分请求 */
 export interface RpcCreditsClaimAllRequest {
   provider: string
+  /**
+   * 是否同时执行成长中心任务（**CodeBuddy 中国版专有**）。
+   *
+   * ⚠️ **不是**「buddy / workbuddy 专有」：WorkBuddy（国际版）后端**根本没有**
+   * 成长中心（contributor 在 !62 复审中实测确认：无任务列表、无 claim 端点），
+   * `src/provider-credits.ts` 只给 `buddy` 挂 `afterClaim`。
+   * 客户端那侧 `GROWTH_TASK_PROVIDERS` 同样只含 `buddy`（决定按钮渲不渲染）。
+   *
+   * ⚠️ **缺省为 `false`，且必须保持这样**：`credits.claimAll` 同时是「每日首次
+   * 启动自动签到」的执行体（见 `src/auto-checkin.ts` 的 `claim` 回调），而成长
+   * 一轮单账号实测 90～270s、全串行、任务间 1.5s 节流。若默认开启，每次启动都会
+   * 自动打几十个上游请求 —— 那不是签到。
+   *
+   * 只有用户手点「一键领取积分」时才传 `true`。
+   */
+  runTasks?: boolean
+  /**
+   * 成长任务单账号时间预算（毫秒），透传给 `runGrowthTaskCompletions`。
+   * 缺省由实现取 10 分钟；传 0 或负数表示不限时（本地排障用）。
+   */
+  budgetMs?: number
 }
 /** 单个账号的领取结果 */
 export interface RpcCreditsClaimAccountResult {
@@ -281,11 +448,99 @@ export interface RpcCreditsClaimSummary {
   alreadyClaimed: number
   inactive: number
   failed: number
+  /**
+   * 其中**能证明「今天这一轮已被处理」**的条数（`claimed` + `alreadyClaimed`
+   * 里 `coversToday !== false` 的那些）。
+   *
+   * ⚠️ 它**不是** `claimed + alreadyClaimed`：那两项里可能混着「刷新前那一轮」的
+   * 痕迹（Qoder 活动 10:00 UTC+8 才刷新），拿它们记账会导致当天新额度整天漏领。
+   * 判据见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
+   */
+  coversToday: number
+  /**
+   * ★ **按单位分组**的领取合计（2026-10-04）。
+   *
+   * ## 为什么必须有它（真实缺陷，用户报障）
+   *
+   * 用户报障原文：
+   * > 插件的这个一键签到，Zcode 获得的是 token 数量，但是这里显示成获得积分。
+   * > 正文「…ZCode（智谱）+100000000（共 +100000100）」
+   * > 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+   *
+   * 根因是 {@link totalCredit} 这个标量**把不同量纲加在了一起**：ZCode 的额度
+   * 单位是 token、其余渠道是积分，1 亿 token + 100 积分 = `100000100`，
+   * 而下游拿到的只有一个数、只能标成「积分」。故单位必须在**汇总这一层**
+   * 就分开保留。
+   *
+   * ⚠️ 两个键**恒存在**（没有该单位的领取时为 `0`），不要写成可选 ——
+   * 消费方（`auto-checkin.ts` / 两个客户端面板）都要读它，可选字段会让
+   * 「宿主旧版本没这个字段」与「本次真的没有 token」混为一谈。
+   *
+   * ⚠️ {@link totalCredit} **保留**：它是既有字段，且对**单一单位**的渠道
+   * （其余 11 个）语义完全正确。消费方若只需一个数，应先确认本次只有一个单位。
+   */
+  totalByUnit: import('./credits.js').ClaimTotalsByUnit
 }
 /** RPC: 一键领取积分响应 */
 export interface RpcCreditsClaimAllResponse {
   results: RpcCreditsClaimAccountResult[]
   summary: RpcCreditsClaimSummary
+  /**
+   * 逐账号的成长任务明细，**仅在请求方传了 `runTasks: true` 且该 provider
+   * 有成长中心时**给出。
+   *
+   * ⚠️ 它与 `results` 并列而非塞进 `outcome.message`：成长有 22 项任务、每项
+   * 的处置不同（完成 / 需客户端 / 失败），折进一句文案就丢掉了逐项判据 ——
+   * 而那正是排查「为什么这项没涨」的唯一线索。
+   */
+  growth?: RpcBuddyGrowthAccountResult[]
+}
+
+/** RPC: 成长中心任务一键全自动化请求 */
+export interface RpcBuddyGrowthTasksRequest {
+  provider: string
+  /**
+   * 单账号时间预算（毫秒）。缺省由实现取 10 分钟；传 0 或负数表示不限时。
+   * 该值会**原样**透传给 `runGrowthTaskCompletions` 的 `budgetMs`。
+   */
+  budgetMs?: number
+}
+/** 单个成长任务的完成结果 */
+export interface RpcBuddyGrowthTaskResult {
+  taskCode: string
+  ok: boolean
+  message: string
+  /** 判据在服务端推不动、如实归为「需客户端」而非「失败」。 */
+  clientOnly?: boolean
+}
+/** 单个账号的成长任务执行结果 */
+export interface RpcBuddyGrowthAccountResult {
+  accountId: string
+  nickname: string
+  /**
+   * 执行是否成功完成整轮。
+   *
+   * `ok:false` 表示有任务失败或时间预算用尽 —— 逐项明细看 `tasks`。
+   */
+  ok: boolean
+  completed: number
+  /** 需客户端动作的项数（微信动作、夜窗未到、判据推不动）。 */
+  clientOnly: number
+  failed: number
+  /** 扫尾自动领到的任务数。 */
+  claimedCount: number
+  /** 扫尾自动领到的积分。 */
+  claimedCredit: number
+  /** 时间预算用尽、本轮提前收住。 */
+  timedOut: boolean
+  /** 逐项明细（含事件数 / progress / 失败原因）。 */
+  tasks: RpcBuddyGrowthTaskResult[]
+  /** 执行失败原因（凭据失效、任务列表查询失败等）。 */
+  error?: string
+}
+/** RPC: 成长中心任务一键全自动化响应 */
+export interface RpcBuddyGrowthTasksResponse {
+  results: RpcBuddyGrowthAccountResult[]
 }
 
 /**
@@ -331,7 +586,7 @@ export interface RpcLoomyPermanentLockResponse {
  *
  * ⚠️ 判据不同但**开关语义相同**（「只消耗会近期作废的积分」），故共用一个端点
  * 与一张持久化表，而不是每个 provider 加一条 case —— 平行分支越多，漏接概率越高
- * （WorkBuddy 的「刷新」按钮就是这么一直坏着的）。
+ * （`account.refresh` 端点对 workbuddy 漏接 case 就是这么一直坏着的）。
  *
  * `locked` 省略表示**只读查询**；给出布尔值表示写入。
  */
@@ -372,6 +627,31 @@ export interface RpcCreditsBalanceAccount {
   balance: import('./credits.js').CreditBalance | null
   /** 查询失败的原因，供 UI 提示（成功时为 undefined）。 */
   error?: string
+  /**
+   * 与余额**并列**的附加读数（不属于余额语义，故不塞进 `CreditBalance`）。
+   *
+   * 目前只有 Gemini 用：它的「账号规格」（Google AI Pro / Free）来自
+   * `loadCodeAssist`，与配额是两个端点，但搭同一次 `credits.balances` 回来。
+   * 缺省 = 该 provider 没有附加读数 / 这次没取到 ⇒ 面板不渲染对应行。
+   */
+  extra?: RpcCreditsBalanceExtra
+}
+
+/**
+ * 逐账号附加读数。
+ *
+ * ⚠️ 用**对象**而不是把字段平铺到 {@link RpcCreditsBalanceAccount} 上：
+ * 平铺会让 `usage-badge.ts` / 卡片里所有逐账号形状的断言都跟着膨胀，
+ * 而这类读数注定还会增加（每加一个 provider 就多一批字段）。
+ */
+export interface RpcCreditsBalanceExtra {
+  /**
+   * 账号规格短标签（`Pro` / `Free` / `Ultra`）。
+   *
+   * `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），hover 才看得到
+   * —— 面板空间只够一个词。
+   */
+  accountTier?: { label: string; title: string }
 }
 
 /** RPC: 查询积分余额响应 */
@@ -631,6 +911,18 @@ export interface RpcModelListEntry {
    * 「未知」语义 —— 不编造 `false`（与全仓「未知不编造」的约定一致）。
    */
   isFree?: boolean
+  /**
+   * 该模型是否已被判定为**上游下架**（`dead-models.json` 命中）。
+   *
+   * ⚠️ 恒为布尔值、**不省略**：缺失即 false。客户端据此灰显并给出「重新显示」
+   * 入口（`model.clearDead`）。
+   *
+   * ⚠️ **必须显式列出失效模型而不能静默剔除**（2026-10-06 复审 !66 实测）：
+   * 适配器侧会把它们从目录里过滤掉，若这里不补回，用户在设置页**连开关都摸不着**
+   * —— 而失效模型用户**选不到 ⇒ 不可能再成功 ⇒ 记录永不自动清除**，等于永久失去
+   * 恢复路径。这是「误判代价不对称」的必然要求：能藏，但必须能找回。
+   */
+  dead: boolean
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -649,6 +941,129 @@ export interface RpcModelSetDisabledRequest {
 export interface RpcModelSetDisabledResponse {
   provider: string
   disabledModels: Record<string, boolean>
+  /**
+   * 「本次操作没有它看上去那么有效」的说明（Issue IKJW33）。
+   *
+   * ⚠️ **缺省 = 无警告**，不是空数组 —— 与全仓「未知不编造」的约定一致，
+   * 也让既有调用方（只读 `disabledModels`）逐字节不受影响。
+   *
+   * ## 为什么需要它
+   *
+   * 对**已从上游目录消失**的模型 id 调开关时，旧实现返回「成功 1」却
+   * **什么都没发生、且没有任何警告**：脚本与 AI 助手据此以为开关生效了
+   * （issue 作者本人就据此误判过一次，回查目录才发现是空操作）。
+   *
+   * ⚠️ **为什么是 warnings 而不是 `ok:false` + `not-found`**（issue 的原始建议
+   * 未被采纳，两个理由）：
+   *
+   * 1. **打开方向是幽灵条目的唯一清理路径**：`model.setAllDisabled` 的注释已立
+   *    此约定 —— 「曾被关闭、后来从服务端目录下线」的历史死键**只能靠打开方向
+   *    清掉**。按目录拒绝会让这些键永远留在配置里，正好加重 issue 抱怨的第 2 条。
+   * 2. **目录可能读不出来**（凭据过期 / 远端故障）：此时若按「不在目录」拒绝，
+   *    用户会连开关都动不了。
+   *
+   * ⇒ **照常写入**（既有语义逐字节不变），只在响应里说明真相。
+   */
+  warnings?: string[]
+}
+
+/**
+ * 聚合设置面板的一条候选（`aggregate.catalog` 的条目）。
+ *
+ * ⚠️ **不含余额**（规格 §8.3）：本端点只回答「有哪些候选、哪些被拒」，
+ * 余额仍由各渠道自己的面板负责 —— 否则打开面板就会对每个渠道打一次上游请求。
+ */
+export interface RpcAggregateCandidate {
+  provider: string
+  /** 该渠道的**真实** modelId（面板要让用户看到它以便人工核查）。 */
+  realId: string
+  /** 该渠道的展示名（含倍率等运行时信息）。 */
+  realName: string
+  /** 倍率（`Infinity` = 无标注）。 */
+  price: number
+  /** 是否靠**显式补丁**归一（面板标 `⚠️补丁` 供人工核查）。 */
+  viaPatch: boolean
+  /** 是否被用户拒绝参与该模型的轮换。 */
+  rejected: boolean
+}
+
+/** 聚合设置面板的一个虚拟模型（`aggregate.catalog` 的条目）。 */
+export interface RpcAggregateModel {
+  canonicalId: string
+  name: string
+  candidates: RpcAggregateCandidate[]
+}
+
+/** RPC: 列出聚合目录（虚拟模型 + 各自候选 + 拒绝状态）响应 */
+export interface RpcAggregateCatalogResponse {
+  models: RpcAggregateModel[]
+}
+
+/** RPC: 设置某条候选是否拒绝参与轮换请求 */
+export interface RpcAggregateSetRejectedRequest {
+  canonicalId: string
+  provider: string
+  realId: string
+  rejected: boolean
+}
+
+/** RPC: 清空拒绝表请求（`canonicalId` / `provider` 都可省略；都省略 = 清空全部） */
+export interface RpcAggregateClearRejectedRequest {
+  canonicalId?: string
+  provider?: string
+}
+
+/** RPC: 拒绝表变更后的统一响应（回传写入后的完整拒绝表，便于前端校验） */
+export interface RpcAggregateRejectionsResponse {
+  aggregateRejections: Record<string, Record<string, Record<string, boolean>>>
+}
+
+/**
+ * RPC: 聚合 provider「上次实际转发成功的渠道」响应（P3，供用量徽标）。
+ *
+ * ⚠️ `provider` 为 `null` 表示**无历史**（尚未发过任何请求 / 插件重启后内存清空）
+ * ⇒ 客户端**不渲染**徽标（规格 §6.3 的 P4）。**不做预测**。
+ */
+export interface RpcAggregateActiveProviderResponse {
+  provider: string | null
+}
+
+/**
+ * RPC: 「按临期排序」用的候选到期时刻（面板可选按钮，用户 2026-10-07 选定）。
+ *
+ * `order` 是 `{ <provider>: expiry }`（毫秒时间戳；`-1` = 查不到、`Infinity` = 长期）。
+ * ⚠️ 该端点**会做余额探测**（每个已接入渠道一次上游 GET），
+ * 故只在用户显式点「按临期排序」时调用 —— 面板默认不探测（规格 §8.3）。
+ */
+export interface RpcAggregateExpiryOrderResponse {
+  order: Record<string, number>
+}
+
+/**
+ * RPC: 把某个模型从「已失效」表里移除（让它重新出现在目录中）。
+ *
+ * ## 为什么必须有这个端点（2026-10-06 复审 !66 确认）
+ *
+ * 失效记录的**唯一**自愈路径是 TTL 过期（默认 30 天）—— 因为模型被剔除后
+ * 用户**选不到**，不可能靠「再成功一次」触发重记清除。于是**误判即永久损伤**
+ * （用户连手工编辑 `dead-models.json` 都不会）。
+ *
+ * ⚠️ 这与 Jet Hub 已有的模型开关**不对等**：用户能一键关模型，却不能一键
+ * 「复活」一个被误记的模型。故必须有显式恢复入口。
+ *
+ * ⚠️ `modelId` **可选**：省略则清空该 provider 的全部失效记录（「全部重新显示」）。
+ * 与 `disabled` 一样**没有默认值** —— 传 `""` 视为非法，避免「字段名写错 ⇒
+ * 静默清空全表」。
+ */
+export interface RpcModelClearDeadRequest {
+  provider: string
+  modelId?: string
+}
+
+/** RPC: 恢复失效模型的响应（回传该 provider 剩余的失效 id，便于前端刷新） */
+export interface RpcModelClearDeadResponse {
+  provider: string
+  deadModels: string[]
 }
 
 /**
@@ -720,6 +1135,42 @@ export interface ProviderStatus {
    * 两者必须同步修改，否则「左侧说已关闭、账号联动说没全关」会自相矛盾。
    */
   closed: boolean
+  /**
+   * 目录健康快照（**可选** —— 只有目录来自**多个外部来源**的适配器实现它）。
+   *
+   * 存在的意义（issue IKKZUG 第 5 点）：`cline` 的目录来自**三个来源**，
+   * 其中 models.dev 是 5.39 MB 的外部站点、经常拉不到；失败时只有
+   * `console.warn`，而**宿主不落盘** ⇒ 用户与排障者看到的只是「贴不了图」，
+   * 无从判断是「模型不支持图片」还是「目录还没拉到」。
+   *
+   * ⚠️ `complete: false` 是**可操作**的信号：它意味着目录处于残缺态，
+   * 本插件会继续按闸门冷却重试（不需要用户做任何事）。
+   *
+   * ⚠️ **字段缺席 = 该适配器不提供诊断**，不是「诊断失败」—— 前端与
+   * 排障脚本都必须按 `undefined` 判「无信息」，不得当成「一切正常」
+   * （那是把「没测」当成「没问题」，正是本仓库反复出现的静默形态）。
+   */
+  catalog?: CatalogHealth
+}
+
+/**
+ * 目录来源的就绪度（`ProviderStatus.catalog`）。
+ *
+ * ⚠️ `total` 是**已载入**的条数（不是远端真实条数）—— 远端条数在失败时
+ * 无从得知，编造一个数比不报更糟。
+ */
+export interface CatalogHealth {
+  /** 当前已载入的模型条数（目录 = 远端已读到的 ∪ 本地兜底表）。 */
+  total: number
+  /**
+   * 目录是否**完整**（所有来源都已就绪）。
+   *
+   * ⚠️ `false` 时插件**仍会按闸门冷却自动重试**，用户无需操作；
+   * 它只是告诉排障者「现在看到的列表/能力可能不全，且会自愈」。
+   */
+  complete: boolean
+  /** 人类可读的现场说明（如 `models.dev 未就绪`）；省略时前端不必渲染。 */
+  note?: string
 }
 
 /** RPC: 读取多个供应商的汇总状态请求 */
@@ -754,10 +1205,163 @@ export interface RpcProviderSetEnabledRequest {
 export interface RpcProviderSetEnabledResponse {
   provider: string
   enabled: boolean
-  /** 实际被写入黑名单的模型数（关闭方向）或清空的条目数（打开方向）。 */
+  /**
+   * **实际被改变的**模型数（关闭方向 = 本次真正新关掉的条数；打开方向 = 清空的条目数）。
+   *
+   * ⚠️ 关闭方向**不是**「本次写入黑名单的条数」：`setModelsDisabled` 是**合并**
+   * 语义，传入的并集里可能有相当一部分早就关着（历史遗留的完整黑名单 / 用户此前
+   * 逐条关过），按写入条数报会**少报**用户看到的实际结果。与 {@link accounts}
+   * 的口径（只算实际变更数）保持一致。
+   */
   models: number
   /** 实际被改变的账号数（已是目标状态的账号不计入）。 */
   accounts: number
+}
+
+/**
+ * RPC: 读取供应商自定义显示顺序（Jet Hub「供应商开关」弹窗的拖拽排序）。
+ *
+ * `order` 为空数组表示用户尚未自定义（或文档缺失该键），展示侧按 `PROVIDERS`
+ * 的声明顺序渲染（见 `plugin-src/client/provider-toggle.js` 的
+ * `sortOpenProvidersByOrder`）。
+ */
+export interface RpcGetProviderOrderResponse {
+  order: string[]
+}
+
+/**
+ * RPC: 写入供应商自定义显示顺序。
+ *
+ * 数组含**全部**供应商 id：拖拽提交时 = 拖后的「已打开」序列 + 已关闭的
+ * 按声明序缀尾。展示侧对数组中不认识 / 缺失的 id 都有稳定兜底，故插件
+ * 跨版本增删 provider 时不需要迁移（见 `sortOpenProvidersByOrder`）。
+ */
+export interface RpcSetProviderOrderRequest {
+  order: string[]
+}
+
+/**
+ * RPC: 本机 OpenAI 网关状态。
+ *
+ * ⚠️ 三个字段必须**分开回传**，不能只回一个 `enabled`：设置页里的开关读的是
+ * `enabled`（用户的选择），而端口是否真的在监听取决于另外两个条件 ——
+ * `blockedByEnv` 为真时，用户的选择**不会**让网关跑起来（`env` 是运维级
+ * 停用，优先级更高）。只回一个布尔会让 UI 显示「已打开」而实际没监听，
+ * 用户完全无从判断该改哪里。
+ */
+export interface RpcGatewayStatusResponse {
+  /** 用户在设置页里的选择（持久化状态）。 */
+  enabled: boolean
+  /** 当前是否真的在监听端口。 */
+  running: boolean
+  /** 是否被 `DSH_OPENAI_GATEWAY_ENABLED` 显式停用（此时设置页改开关无效）。 */
+  blockedByEnv: boolean
+  /** 实际监听地址；未运行或被 env 停用时为 `null`。 */
+  address: { host: string; port: number } | null
+  /**
+   * 网关正在使用的凭据。
+   *
+   * ⚠️ 明文密钥。网关尚未创建过实例时为 `null`（例如被 env 停用、或插件刚
+   * 启动还没起过网关），此时设置页应提示「启用后自动生成」而**不是**编一个
+   * 占位串 —— 复制出去必然 401，比不给更让人困惑。
+   */
+  apiKey: RpcGatewayApiKey | null
+  /**
+   * 当前可用的模型 ID 列表（`provider/模型名`）。
+   *
+   * 存在的理由：**有些 agent 不会主动扫描模型目录**（如 ZCode），要靠用户
+   * 手工把 ID 填进它的配置。而 `/v1/models` 需要 Bearer 鉴权，浏览器地址栏
+   * 直接打开只会得到 401 —— 用户在设置页外没有任何途径看到这些 ID。
+   *
+   * ⚠️ 无凭据的 provider 已在采集阶段被跳过，故不会出现在这里。
+   */
+  models: RpcGatewayModel[]
+  /**
+   * 目录是从哪来的 —— 用于在清单为空时**说清原因**。
+   *
+   * ⚠️ 这个字段存在的唯一理由：此前 `models: []` 只有一种含义，用户看到
+   * 「还没有可用模型」就去检查自己的登录，而真实原因可能是宿主根本没给出任何
+   * 可枚举的 provider（插件加载异常）。空状态必须能自解释。
+   *
+   * - `catalog`：来自 `ctx.llm.listProviders()`（权威，正常路径）
+   * - `adapters`：该方法不可用，退化为用本插件已注册的适配器 key 枚举
+   * - `none`：两者都拿不到，目录必然为空
+   */
+  modelsSource: 'catalog' | 'adapters' | 'none'
+}
+
+/** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */
+export interface RpcGatewayModel {
+  /** 可直接填进 agent 配置的完整 ID（`provider/模型名`）。 */
+  id: string
+  /**
+   * 该条目所属的 provider key（**采集侧给的权威拆分**，不是从 `id` 切出来的）。
+   *
+   * ⚠️ 存在的理由：设置页要按「一家供应商一张卡片」分组，而模型名里**允许带
+   * 斜杠**（实测 Cline 的 `cline/anthropic/claude-sonnet-5.5`）。前端按首个 `/`
+   * 反推 provider 在正常数据上恰好也对，但那是**巧合**而非契约 —— 一旦某家
+   * provider 的模型名以 `/` 开头、或 provider key 本身含 `/`，反推就错位，
+   * 表现为「模型被分到了不存在的那一家」。分组是用户的语义，故由采集侧给定。
+   */
+  provider: string
+  /**
+   * provider **内部**的模型名（不含 `<provider>/` 前缀）。
+   *
+   * 卡片头已经把供应商写清楚了，行内再重复一遍前缀只是噪声：实测
+   * `codearts/deepseek-v4.1-flash` 这类 id 会占满整行，窄面板下被截成
+   * `codearts/deepse…` —— 用户既看不出模型名，也读不到能复制的 ID。
+   */
+  model: string
+  /** 模型展示名，仅供人辨认。 */
+  name: string
+  /**
+   * 模型接受的输入模态（如 `['text']`、`['text','image']`）。
+   *
+   * 设置页据此标出**哪些模型能发图片** —— 不标的话用户只能靠撞一次
+   * `unsupported_content` 才知道。缺省为 `['text']`（与各适配器「不声明即
+   * 保守按 text 处理」一致）。
+   */
+  input: readonly string[]
+  /**
+   * 思考档位视图（与 `/v1/models` 的 `reasoning` 字段**同一份**）。
+   *
+   * 存在的理由与 `models` 相同，但更硬：各 provider 的档位 id 是**上游私有值**
+   * （TRAE 的 `light`/`extra_high`、LobsterAI 的 `xhigh`（界面上叫 Max）、
+   * Cline 的 `max`（界面上叫 Extra）），而 OpenAI 客户端只有固定 8 档词汇。
+   * 用户只能照 DSH 界面上的名字猜着填，猜错就是 400。
+   * `openai_efforts` 就是「该填哪几个」的机读答案。
+   *
+   * 缺省表示该模型**未声明**档位（网关不下发该参数、按模型默认走），
+   * 与「声明了但为空」不是一回事。
+   */
+  reasoning?: {
+    /** 模型真实接受的 id，以及它在客户端里该写成的规范名。 */
+    efforts: Array<{ id: string; name: string; canonical?: string }>
+    /** 适配器配置的默认档（省略表示交给上游默认）。 */
+    default?: string
+    /** 可直接填进客户端的规范名清单（与 `efforts` 一一对应，无翻译损失）。 */
+    openai_efforts: string[]
+  }
+}
+
+/** RPC: 本机 OpenAI 网关开关写入请求。 */
+export interface RpcGatewaySetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 网关凭据信息。
+ *
+ * ⚠️ 这是**明文凭据**，只应回传给调用方用于展示/复制，**不得**写进日志。
+ * 单独成类型是为了让「拿到它」这件事在代码里显式可见，便于 review 时留意。
+ */
+export interface RpcGatewayApiKey {
+  /** 密钥本体。 */
+  value: string
+  /** 是否来自 `DSH_OPENAI_GATEWAY_API_KEY`（此时 UI 不该显示文件路径）。 */
+  fromEnv: boolean
+  /** 密钥文件路径；`fromEnv` 为真时为 `null`。 */
+  path: string | null
 }
 
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
@@ -869,18 +1473,50 @@ export interface RpcBackupExportResponse {
   warnings: string[]
 }
 
+/**
+ * 导入模式。
+ *
+ * - `replace`：**整体替换**账号池与模型黑名单（还原快照）。既有的「恢复」行为。
+ * - `merge`：**只追加**——按 id 判重，已存在的账号跳过；**不碰**模型黑名单、
+ *   永久积分锁定表与其余账号的凭据。用于「单独导入一个账号」。
+ *
+ * ⚠️ 两者都**不提升** {@link BACKUP_VERSION}：模式是**导入时的选择**，不是
+ * 文件格式的一部分 —— 同一份备份文件既可整体还原也可合并追加。
+ */
+export type BackupImportMode = 'replace' | 'merge'
+
 /** RPC: 导入备份请求。 */
 export interface RpcBackupImportRequest {
   /** 备份载荷（明文 JSON 解析后的对象；加密文件在浏览器侧解密后传入）。 */
   payload: unknown
+  /**
+   * 导入模式，缺省 `replace`（保持既有调用方行为不变）。
+   *
+   * ⚠️ 必须是**可选**字段：老客户端不带它，后端必须按旧的「整体替换」处理。
+   */
+  mode?: BackupImportMode
+}
+
+/** RPC: 导出备份请求。 */
+export interface RpcBackupExportRequest {
+  /**
+   * 只导出这些账号 id（单独导出某个账号时传**一个**元素）。
+   * 缺省 / 空数组 = 导出全部账号。
+   */
+  accountIds?: string[]
 }
 
 /** RPC: 导入备份响应。 */
 export interface RpcBackupImportResponse {
   /** 写入的凭据条数。 */
   credentialsImported: number
-  /** 写入的账号数。 */
+  /** 写入的账号数（合并模式下 = 实际新增的账号数）。 */
   accountsImported: number
+  /**
+   * 合并模式下因 id 已存在而**跳过**的账号 id。
+   * `replace` 模式恒为空数组。
+   */
+  accountsSkipped: string[]
   /** 跳过的凭据 ref（非法 ref 等）。 */
   skipped: string[]
   /**
@@ -911,4 +1547,326 @@ export interface RpcBackupStatusResponse {
   accounts: number
   /** 缺 `expiresAt` 的账号条目数（疑似自动恢复产物）。 */
   withoutExpiry: number
+  /**
+   * 当前账号池的账号摘要（**可选**）：导出弹窗据此渲染「勾选要导出的账号」。
+   *
+   * ⚠️ 只含展示所需的字段，**不含任何凭据内容** —— 用户勾选时不需要看到
+   * 密钥，多传一份只会扩大泄漏面。
+   */
+  accountList?: Array<{
+    id: string
+    provider: string
+    nickname: string
+    enabled: boolean
+  }>
+}
+
+/**
+ * RPC: 内部载体问「现在要不要产 param」。
+ *
+ * 需求位为 `false` 时 client **一次都不产**（零配额消耗）——阿里云按同设备
+ * 每小时 150 次限流，白产比不产更贵（判据见 `src/captcha-supply.ts` 文件头
+ * 「与预取池的区别」）。
+ */
+export interface RpcCaptchaDemandResponse {
+  active: boolean
+}
+
+/**
+ * RPC: 内部载体问「载体页在哪个地址」（评审 C1/C2）。
+ *
+ * ⚠ 为什么 client 不能自己拼：载体页必须待在**一个与 Host 端口不同**的回环端口上
+ *   ——桌面版主进程的 `allowedNavigation()` / `onBeforeRequest` 都以
+ *   `isApplicationHost(url)` 拒绝「端口相同 + 主机相同/回环」的地址
+ *   （DSH Desktop 0.2.0-rc.2，`app.asar/lib/main.js`）。
+ *   端口由 server 运行时挑（`src/captcha-carrier-server.ts`）⇒ 只能问。
+ *
+ * ⚠ `null` = **现在没有可用地址**（env 关掉 / 候选端口全被占）。client 拿到它就
+ *   安静退出（本轮不建 guest、不导航）；这不是错误，别当异常报。
+ */
+export interface RpcCaptchaCarrierUrlResponse {
+  url: string | null
+}
+
+/**
+ * RPC: 内部载体回传一个 param。
+ *
+ * ⚠ **故意没有** `atMs` / 任何绝对时间戳字段：产出时刻由 server 用
+ * 「自己的到达时刻 − `elapsedMs`」推算（见 `jet-hub-rpc.ts` 的该 case 注释）。
+ * client 传绝对时间戳会把跨端时钟漂移引进时效闸 —— 快了永不判过期、
+ * 慢了一投放就过期，两种都表现为**内部载体静默不可用**。
+ */
+export interface RpcCaptchaContributeRequest {
+  /** guest 里 SDK 产出的 param。空串/全空白一律不收。 */
+  param: string
+  /**
+   * client 侧「开始产 → 发这条 RPC」的**相对耗时**（毫秒）。
+   *
+   * 相对耗时是同机单向差值，比绝对时钟可靠；非法值（负数、非整数、
+   * ≥ 5 分钟）一律退回 0，即按到达时刻记账。
+   */
+  elapsedMs?: number
+  /**
+   * 这一发是不是被降级成了**交互式验证**（评审 I2）。
+   *
+   * ⚠ 这是内部载体**唯一**的设备信誉预警：chromium 那条腿在
+   *   `ZcodeAuth.captchaPoolInstance()` 里已经会 `warn`，而内部载体这段此前
+   *   只打进 client 控制台 —— host 侧看不到，等于没有预警。
+   * 缺省 / 非 `true` 一律当「无感通过」（不要把缺字段说成有）。
+   */
+  interactive?: boolean
+}
+
+/** RPC: 内部载体回传 param 的结果（`false` = 没进槽，client 可决定要不要重试）。 */
+export interface RpcCaptchaContributeResponse {
+  accepted: boolean
+}
+
+/**
+ * ========================================
+ * 用量徽标（模型选择器旁）
+ * ========================================
+ *
+ * 一个端点回答「当前选中的渠道还剩多少」，供会话输入区那枚徽标使用：
+ * 折叠态给一个数字（订阅优先 / 积分兜底），展开后给逐账号明细。
+ *
+ * ⚠️ 与 `credits.balances` 的关系：**读数是同一份**（本端点内部直接复用
+ * `credits.balances` 的实现），差别有三处 ——
+ * 1. 只返回**启用**账号（停用账号不计入合计，另给 `disabledCount` 说明）；
+ * 2. 多带一份订阅读数（窗口 / 套餐），形状由 `badge-subscription.ts` 判定；
+ * 3. 结果带**宿主侧 TTL 缓存**（`cached` 标出来），因为徽标会按分钟轮询，
+ *    而余额是逐账号打上游的（见 `collectCreditBalances` 的「顺序查询」）。
+ */
+
+/** RPC: 读取用量徽标读数。 */
+export interface RpcUsageBadgeRequest {
+  /** 渠道 id（与 provider id 同名，即模型选择器里的路由 id）。 */
+  provider: string
+  /** `true` = 绕过宿主 TTL 缓存（手动刷新、签到之后用）。 */
+  force?: boolean
+}
+
+/**
+ * 套餐读数（**折叠态只显示一条**，故每个账号先折算成一条）。
+ *
+ * ⚠️ 与窗口式订阅（Cline）是**两种形态**，不要合并：
+ * 窗口答「各时间窗用掉百分之几」，套餐答「这份套餐还剩多少额度」。
+ */
+export interface RpcUsageBadgePlanReading {
+  /** 展示名：套餐包名，或「整个余额即套餐」时的固定名（见 `badge-subscription.ts`）。 */
+  name: string
+  remaining: number
+  total: number
+  /** 额度单位（`credits` / `token`），渲染标签与数字格式化都按它走。 */
+  unit: string
+  /** 扣费截止（毫秒）；缺省 = 服务端未下发（**不是**已过期）。 */
+  deductionEndTime?: number
+}
+
+/** 套餐读数：一个账号一条（`plan` 为 `null` = 该账号没有可用套餐包）。 */
+export interface RpcUsageBadgePlanAccount {
+  accountId: string
+  nickname: string
+  plan: RpcUsageBadgePlanReading | null
+  /** 余额本身查询失败时的原因（与 `plan: null` 严格区分）。 */
+  error?: string
+}
+
+/** 订阅读数：窗口（Cline）或套餐（Qoder / ZCode / 两个 buddy）。 */
+export type RpcUsageBadgeSubscription =
+  | { kind: 'windows'; accounts: RpcClineQuotaAccount[] }
+  | { kind: 'plan'; accounts: RpcUsageBadgePlanAccount[] }
+
+/** RPC: 用量徽标读数响应。 */
+export interface RpcUsageBadgeResponse {
+  /** 回显请求的渠道（前端并发切换时据此对号，避免把 A 的读数画到 B 上）。 */
+  provider: string
+  /** 宿主**生成**这份读数的时刻（毫秒）；UI 的「更新于」用它，不用到达时刻。 */
+  generatedAt: number
+  /** `true` = 命中宿主 TTL 缓存（这一轮没有真的打上游）。 */
+  cached: boolean
+  /** 逐账号余额（**仅启用账号**），形状与 `credits.balances` 一致。 */
+  accounts: RpcCreditsBalanceAccount[]
+  /** 被停用而**未计入**的账号数（弹窗脚注说明用；为 0 时不渲染脚注）。 */
+  disabledCount: number
+  /** 临时 / 长期分桶的窗口天数（沿用 `credits.balances` 的口径）。 */
+  windowDays?: number
+  /** 订阅读数；该渠道没有订阅数据、或订阅查询失败时**整个字段缺席**。 */
+  subscription?: RpcUsageBadgeSubscription
+  /** 当前生效的显示偏好（顺带回传，省一次往返）。 */
+  preference: BadgePreference
+  /**
+   * 「每日首次启动自动签到」的实时状态（顺带回传，供弹窗右上角那盏状态灯）。
+   *
+   * ⚠️ 与 `preference` 同理**不进 TTL 缓存**：`running` / `ranToday` 会在宿主
+   * 后台任务跑起来后变化，缓存住会让界面一直停在旧状态（看起来像「开关点了没反应」）。
+   */
+  autoCheckin: RpcUsageAutoCheckinState
+  /**
+   * `jet-hub-auto` 本次**实际**发往的渠道与模型（仅当请求的是 auto 且已发过请求时存在）。
+   *
+   * ⚠️ 宿主端的 auto 没有自己的账号与余额，`usage.badge` 会把请求改写成「临期胜者」
+   * 再去查余额；这份字段就是告诉客户端「改写成了谁」，供折叠胶囊显示
+   * 「实际在用的渠道 + 模型」—— 徽标是**止损工具**，用户原话「以为在用 A，
+   * 实际在烧 B，等发现时积分已经没了」。
+   *
+   * ⚠️ 上游 `ba10f4f` 重写 aggregate 时把本字段一并删掉了（旧 auto 的徽标随之失效）。
+   * 这里补回来（用户 2026-10-08 选定「两条都修」）。
+   */
+  autoActual?: { provider: string; model: string; viaImageFallback: boolean }
+  /**
+   * 本次 auto 胜者的额度失效时刻（毫秒）—— 折叠胶囊的临期倒计时用。
+   *
+   * ⚠️ **只有有限值才回传**：`Infinity`（只有长期积分）会被 JSON 序列化成 `null`，
+   * 客户端按 `typeof === 'number'` 判空。故 `null` 与「字段缺席」在语义上等价，
+   * 客户端只需判 `typeof`。
+   */
+  autoExpiryAt?: number
+  /**
+   * auto 本次目标的**计费倍率**（`priceFactorFromName` 的结果）。
+   *
+   * ⚠️ 只有**有限**值才回传：`Infinity` 是「无标注」的哨兵，拼进文案会渲染出
+   * `xInfinity`。`0` 是合法值（显示「免费」）。
+   *
+   * ⚠️ 存在的理由（用户报障 2026-10-08「没倍率显示？」）：auto 是跨渠道的单一
+   * 模型名，**它自己没有倍率** —— 倍率取决于这次选中谁。模型选择器显示的是
+   * `listModels` 的静态名（对所有请求都一样），往那里写死倍率就是编造。
+   * ⇒ 倍率只能显示在胶囊里（那里才有「实际用了谁」）。
+   */
+  autoPrice?: number
+}
+
+/**
+ * RPC: 读写「用量徽标显示偏好」。
+ *
+ * ⚠️ `preference` **省略 = 只读**；给出时必须是 `auto` / `subscription` /
+ * `credits` 三者之一 —— 非法值一律 `bad-request`，**不做**静默回落
+ *（回落会让「设置没生效」看起来像「保存成功」）。读取侧的容错在
+ * `sanitizeBadgePreference`，那里面对的是**磁盘上的脏数据**，不是用户输入。
+ */
+export interface RpcUsageBadgePreferenceRequest {
+  preference?: BadgePreference
+}
+
+/** RPC: 用量徽标显示偏好响应（回显写入后的生效值）。 */
+export interface RpcUsageBadgePreferenceResponse {
+  preference: BadgePreference
+}
+
+/**
+ * RPC: 读取 **Token 账本**快照（「Token 用量」面板的唯一数据源）。
+ *
+ * 数据来自进程内存的 `src/token-ledger.ts`：记账点在注册收敛层
+ * （`llm-register-compat.ts` 的包装适配器），渠道由网关侧打标区分。
+ * **重启即丢**（第 1 期不持久化），UI 需说明这一点而不是伪装成历史报表。
+ */
+export interface RpcUsageTokenLedgerRequest {
+  /** 明细最多多少条；省略 = 服务端上限（`TOKEN_LEDGER_LIMIT`）。 */
+  limit?: number
+}
+
+/** Token 账本快照响应（形状直透 `TokenLedgerSnapshot`，不另造一份平行类型）。 */
+export interface RpcUsageTokenLedgerResponse {
+  snapshot: TokenLedgerSnapshot
+}
+
+/**
+ * RPC: 读取 **历史日聚合**（第 4 期 · 「Token 用量」弹窗的历史视图）。
+ *
+ * 数据源是落盘的日聚合（重启保留），与内存明细是两份独立数据 ——
+ * 历史答「本周/本月用了多少」，明细答「每一笔长什么样」。
+ */
+export interface RpcUsageTokenLedgerHistoryRequest {
+  /**
+   * 只看最近 N 天（**含今天**，UTC+8 日界）；省略 = 全部历史
+   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。自选范围可传 fromDay / toDay。
+   */
+  sinceDays?: number
+  /** 自选日期范围起点（UTC+8 日键，含当日）；与 toDay 配合使用。 */
+  fromDay?: string
+  /** 自选日期范围终点（UTC+8 日键，含当日）；与 fromDay 配合使用。 */
+  toDay?: string
+}
+
+/** 历史日聚合响应（形状直透，不另造平行类型）。 */
+export interface RpcUsageTokenLedgerHistoryResponse {
+  history: TokenLedgerHistoryDay[]
+  /** 所选窗口的合计（按日累加，均值按全部样本 Σ/份数计算）。 */
+  totals: Omit<TokenLedgerModelRow, 'model'>
+}
+
+/** RPC: 删除某一天的历史日累计；不影响进程内 Token 明细。 */
+export interface RpcUsageTokenLedgerDeleteDayRequest {
+  day: string
+}
+
+export interface RpcUsageTokenLedgerDeleteDayResponse {
+  day: string
+  deleted: true
+}
+
+/**
+ * 「每日首次启动自动签到」的实时状态。
+ *
+ * 语义要点（用户 2026-10-02 的需求：「每日第一次打开 DSH 可以按照这个状态是否
+ * 自动签到，并记录签到状态，不多次重复触发」）：
+ * - 开关是**全局**的（不分渠道），作用范围是**全部有账号的渠道**；
+ * - 「今天」按 **UTC+8** 日界算（各渠道的每日额度都按 UTC+8 结算）；
+ * - `lastDate` 就是「不多次重复触发」的凭据：等于今天 ⇒ 当天不再自动跑。
+ */
+export interface RpcUsageAutoCheckinState {
+  /**
+   * 开关是否打开。默认**打开**（`auto-checkin.ts` 的 `DEFAULT_AUTO_CHECKIN`：
+   * 用户 2026-10-02 明确要求「自动签到默认保持打开」）。⚠️ 本注释早于那次
+   * 决定、写的是「默认关闭」，已按实现更正 —— 改默认值前先改这里，别让注释
+   * 与实现分家（那正是本 PR 审查发现的一处矛盾）。
+   */
+  enabled: boolean
+  /** 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。 */
+  lastDate: string
+  /** 今天是否已经自动签到过（`lastDate` 等于今天）。 */
+  ranToday: boolean
+  /** 正在执行中（刚打开开关会立刻跑一轮，此时为 true）。 */
+  running: boolean
+  /** 上次结果摘要（中文短句，展示在状态灯提示里）。 */
+  lastResult: string
+  /** 上次跑完的时刻（毫秒）；0 = 从未跑过。面板上的时间戳用它。 */
+  lastAt: number
+  /**
+   * **逐渠道**结果（顺序即遍历顺序，文本形如 `2 个 +800` / `今天已领` /
+   * `无签到接口` / `出错`）。
+   *
+   * 用户 2026-10-02：「自动签到状态下，下方应该也显示文字状态，这样才能够知道
+   * 各个渠道的签到状态」—— 汇总句看不出是哪个渠道，故这里给逐渠道明细。
+   */
+  channels: Array<{ provider: string; text: string }>
+  /**
+   * 用户是否已手动关闭那行**常驻**的自动签到状态文字。
+   *
+   * ⚠️ 判据是「关闭的是当前这一轮」：新一轮跑出结果后自动变回 `false`
+   *（否则用户关过一次就再也看不到新结果了）。
+   */
+  dismissed: boolean
+}
+
+/**
+ * RPC: 读写「每日首次启动自动签到」开关，以及关闭常驻状态文字。
+ *
+ * ⚠️ `enabled` 与 `dismiss` 都**省略 = 只读**；给出时必须是布尔值 —— 非法值一律
+ * `bad-request`，**不做**静默回落（与本仓库 `usage.badgePreference` 同口径：
+ * 回落会让「设置没生效」看起来像「保存成功」）。磁盘脏数据的容错在
+ * `sanitizeAutoCheckin`。
+ * ⚠️ 打开开关时宿主会**立刻尝试一轮**（今天已跑过则内部拦住）：否则用户今天点了
+ * 开关要等到明天才有动作，看起来像没生效。
+ * ⚠️ `dismiss: true` 只关掉**当前这一轮**的状态文字（下一轮结果会重新出现）——
+ * 手动签到的结果提示是按时自动消失的，两者语义不同，别合并。
+ */
+export interface RpcUsageAutoCheckinRequest {
+  enabled?: boolean
+  dismiss?: boolean
+}
+
+/** RPC: 自动签到开关响应（回显写入后的生效状态）。 */
+export interface RpcUsageAutoCheckinResponse {
+  autoCheckin: RpcUsageAutoCheckinState
 }

@@ -1,191 +1,49 @@
 /**
- * ZCode 凭据读取（**纯 Node，不需要 ZCode 实例运行**）。
+ * ZCode 凭据类型与判据（**纯类型 + 纯函数，不碰磁盘**）。
  *
- * ## 为什么不再用「本机 HTTP 桥」
+ * ## ⚠⚠ 本文件**不再**读取官方 ZCode 客户端的本机数据（2026-10-05，用户决策）
  *
- * PR #17 初版的设计是「读 `<dataBaseDir>/.zcode/v2/bridge-port.json` → 打本机桥
- * → 由 ZCode 实例代发上游」。那条路有一个致命的可用性问题（实测）：
+ * ### 被删掉的是什么
  *
- * **它依赖一个被补丁注入过的开源版实例。** 官方闭源版
- * （`%LOCALAPPDATA%\Programs\ZCode\ZCode.exe`）**不写** `bridge-port.json`
- * —— 故「装了 ZCode」并不等于「桥可用」。而现实中用户装的正是官方版。
+ * 初版（PR #17 起）有一整套「复用官方客户端登录态」的能力，**已整体移除**：
  *
- * 更关键的是，上游准入**并不真的需要 Electron**：
+ * | 已删除 | 原来读的本机数据 |
+ * |---|---|
+ * | `readZcodeCredential()` | — |
+ * | `readRawCredentials()` / `credentialFileCandidates()` | `~/.zcode/v2/credentials.json` |
+ * | `decryptCredentialValue()` / `deriveCredentialKey()` | 同上（AES-256-GCM 解密） |
+ * | `readDeviceMid()` | `~/.zcode/v2/telemetry-state.json` |
+ * | `detectZcodeAppVersion()` | `%LOCALAPPDATA%\Programs\ZCode\.zcode-install-manifest` |
+ * | `labelFromUserInfo()` / `identityFromUserInfo()` / `readUserIdFromUserInfo()` | 只服务于上面那条路 |
  *
- * - captcha 是阿里云的**网页 SDK**（`o.alicdn.com/captcha-frontend/...`），
- *   只需「一个有 DOM 的浏览器」—— 不需要 ZCode 那个壳；
- * - 3012 的判据是**请求体内容**（system 身份块 + 首轮 user 的
- *   `<system-reminder>` 日期块），与运行时无关 —— 上游实测 curl 同样 200。
+ * ### 为什么删（**别改回去**）
  *
- * 而凭据本身就躺在磁盘上，官方用一套**公开可复现**的算法加密：
- * `enc:v1:` + AES-256-GCM + `sha256(secret)` 密钥，secret 缺省由
- * `平台 + 家目录 + 用户名` 派生。故纯 Node 即可解密（实测 7 个键全部成功）。
+ * 1. **安全**：那条路等价于「任何本地进程都能解密 ZCode 的登录凭据」——
+ *    官方用一套**公开可复现**的派生密钥（`zcode-credential-fallback:<平台>:<家目录>:<用户名>`
+ *    过 `sha256`）加密 `enc:v1:` 密文，插件等于把「读别人应用登录态」的能力
+ *    复制进了 DSH。**不做**这件事，用户就不必担心 DSH 拿到的是自己点的那个授权。
+ * 2. **正确性**：它只对 **bigmodel 渠道**认 `oauth:bigmodel:user_info`，
+ *    zai 渠道写的是 `oauth:zai:user_info`（键名不同）⇒ 读出来 `user_id` 恒缺、
+ *    账号名退化成「设备xxxxxxxx」，且因 `user_id` 是账号去重与
+ *    「防跨账号覆盖」的唯一判据，这条路实际走不通
+ *    （Gitee issue IKJNPZ，2026-10-04 实机复现）。
+ * 3. **一致性**：插件**本来就有**自己的完整 OAuth 流程（`zcode-login.ts` 的
+ *    `runZcodeLogin`，bigmodel / zai 两个渠道都跑得通，且
+ *    `zcode-auth.ts` 的 `startLogin` 会写出**带 `user_id` / `account_name`** 的
+ *    完整凭据）。旧路径是条**功能更差的旁路**，留着只会让人误以为不用登录。
  *
- * ## 与 `AGENTS.md` 既有约定一致
+ * ### 留下的唯一影响
  *
- * 「靠『文件实际在哪』这个事实探测，比靠『进程记得什么』可靠」——
- * 这里读的是**磁盘上的凭据文件**，不依赖任何进程是否在跑。
+ * **coding-plan（ultra）通道对纯插件登录用户不可用** —— `coding_plan_key_zai` /
+ * `coding_plan_key_bigmodel` 过去**只**由 `readZcodeCredential()` 填，而唯一能
+ * 给它补 key 的 `fetchCodingPlanApiKey()`（`zcode-transport.ts`）**至今没有任何
+ * 调用方**。⇒ 这**不是**本次删除造成的回退：纯插件登录用户本来就拿不到该通道。
+ * 两个 key 字段**保留**在类型里，因为存量凭据（早期从本机读进来的那批）
+ * 仍可能带着它们，`zcode-transport.ts` 的通道判定依赖它们。
  */
 
-import { createDecipheriv, createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
-import { homedir, platform, userInfo } from 'node:os'
-import { join } from 'node:path'
-
-/** 密文前缀；无此前缀的值视为明文（官方实现同样如此）。 */
-export const CREDENTIAL_PREFIX = 'enc:v1:'
-
-/** 加密算法（官方 `createCredentialCipherProvider`）。 */
-const CREDENTIAL_ALGO = 'aes-256-gcm'
-
-/** IV 长度（字节）。 */
-const CREDENTIAL_IV_LEN = 12
-
-/** AuthTag 长度（字节）。 */
-const CREDENTIAL_TAG_LEN = 16
-
-/** 覆盖密钥的环境变量（官方同名）。 */
-export const CREDENTIAL_SECRET_ENV = 'ZCODE_CREDENTIAL_SECRET'
-
 /**
- * `credentials.json` 的候选位置（按优先级）。
- *
- * ⚠ 与初版 `bridgeDiscoveryCandidates()` 的区别：**不再扫盘**。
- * 初版为找 `bridge-port.json` 会遍历每个盘符的顶层目录（实测 82 个候选、
- * 每次请求约 3ms），因为发现文件可能落在自定义路径（`<项目>\_oss_data`）。
- * 而 `credentials.json` 的位置由**官方固定**：写在
- * `<dataBaseDir>/.zcode/v2/` 下，默认 `dataBaseDir` 就是家目录。
- * 故只需少量确定候选 —— 这让「每次请求重读」的成本可忽略。
- */
-export function credentialFileCandidates(): readonly string[] {
-  const out: string[] = []
-  const push = (dir: string | undefined): void => {
-    if (typeof dir !== 'string' || dir.trim().length === 0) return
-    const candidate = join(dir.trim(), '.zcode', 'v2', 'credentials.json')
-    if (!out.includes(candidate)) out.push(candidate)
-  }
-
-  // ① 显式数据根目录（支持 `;` 分隔多目录）—— 官方读同一个变量。
-  const fromEnv = process.env.ZCODE_DATA_BASE_DIR
-  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
-    for (const dir of fromEnv.split(';')) push(dir)
-  }
-
-  // ② 家目录（官方默认：dataBaseDir = homedir，其下有 .zcode）。
-  push(homedir())
-
-  /**
-   * ③ `%APPDATA%` / `%LOCALAPPDATA%`。
-   *
-   * 实测本机凭据在 `~/.zcode/v2/`，但官方部分安装形态用
-   * `%APPDATA%\ZCode` 作 userData —— 两个都试，代价只是一次 stat。
-   */
-  push(process.env.APPDATA)
-  push(process.env.LOCALAPPDATA)
-
-  return out
-}
-
-/** 定位实际存在的凭据文件；都找不到时返回首选路径（供报错信息用）。 */
-export function resolveCredentialFilePath(): string {
-  const candidates = credentialFileCandidates()
-  for (const path of candidates) {
-    try {
-      if (existsSync(path)) return path
-    } catch {
-      // 权限/路径异常视为该候选不可用。
-    }
-  }
-  return candidates[0] ?? join(homedir(), '.zcode', 'v2', 'credentials.json')
-}
-
-/** 读磁盘上的原始凭据表（`键 → 密文或明文`）。失败返回 undefined。 */
-export function readRawCredentials(
-  filePath: string = resolveCredentialFilePath(),
-): Record<string, string> | undefined {
-  try {
-    if (!existsSync(filePath)) return undefined
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
-    const out: Record<string, string> = {}
-    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof value === 'string') out[key] = value
-    }
-    return out
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * 派生解密密钥（官方 `defaultCredentialSecret` + `deriveCipherKey`）。
- *
- * ⚠ 逐字复刻官方算法，**不要"规范化"**：
- * - 平台用 `process.platform` 原值（`win32` / `darwin` / `linux`）
- * - 用户名取值失败时回落**字面量** `unknown`
- * - 三段用 `:` 连接，前缀是 `zcode-credential-fallback`
- *
- * 任一处不同都会解出垃圾（GCM 认证失败），表现为「凭据读不出来」。
- */
-export function deriveCredentialKey(env: NodeJS.ProcessEnv = process.env): Buffer {
-  const explicit = env[CREDENTIAL_SECRET_ENV]
-  if (typeof explicit === 'string' && explicit.length > 0) {
-    return createHash('sha256').update(explicit).digest()
-  }
-  let username = 'unknown'
-  try {
-    username = userInfo().username
-  } catch {
-    // 官方同样吞掉异常并回落 "unknown"。
-  }
-  const secret = `zcode-credential-fallback:${platform()}:${homedir()}:${username}`
-  return createHash('sha256').update(secret).digest()
-}
-
-/**
- * 解密一个凭据值。
- *
- * 无 `enc:v1:` 前缀时**原样返回**（官方 `decrypt()` 行为）——
- * 这让该函数对「用户手工填入明文」也成立。
- *
- * @throws 密文格式非法 / 密钥不匹配 / GCM 认证失败
- */
-export function decryptCredentialValue(
-  value: string,
-  env: NodeJS.ProcessEnv = process.env,
-): string {
-  if (!value.startsWith(CREDENTIAL_PREFIX)) return value
-  const parts = value.slice(CREDENTIAL_PREFIX.length).split('.')
-  if (parts.length !== 3) throw new Error('凭据密文格式非法（应为 iv.tag.data 三段）')
-  const [ivPart, tagPart, dataPart] = parts as [string, string, string]
-  if (ivPart.length === 0 || tagPart.length === 0 || dataPart.length === 0) {
-    throw new Error('凭据密文格式非法（存在空段）')
-  }
-  const iv = Buffer.from(ivPart, 'base64url')
-  const tag = Buffer.from(tagPart, 'base64url')
-  const data = Buffer.from(dataPart, 'base64url')
-  if (iv.length !== CREDENTIAL_IV_LEN) {
-    throw new Error(`凭据 IV 长度非法（${iv.length} ≠ ${CREDENTIAL_IV_LEN}）`)
-  }
-  if (tag.length !== CREDENTIAL_TAG_LEN) {
-    throw new Error(`凭据 AuthTag 长度非法（${tag.length} ≠ ${CREDENTIAL_TAG_LEN}）`)
-  }
-  const decipher = createDecipheriv(CREDENTIAL_ALGO, deriveCredentialKey(env), iv)
-  decipher.setAuthTag(tag)
-  try {
-    return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8')
-  } catch (error) {
-    throw new Error(
-      `凭据解密失败（密钥不匹配或密文损坏）：${error instanceof Error ? error.message : String(error)}`,
-    )
-  }
-}
-
-/**
- * ZCode 账号凭据（全部来自磁盘解密，**不需要实例在跑**）。
- *
- * ⚠ 与初版 `ZcodeCredential`（`{bridge_token, bridge_port}`）**完全不同**：
- * 那个描述「本机桥的访问信息」，这个描述「上游账号身份」。
+ * ZCode 账号凭据（全部由**插件自己的 OAuth 流程**产出，见 `zcode-login.ts`）。
  */
 export interface ZcodeCredential {
   /** ZCode JWT（`zcodejwttoken`）—— 免费额度通道的 `Authorization: Bearer`。 */
@@ -193,241 +51,108 @@ export interface ZcodeCredential {
   /**
    * 设备标识。
    *
-   * 插件登录路径下由 `generateDeviceMid()` **自己随机生成**；
-   * 读官方客户端凭据时来自 `~/.zcode/v2/telemetry-state.json` 的 `deviceMid`。
+   * 由 `generateDeviceMid()`（`zcode-login.ts`）**自己随机生成**。
    *
    * ⚠ **必需**：`billing/balance` 等端点缺它会返回
    * `400 {"code":3001,"msg":"parameter error"}`（实测）。
+   * 实测依据：同一 JWT 换任意随机 UUID，`billing/balance` 都回 200 ⇒
+   * 它的**值**不被服务端绑定校验，只需**稳定**（生成后持久化在凭据里）。
    *
    * ⚠⚠ **它不是账号标识，别拿它去重 / 认账号**：
-   * 插件登录时它由我们随机生成（实测其值不被服务端绑定校验），
-   * 同一账号**每次重新登录都会得到一个新值** —— 拿它判「是否同一账号」
-   * 会把同一账号判成不同账号。
+   * 我们随机生成，同一账号**每次重新登录都会得到一个新值** ——
+   * 拿它判「是否同一账号」会把同一账号判成不同账号。
    */
   device_mid: string
   /**
    * ★ **账号标识**（服务端下发的 `user.user_id`）。
    *
-   * ## 为什么必须有（真实缺陷，2026-10-02）
+   * 它是**唯一**能判断「两条账号记录是不是同一个账号」的稳定标识
+   * （`device_mid` 每次登录都变，见上）。账号去重（`jet-hub-rpc.ts` 的
+   * `findAccountIdByIdentityField`）与「防跨账号覆盖」全靠它。
    *
-   * 它是**唯一**能判断「两条账号记录是不是同一个账号」的稳定标识 ——
-   * 但此前 `startLogin` 组装凭据时**把它丢掉了**（`loginResult.userId`
-   * 从未被搬进 credential），于是**无从去重**：同一账号点两次
-   * 「添加账号」就得到两条，两条各自消耗额度。
-   *
-   * ⚠ 与 `device_mid` 的关键差异（**别混用**）：
-   *
-   * | 字段 | 来源 | 同一账号多次登录 |
-   * |---|---|---|
-   * | `device_mid` | **我们随机生成** | **会变**（不可作标识） |
-   * | `user_id` | **服务端下发** | **不变**（正确的标识） |
-   *
-   * ⚠ 早期登录的凭据里**没有**这个字段 —— 读取时按 `undefined` 处理，
+   * ⚠ 老凭据里可能**没有**这个字段 —— 读取时按 `undefined` 处理，
    * 去重逻辑必须容忍缺失（回退或放弃去重，**不能报错**）。
    */
   user_id?: string
-  /** 大模型 access token（`oauth:bigmodel:access_token`），备用身份。 */
+  /** 大模型 access token（`bigmodel` 渠道登录时拿到的），备用身份。 */
   bigmodel_access_token?: string
-  /** Coding Plan api-key（zai 侧），仅 ultra 通道需要。 */
+  /** z.ai access token（`zai` 渠道登录时拿到的），备用身份。 */
+  zai_access_token?: string
+  /**
+   * Coding Plan api-key（zai 侧），仅 ultra 通道需要。
+   *
+   * ⚠ **新登录路径不会填**（上游不在登录时下发它，见
+   * `zcode-transport.ts` 的 `fetchCodingPlanApiKey` 说明）。
+   * 保留字段是因为**存量凭据**可能带着它。
+   */
   coding_plan_key_zai?: string
-  /** Coding Plan api-key（bigmodel 侧），仅 ultra 通道需要。 */
+  /** Coding Plan api-key（bigmodel 侧），仅 ultra 通道需要。保留理由同上。 */
   coding_plan_key_bigmodel?: string
-  /** 展示用标签（脱敏手机号 / 用户名 / 设备码）。 */
+  /** 展示用标签（脱敏手机号 / 用户名）。 */
   account_label?: string
-  /** 客户端版本，随请求头下发。 */
+  /**
+   * 账号名（用户在智谱侧的用户名，如 `mylzscy4`）。
+   *
+   * 与 `account_label` 分开存的理由：`account_label` 可能是兜底链的占位串，
+   * 而 `account_name` 始终是真实用户名，供账号卡片展示。
+   */
+  account_name?: string
+  /**
+   * 脱敏手机号（`159****0100`）。
+   *
+   * ⚠ 它是**从 17 位 `user_id` 前 11 位派生**的，不是独立字段
+   * （上游不下发手机号；智谱把手机号编进了 id 前缀）⇒
+   * **取不到合法前缀时不设该字段**（宁可不显示，也不猜）。
+   */
+  phone?: string
+  /** 客户端版本，随请求头下发（`X-ZCode-App-Version` / `User-Agent`）。 */
   app_version?: string
   /**
    * 凭据来源。
    *
-   * - `plugin` = 用户在 Jet Hub 里**插件内登录**拿到的（无需官方客户端）
-   * - `ide`    = 解密自官方客户端的 `~/.zcode/v2/credentials.json`
-   *
-   * 仅用于展示与排查，不参与鉴权。
+   * ⚠ **新凭据恒为 `'plugin'`**（本文件顶部说明了为何不再有 `'ide'`）。
+   * 保留该字段是因为**存量凭据**里可能已经写着 `'ide'`，
+   * 且它仍供排查时区分「这批凭据是哪条路来的」。
    */
   source?: 'plugin' | 'ide'
   /** 不可续期（静态凭据；失效需用户重新登录 ZCode）。 */
   refresh_token?: undefined
 }
 
-/** 凭据键的匹配片段（官方键名很长且含 uuid，故用片段匹配）。 */
-const KEY_FRAGMENTS = {
-  jwt: 'zcodejwttoken',
-  bigmodelAccess: 'oauth:bigmodel:access_token',
-  codingPlanZai: 'zai-individual-coding-plan',
-  codingPlanBigmodel: 'bigmodel-individual-coding-plan',
-  userInfo: 'oauth:bigmodel:user_info',
-} as const
-
-/** 在凭据表里按键名**片段**查找并解密。 */
-function pickCredential(
-  table: Record<string, string>,
-  fragment: string,
-  env: NodeJS.ProcessEnv,
-): string | undefined {
-  for (const [key, value] of Object.entries(table)) {
-    if (!key.includes(fragment)) continue
-    try {
-      const plain = decryptCredentialValue(value, env)
-      if (plain.length > 0) return plain
-    } catch {
-      // 单个键解不开不影响其它键（例如某键用了不同的 secret）。
-    }
-  }
-  return undefined
-}
-
-/** 从 userInfo 里提取展示名（手机号末 4 位 / 用户名 / id 末 6 位）。 */
-export function labelFromUserInfo(raw: string | undefined): string | undefined {
-  if (raw === undefined) return undefined
-  try {
-    const info = JSON.parse(raw) as Record<string, unknown>
-    for (const field of ['phone', 'mobile', 'name', 'nickname', 'email']) {
-      const value = info[field]
-      if (typeof value === 'string' && value.trim().length > 0) {
-        const text = value.trim()
-        // 手机号只留末 4 位（与其余 provider 的脱敏惯例一致）。
-        if (/^\d{7,}$/.test(text)) return `尾号${text.slice(-4)}`
-        return text.length > 24 ? text.slice(0, 24) : text
-      }
-    }
-    const id = info['id'] ?? info['userId']
-    if (typeof id === 'string' && id.length >= 6) return `id:${id.slice(-6)}`
-  } catch {
-    // userInfo 不是 JSON —— 忽略。
-  }
-  return undefined
-}
-
-/** `telemetry-state.json` 的候选位置（与凭据同目录，故同形）。 */
-function telemetryFileCandidates(): readonly string[] {
-  const out: string[] = []
-  const push = (dir: string | undefined): void => {
-    if (typeof dir !== 'string' || dir.trim().length === 0) return
-    const candidate = join(dir.trim(), '.zcode', 'v2', 'telemetry-state.json')
-    if (!out.includes(candidate)) out.push(candidate)
-  }
-  const fromEnv = process.env.ZCODE_DATA_BASE_DIR
-  if (typeof fromEnv === 'string') for (const dir of fromEnv.split(';')) push(dir)
-  push(homedir())
-  push(process.env.APPDATA)
-  return out
-}
+/**
+ * 手机号：11 位、以 1 开头、第 2 位 3-9（中国大陆移动号段）。
+ */
+const PHONE_RE = /^1[3-9]\d{9}$/
 
 /**
- * 读设备标识。
+ * 从 17 位 `user_id` 派生脱敏手机号，取不到返回 `undefined`。
  *
- * ⚠ 缺它时上游对 `billing/*` 与推理端点一律回
- * `400 code 3001 parameter error`（实测）—— 故它是**准入门槛的一部分**。
+ * ## ⚠ 为什么要「派生」而不是「读取」
+ *
+ * 上游**不下发**手机号字段。实测（扫遍 `~/.zcode/v2/*.json`、解两个 JWT 的
+ * payload）：`user_info` 只有 `{id, username, displayName, rawProfile}`，
+ * `zcodejwttoken` 的 payload 只有 `{user_id, token_version, sub, iat}` ——
+ * 唯一命中 11 位手机号形状的字符串就是 `user_info.id` 的**前 11 位**。
+ *
+ * ⇒ 智谱把手机号编进了 `user_id` 的前缀。故这里取前 11 位校验后脱敏；
+ * **校验不过就不显示**（有些账号的 id 前缀并非手机号，不能硬套）。
  */
-export function readDeviceMid(): string | undefined {
-  for (const path of telemetryFileCandidates()) {
-    try {
-      if (!existsSync(path)) continue
-      const parsed = JSON.parse(readFileSync(path, 'utf8')) as { deviceMid?: unknown }
-      if (typeof parsed.deviceMid === 'string' && parsed.deviceMid.trim().length > 0) {
-        return parsed.deviceMid.trim()
-      }
-    } catch {
-      // 换个候选。
-    }
-  }
-  return undefined
+export function phoneFromUserId(userId: string | undefined): string | undefined {
+  if (typeof userId !== 'string' || userId.length < 11) return undefined
+  const head = userId.slice(0, 11)
+  if (!PHONE_RE.test(head)) return undefined
+  return `${head.slice(0, 3)}****${head.slice(-4)}`
 }
 
-/** 兜底的客户端版本（探测失败时用）。 */
+/** 客户端版本的兜底值（请求头 `X-ZCode-App-Version` 用）。 */
 export const ZCODE_APP_VERSION_FALLBACK = '3.14.3'
-
-/**
- * 探测已安装的 ZCode 客户端版本。
- *
- * 为什么需要：请求头 `X-ZCode-App-Version` 与实际安装版本一致更自然。
- * 取不到时用兜底值 —— **不让版本探测失败连带让 provider 不可用**
- * （版本只是一个头，不该成为硬依赖）。
- */
-export function detectZcodeAppVersion(): string {
-  const roots = [
-    join(process.env.LOCALAPPDATA ?? '', 'Programs', 'ZCode'),
-    join(process.env.PROGRAMFILES ?? '', 'ZCode'),
-    join(process.env['PROGRAMFILES(X86)'] ?? '', 'ZCode'),
-  ]
-  for (const root of roots) {
-    try {
-      if (!existsSync(join(root, 'ZCode.exe'))) continue
-      const manifest = join(root, '.zcode-install-manifest')
-      if (!existsSync(manifest)) continue
-      const match = readFileSync(manifest, 'utf8').match(/"version"\s*:\s*"(\d+\.\d+\.\d+)"/)
-      if (match?.[1] !== undefined) return match[1]
-    } catch {
-      // 忽略，试下一个候选。
-    }
-  }
-  return ZCODE_APP_VERSION_FALLBACK
-}
-
-/**
- * 读取**可用**的 ZCode 凭据（来源：官方客户端的凭据文件）。
- *
- * 返回 `undefined` 表示**没有可用的 ZCode 登录态**（凭据文件不存在、
- * 解不开、或缺关键字段）—— 调用方据此让 provider 整体隐藏，
- * 而不是抛错（抛错会在 DSH 界面上多一条 provider 失败记录）。
- *
- * ⚠ 这是**回退路径**。优先路径是 `ctx.credentials` 里的插件自存凭据
- * （见 `ZcodeAuth.current()`）—— 那条路让用户不必安装官方客户端。
- */
-export function readZcodeCredential(
-  env: NodeJS.ProcessEnv = process.env,
-  filePath?: string,
-): ZcodeCredential | undefined {
-  const table = readRawCredentials(filePath)
-  if (table === undefined) return undefined
-
-  const jwt = pickCredential(table, KEY_FRAGMENTS.jwt, env)
-  if (jwt === undefined) return undefined
-
-  const deviceMid = readDeviceMid()
-  if (deviceMid === undefined) return undefined
-
-  const userInfo = pickCredential(table, KEY_FRAGMENTS.userInfo, env)
-  return {
-    zcode_jwt: jwt,
-    device_mid: deviceMid,
-    bigmodel_access_token: pickCredential(table, KEY_FRAGMENTS.bigmodelAccess, env),
-    coding_plan_key_zai: pickCredential(table, KEY_FRAGMENTS.codingPlanZai, env),
-    coding_plan_key_bigmodel: pickCredential(table, KEY_FRAGMENTS.codingPlanBigmodel, env),
-    account_label: labelFromUserInfo(userInfo) ?? `设备${deviceMid.slice(0, 8)}`,
-    app_version: detectZcodeAppVersion(),
-    // 标记来源，便于 UI 与排查区分「插件登录」与「读官方客户端」。
-    source: 'ide',
-  }
-}
-
-/**
- * 从两个来源里挑一个可用凭据。
- *
- * 优先级：**插件自存 > 官方客户端凭据文件**。
- *
- * ## 为什么插件自存优先
- *
- * 「插件内登录」的目标是让用户**不装 ZCode 客户端也能用**。
- * 若反过来（官方优先），一个用户在插件里登录后，只要机器上碰巧有
- * 另一份（可能已失效的）官方凭据，就会被后者覆盖 —— 表现为
- * 「明明刚登录成功，却报凭据失效」。
- *
- * @param stored 插件自存的凭据（来自 `ctx.credentials`；已解析成对象）。
- */
-export function resolveZcodeCredential(
-  stored: ZcodeCredential | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): ZcodeCredential | undefined {
-  if (stored !== undefined && isUsableZcodeCredential(stored)) return stored
-  return readZcodeCredential(env)
-}
 
 /**
  * 凭据是否「够用」。
  *
  * 判据是**上游真正需要的两个字段**：JWT 与 device_mid。
- * 其余（coding-plan key 等）都是可选的 —— 缺了只影响 ultra 通道。
+ * 其余（access token、coding-plan key 等）都是可选的 ——
+ * 缺了只影响 ultra 通道。
  */
 export function isUsableZcodeCredential(value: unknown): value is ZcodeCredential {
   if (typeof value !== 'object' || value === null) return false

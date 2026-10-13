@@ -33,18 +33,31 @@
 
 /** 构造选项。 */
 export interface TtlCacheOptions<T> {
-  /** 缓存有效期（毫秒）。 */
+  /** 缓存有效期（毫秒）。`ttlFor` 省略时，每个值都用它。 */
   ttlMs: number
   /** 真正的加载函数（**失败**应抛错；返回值可为 `undefined` 表示「无结果」）。 */
   load: () => Promise<T>
+  /**
+   * 按**结果**决定这一条自己的有效期（毫秒）；省略时一律用 `ttlMs`。
+   *
+   * 需求来自「用量徽标」：拿到真实读数的结果值得缓存久一点，而**全部账号都
+   * 失败**的那种结果只是当时的网络/凭据状态，缓存久了会让用户修好凭据之后
+   * 仍盯着「用量不可用」。与 `buddy-balance-selector.ts` /
+   * `loomy-balance-selector.ts` 既有的「成功 60s / 失败 5s」口径同源。
+   *
+   * ⚠️ 返回值非法（非有限数 / 负数）时**回落到 `ttlMs`**，不抛错也不当成 0：
+   * 当成 0 会让这个缓存变成「永不命中」，把上游请求量悄悄放大一个数量级。
+   */
+  ttlFor?: (value: T) => number
   /** 取当前时刻（注入以便单测）。 */
   now?: () => number
 }
 
-/** 缓存项。 */
+/** 缓存项。`ttlMs` 是**写入时**按 `ttlFor` 定下的、这一条自己的有效期。 */
 interface Entry<T> {
   value: T
   atMs: number
+  ttlMs: number
 }
 
 /**
@@ -58,11 +71,13 @@ export class TtlCache<T> {
   private entry: Entry<T> | undefined
   private inflight: Promise<T> | undefined
   private readonly ttlMs: number
+  private readonly ttlFor: ((value: T) => number) | undefined
   private readonly load: () => Promise<T>
   private readonly now: () => number
 
   constructor(options: TtlCacheOptions<T>) {
     this.ttlMs = options.ttlMs
+    this.ttlFor = options.ttlFor
     this.load = options.load
     this.now = options.now ?? (() => Date.now())
   }
@@ -82,7 +97,7 @@ export class TtlCache<T> {
 
     const task = (async (): Promise<T> => {
       const value = await this.load()
-      this.entry = { value, atMs: this.now() }
+      this.write(value)
       return value
     })()
     this.inflight = task
@@ -102,7 +117,9 @@ export class TtlCache<T> {
   peek(): Entry<T> | undefined {
     const entry = this.entry
     if (entry === undefined) return undefined
-    if (this.now() - entry.atMs >= this.ttlMs) {
+    // ⚠ 用**这一条自己的** ttlMs（写入时由 `ttlFor` 定下），不是构造参数 ——
+    // 否则「成功缓存久 / 失败缓存短」会在读取这一侧被构造参数覆盖掉。
+    if (this.now() - entry.atMs >= entry.ttlMs) {
       this.entry = undefined
       return undefined
     }
@@ -111,7 +128,19 @@ export class TtlCache<T> {
 
   /** 写入一个已知值（例如从别处拿到的新配置，避免下一次白加载）。 */
   set(value: T): void {
-    this.entry = { value, atMs: this.now() }
+    this.write(value)
+  }
+
+  /** 写入缓存项：有效期在**这一刻**定下（见 `TtlCacheOptions.ttlFor`）。 */
+  private write(value: T): void {
+    this.entry = { value, atMs: this.now(), ttlMs: this.effectiveTtl(value) }
+  }
+
+  /** 这一条该缓存多久；`ttlFor` 缺省或返回非法值时用构造参数。 */
+  private effectiveTtl(value: T): number {
+    if (this.ttlFor === undefined) return this.ttlMs
+    const ttl = this.ttlFor(value)
+    return Number.isFinite(ttl) && ttl >= 0 ? ttl : this.ttlMs
   }
 
   /** 清空（关停时调用）。 */

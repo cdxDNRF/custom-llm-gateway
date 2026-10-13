@@ -1,11 +1,25 @@
 /**
- * ZCode 的阿里云 captcha 产出（**唯一还需要浏览器的环节**）。
+ * ZCode 的阿里云 captcha 产出（**唯一还需要浏览器的环节，但只服务 claim 路径**）。
  *
- * ## 为什么需要它
+ * ## 谁还要 captcha（2026-10-01 直连上游实测，别再凭印象改）
  *
- * ZCode 免费额度通道（`/api/v1/zcode-plan/anthropic`）强制阿里云 captcha：
- * 缺 `x-aliyun-captcha-verify-param` 时上游回
- * `400 {"code":3007,"msg":"captcha verify failed"}`（实测）。
+ * | 端点 | 不带验证头 | 结论 |
+ * |---|---|---|
+ * | `/api/v1/zcode-plan/anthropic`（**模型请求**） | **HTTP 200**（6 个采样点） | **自 3.14.4（2026-09-29）起不再索要** |
+ * | `/api/v1/zcode-plan/billing/claim`（**领取**） | `400 {"code":3007}` | **始终索要**，且校验**前置于** plan 校验 |
+ *
+ * ⇒ 模型请求这条路现在**恒不产** param（`src/captcha-requirement.ts` 的
+ * 「先探后取」使 mint 次数归零）；仍在产的是**领取**（每日一次 / 手动点「一键领取」，
+ * **每个 plan 独立一个**，一次性，复用必 `3007`）。
+ * ⚠ 模型请求侧的 `3007` 防御分支**故意保留**：万一上游回滚再开校验，推理请求仍能自愈，
+ * 而不是把失败抛给用户。
+ *
+ * ## 载体：web 版必需浏览器，桌面版可用内部载体
+ * captcha 是**网页 SDK**（`o.alicdn.com/.../AliyunCaptcha.js`），任何有 DOM 能跑 JS 的
+ * 浏览器都能产。本文件这套外挂 chromium 路径是 **web 版的必需项**；
+ * DSH Desktop 下会优先用**桌面自己的 Electron 内核**（`dshDesktop.browser` 租约 +
+ * 隐藏 `<webview>` + `executeJavaScript`，见 `src/captcha-carrier.ts`），
+ * 本文件退为其**兜底**（`DSH_ZCODE_INTERNAL_CARRIER=0` 可强制只用它）。
  *
  * ## 为什么能用普通浏览器而不是 ZCode 那个壳
  *
@@ -22,9 +36,9 @@
  * 故任何「有 DOM + canvas + 能跑 JS」的浏览器都行。实测
  * **scoop 的 chromium（headful + 基本 stealth 补丁）** 可稳定产出。
  *
- * ## ⚠ 两个实测得到的硬约束（决定本文件的实现形态）
+ * ## ⚠ 两个实测得到的约束（第 1 条后来**被推翻**，结论以第 2 条为准）
  *
- * ### 1. 同一个页面**不能**重复 mint
+ * ### 1. ~~同一个页面**不能**重复 mint~~ → **已推翻**（当时页面停在 `about:blank`）
  *
  * 同一 page 上连续 `initAliyunCaptcha` 三次的实测结果：
  *
@@ -37,6 +51,12 @@
  * ⇒ SDK 实例状态在页面内不可重复初始化。**每次 mint 必须新建 page target**。
  * 采用该策略后实测 **4/4 成功，中位 1246ms**（浏览器冷启动仅 690ms）。
  *
+ * ⚠⚠ **上面那两行是当时的结论，现在别再照着做**：真正的变量是页面 origin ——
+ * 那三次是在 `about:blank`（origin 为字符串 `"null"`）上跑的。换到真实
+ * `https://zcode.z.ai/` 后同一页面可**连续 mint 5/5**，中位 426ms / 平均 546ms，
+ * 现行实现因此**复用常驻页面 + 每次重置 DOM**。证据与推理见
+ * {@link CAPTCHA_PAGE_ORIGIN}；上面的表保留仅作原始记录（改回去会让耗时翻 2.3 倍）。
+ *
  * ### 2. `--headless=new` 过不了，必须 **headful**
  *
  * | 模式 | 结果 |
@@ -48,11 +68,29 @@
  * （`--window-position=-32000,-32000` 移出屏幕）。
  */
 
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:net'
-import { homedir, tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { homedir } from 'node:os'
+
+import { CdpConnection, ChromiumSession, sleep } from './chromium-session.js'
+
+/**
+ * 浏览器侧通用件**已搬到 `./chromium-session.js`**（库库AI 的登录注册也复用它）。
+ *
+ * ⚠️ 这里**必须继续 re-export**，两条理由各管一件事：
+ * 1. 既有调用方（`zcode-auth.ts` / `zcode-adapter.ts` 等）与一批回归用例
+ *    是按 `./zcode-captcha.js` 这个路径 import 的，砍掉导出面等于改 API；
+ * 2. 源码扫描型用例（拿 `readFileSync` 读源码做断言的那些）已改为指向
+ *    `chromium-session.ts` —— 那是**代码真正所在**的文件，否则断言会打空、
+ *    变成假绿。
+ */
+export {
+  browserCandidates,
+  browserNotFoundMessage,
+  buildLinuxSkipTaskbarArgs,
+  buildMacosMiniaturizeArgs,
+  findBrowserExecutable,
+  isEdgeExecutable,
+  parseWmctrlList,
+} from './chromium-session.js'
 
 /** 阿里云 captcha 配置（服务端下发；此处为实测兜底值）。 */
 export interface ZcodeCaptchaConfig {
@@ -62,6 +100,84 @@ export interface ZcodeCaptchaConfig {
   prefix: string
   /** 场景 id。 */
   sceneId: string
+  /**
+   * 上游是否**启用** captcha（服务端 `data.configs.captcha.enabled`）。
+   *
+   * ⚠ **可选**：缺席 = 「不知道」，不是 `false`。两者语义完全不同
+   * （见 {@link requiresCaptchaUpfront}）。
+   */
+  enabled?: boolean
+  /**
+   * 上游是否**对模型请求（推理）跳过** captcha 校验
+   * （服务端 `data.configs.captcha.skip_model_request`）。
+   *
+   * ## 为什么这个字段必须读出来（2026-10-12，用户要求核实 3.14.5）
+   *
+   * 官方闭源版 **3.14.5** 的渲染层产物（`out/renderer/assets/styles-*.js`）
+   * 逆向得到这样一条链：
+   *
+   * ```js
+   * // ① 准入：只有智谱积分账号走这条
+   * function xnn(e){ return e?.access?.type==='zhipu-account' && e.access.mode==='start-plan' }
+   *
+   * // ② 索要 captcha（`model-request` 与 `captcha-retry` 两种 reason 都进这里）
+   * async function Lnn(e){
+   *   if (!xnn(e.providerConfig)) return
+   *   if (t?.enabled===false || t?.skipModelRequest===true) return { headers:{} }  // ← 跳过
+   *   const n = await Pnn(t, {...})
+   *   return { headers: unn({ captchaVerifyParam: n, captchaRegion: t.region }) }
+   * }
+   * ```
+   *
+   * 且 host 侧新增 `interaction/requestProviderRuntimeHeaders` RPC，其 `reason`
+   * 取值域是 `['model-request', 'captcha-retry']` —— **推理请求真的会走 captcha**，
+   * 被拒后还会用 `captcha-retry` 重试一轮。
+   *
+   * 服务端**当前**把开关关着（本机实测，只发 GET、零额度）：
+   * `{ enabled:true, prefix:'no8xfe', region:'cn', sceneId:'11xygtvd',
+   *    skip_model_request:true }` ⇒ `Lnn` 第二行即返回，不产 param、不注头。
+   *
+   * ⚠ **官方把它转成 camelCase**（`getCaptchaConfig()` 里逐字
+   * `let { skip_model_request: r, ...o } = n; return { ...o,
+   * ...typeof r === 'boolean' ? { skipModelRequest: r } : {} }`）——
+   * 我们的读法必须与它一致，且**同样只在真的是布尔时才写字段**。
+   */
+  skipModelRequest?: boolean
+}
+
+/**
+ * 上游是否**明确要求**推理请求带 captcha —— 即「首发就该带，别再先探」。
+ *
+ * ## 三态（这是本判据的全部要点，别简化成布尔）
+ *
+ * | `skipModelRequest` | `enabled` | 返回 | 理由 |
+ * |---|---|---|---|
+ * | **`false`** | 非 `false` | **`true`** | 上游明确要 ⇒ 先探**必然**被 `3007` 拒，白吃一发往返 |
+ * | `true` | 非 `false` | `false` | 上游明确不校验 ⇒ 先探零成本，且能省掉一次 mint |
+ * | **缺席 / 非布尔** | 任意 | `false` | **不知道就不猜** |
+ * | 任意 | **`false`** | `false` | 上游把 captcha 整个关了 ⇒ 一票否决 |
+ *
+ * ## ⚠⚠ 两个最容易写反的地方
+ *
+ * 1. **方向**：能省的是 `skipModelRequest === false`（明确要 ⇒ 直接带），
+ *    **不是** `true`。`true` 表示上游不校验，先探本来就零成本、无可省。
+ * 2. **缺席 ≠ `false`**：若写成 `skipModelRequest !== true` 或
+ *    `Boolean(skipModelRequest === false)` 之类的宽松判据，就会在
+ *    **老配置 / 上游字段漂移**时把「不知道」当成「上游明确要验证」，
+ *    于是**每个请求白发一个 param** —— 白扣的是阿里云**设备级**配额
+ *    （同设备每小时 150 次，实测口径见 `captcha-backoff.ts`）。
+ *    这正是本仓库记过的「读不到就不猜」原则（同额度桶那条）。
+ *
+ * ⚠ 判据**只读配置**，不发网络、不碰浏览器 ⇒ 可以在热路径上每次调用。
+ */
+export function requiresCaptchaUpfront(
+  config: Pick<ZcodeCaptchaConfig, 'enabled' | 'skipModelRequest'> | undefined,
+): boolean {
+  if (config === undefined) return false
+  // 上游把 captcha 整个关掉时，无论 skip_model_request 是什么都不该带。
+  if (config.enabled === false) return false
+  // ⚠ 严格等于 `false`：`undefined`（缺席）走不到这里 ⇒ 保守回到先探。
+  return config.skipModelRequest === false
 }
 
 /**
@@ -108,6 +224,28 @@ export const CAPTCHA_BUTTON_ID = 'zcode-aliyun-captcha-button'
 export const CAPTCHA_PAGE_ORIGIN = 'https://zcode.z.ai/'
 
 /**
+ * 解析**载体页 origin**：注入值优先，空白/缺省一律回落实测常量。
+ *
+ * ## 为什么存在（以及它为什么**不是**配置项）
+ * 唯一的用途是让本地探针 `scripts/probe-captcha-local-origin.mjs`（不入库）能验证
+ * 「在 `http://127.0.0.1:<port>` 这种本地 origin 上，阿里云 SDK 到底产不产得出合法
+ * param」—— 那是「DSH web 版能否用用户浏览器当载体」这条路线的唯一准入问题
+ * （跨域 iframe 拿不到 DOM、浏览器也不给页面 CDP 权，所以载体页只能是 GUI 自己的 origin）。
+ *
+ * ⚠ **不许**把它接到 env / settings / UI：真实 https origin 是实测硬前提
+ * （`about:blank` 的 origin 是 `"null"`，第二次 mint 必 `F001`）。
+ * 默认值与空白回退由 `tests/unit/zcode-captcha-origin.spec.ts` 锁死。
+ *
+ * ⚠ 空白也算回落：注入空串会让导航变成 `about:blank`（即上面那条已知失败形态）。
+ */
+export function resolveCaptchaPageOrigin(
+  options: { pageOrigin?: string } = {},
+): string {
+  const injected = options.pageOrigin?.trim() ?? ''
+  return injected.length > 0 ? injected : CAPTCHA_PAGE_ORIGIN
+}
+
+/**
  * captcha param 的合法判据（与桥侧 `isUsableCaptchaParam` 同一套）。
  *
  * 三条全中才算合法：
@@ -115,7 +253,8 @@ export const CAPTCHA_PAGE_ORIGIN = 'https://zcode.z.ai/'
  * 2. 是 base64 且能解出 JSON
  * 3. 含 `securityToken` 且长度 ≥ **50**（实测合法值 128）
  *
- * 任一条不中即判为降级 —— **不发请求**，省一次注定 3007 的往返。
+ * 任一条不中即判为降级 —— **不发请求**：在索要验证的窗口里那发注定 `3007`；
+ * 即便上游此刻不校验这个头，把降级产物发出去也不是「成功」，故本地判据不放宽。
  */
 export function validateCaptchaParam(param: unknown): { ok: boolean; reason?: string } {
   if (typeof param !== 'string' || param.length === 0) {
@@ -153,134 +292,6 @@ export function validateCaptchaParam(param: unknown): { ok: boolean; reason?: st
 }
 
 /**
- * 浏览器可执行文件的候选位置（按优先级）。
- *
- * ## ⚠ 两个必须防的坑（都实测踩过）
- *
- * ### 1. 空环境变量会产生**相对路径**
- *
- * `join('', 'Google', 'Chrome', …)` 返回 `Google\Chrome\…` —— 一个**相对路径**，
- * `existsSync` 会相对**当前工作目录**解析。于是「当前目录下恰好有个同名文件」
- * 会被误判成浏览器，而真正的浏览器却找不到。
- *
- * ⇒ 只接受**绝对路径**候选（`isAbsolute` 过滤）。
- *
- * ### 2. `USERPROFILE` 不等于家目录
- *
- * scoop 的安装位置在 `~/.scoop` 或 `~/scoop` 下，而 `~` 应当用
- * `os.homedir()` 求（它还会看 `HOME`，且在 `USERPROFILE` 被改写时仍正确）。
- * 用 `process.env.USERPROFILE` 拼路径会在「环境变量异常/被沙箱改写」时失效 ——
- * 实测：把 `USERPROFILE` 指到沙箱后，原本可用的 scoop chromium 就找不到了。
- */
-export function findBrowserExecutable(): string | undefined {
-  const localAppData = process.env.LOCALAPPDATA ?? ''
-  const programFiles = process.env.PROGRAMFILES ?? ''
-  const programFilesX86 = process.env['PROGRAMFILES(X86)'] ?? ''
-  const home = homedir()
-  const candidates = [
-    /**
-     * ① scoop 的 **显式声明的**根目录优先于默认推导。
-     *
-     * `SCOOP` / `SCOOP_GLOBAL` 是 scoop 自己的「我装在哪」的权威声明 ——
-     * 用户设了它们就说明默认路径不对。若排在 `~/scoop` 之后，会出现
-     * 「旧默认路径恰好存在 → 用它，而用户实际在用的那个被忽略」。
-     */
-    ...(process.env.SCOOP !== undefined && process.env.SCOOP.trim().length > 0
-      ? [join(process.env.SCOOP.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
-      : []),
-    ...(process.env.SCOOP_GLOBAL !== undefined && process.env.SCOOP_GLOBAL.trim().length > 0
-      ? [join(process.env.SCOOP_GLOBAL.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
-      : []),
-    // ② scoop 默认根目录（`~/scoop`）。实测可用。
-    join(home, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe'),
-    // ③ 系统 Chrome。
-    join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    // ④ Chromium。
-    join(localAppData, 'Chromium', 'Application', 'chrome.exe'),
-    join(programFiles, 'Chromium', 'Application', 'chrome.exe'),
-    // ⑤ Edge（Chromium 内核，系统普遍自带）。
-    join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-  ]
-  const override = process.env.ZCODE_CHROME_PATH
-  if (typeof override === 'string' && override.trim().length > 0) {
-    candidates.unshift(override.trim())
-  }
-  for (const candidate of candidates) {
-    try {
-      /**
-       * ⚠ 只接受**绝对路径**：空环境变量产生的相对路径会相对 CWD 解析，
-       * 可能误匹配同名本地文件（见函数头第 1 条）。
-       */
-      if (candidate.length === 0 || !isAbsolute(candidate)) continue
-      if (existsSync(candidate)) return candidate
-    } catch {
-      // 试下一个。
-    }
-  }
-  return undefined
-}
-
-/** 极简 CDP 客户端（用 Node 内置 WebSocket，**零第三方依赖**）。 */
-class CdpConnection {
-  private nextId = 0
-  private readonly pending = new Map<number, {
-    resolve: (value: unknown) => void
-    reject: (error: Error) => void
-  }>()
-
-  constructor(private readonly ws: WebSocket) {
-    ws.addEventListener('message', (event: MessageEvent) => {
-      let message: { id?: number; error?: unknown; result?: unknown }
-      try {
-        message = JSON.parse(String(event.data)) as typeof message
-      } catch {
-        return
-      }
-      if (message.id === undefined) return
-      const slot = this.pending.get(message.id)
-      if (slot === undefined) return
-      this.pending.delete(message.id)
-      if (message.error !== undefined) slot.reject(new Error(JSON.stringify(message.error)))
-      else slot.resolve(message.result)
-    })
-  }
-
-  /** 发送一条 CDP 命令并等结果。 */
-  send(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
-    const id = ++this.nextId
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      try {
-        this.ws.send(JSON.stringify({ id, method, params }))
-      } catch (error) {
-        this.pending.delete(id)
-        reject(error instanceof Error ? error : new Error(String(error)))
-        return
-      }
-      const timer = setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id)
-          reject(new Error(`CDP ${method} 超时（${timeoutMs}ms）`))
-        }
-      }, timeoutMs)
-      timer.unref?.()
-    })
-  }
-
-  close(): void {
-    try {
-      this.ws.close()
-    } catch {
-      // 已关闭。
-    }
-  }
-}
-
-/**
  * 反检测补丁。
  *
  * ⚠ 必须用 `Page.addScriptToEvaluateOnNewDocument` 装 —— 那样它在
@@ -305,11 +316,6 @@ try {
   };
 } catch (error) { /* 内核无 WebGL 时忽略 */ }
 `
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
-  const timer = setTimeout(resolve, ms)
-  timer.unref?.()
-})
 
 /**
  * 构造请求体里那段「建 DOM + 注入 SDK」的表达式。
@@ -342,15 +348,20 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
  * ⚠ 与之配套的修法在 {@link buildSdkInitExpression}：**DOM 重建后必须
  * 重新 `initAliyunCaptcha`**（销毁旧实例、用新元素重新初始化）。
  */
-function buildDomExpression(): string {
+export function buildDomExpression(): string {
   return `document.body.innerHTML =
     '<div id="${CAPTCHA_CONTAINER_ID}" aria-hidden="true">' +
     '<div id="${CAPTCHA_ELEMENT_ID}"></div>' +
     '<button id="${CAPTCHA_BUTTON_ID}">verify</button></div>'; 'ok'`
 }
 
-/** 构造注入 SDK 的表达式（用 `<script src>`，简单可靠）。 */
-function buildSdkInjectExpression(): string {
+/**
+ * 构造注入 SDK 的表达式（用 `<script src>`，简单可靠）。
+ *
+ * ⚠ **无参**：SDK 地址是常量，`region`/`prefix`/`SceneId` 由 {@link buildMintExpression}
+ * 在 `initAliyunCaptcha` 那一刻才用 —— 别在这里塞 config，那会多出一条无人读的形参。
+ */
+export function buildSdkInjectExpression(): string {
   return `new Promise((resolve) => {
     if (typeof window.initAliyunCaptcha === 'function') { resolve('already'); return; }
     const script = document.createElement('script');
@@ -381,8 +392,21 @@ export interface CaptchaMintOutcome {
   interactive: boolean
 }
 
-/** 构造「触发无感验证并等 param」的表达式。 */
-function buildMintExpression(config: ZcodeCaptchaConfig): string {
+/**
+ * 构造「触发无感验证并等 param」的表达式。
+ *
+ * ## 为什么这三个表达式构造函数现在**导出**（二期 Task 3）
+ * 内部载体的**载体页**（`src/zcode-carrier-page.ts`）必须由 server 渲染，
+ * 才守得住「captcha 表达式只在 server 侧一份」这条约束 ——
+ * client 里再写一遍 SDK 调用必然与本文件漂移（本仓库反复吃过同型缺陷）。
+ * 除载体页外**不得**有第二个消费方。
+ *
+ * ⚠ 与 {@link STEALTH_PATCH} 的区别刻意为之：那份反检测补丁是**外挂 chromium**
+ * 为了遮 `--headless` 痕迹才需要的，内部载体是 Electron 真实 guest，
+ * 实测 `webdriver=false`、UA 带 `Electron/44.0.0` 时 4/4 产出合法 param
+ * ⇒ 补丁**既不导出也不使用**（搬进载体页属于无据扩面）。
+ */
+export function buildMintExpression(config: ZcodeCaptchaConfig): string {
   return `new Promise((resolve) => {
     const done = (payload) => resolve(JSON.stringify(payload));
     /**
@@ -483,6 +507,13 @@ export interface ZcodeCaptchaBrowserOptions {
   debugPort?: number
   /** 是否隐藏窗口（默认 true —— 用户不应被打扰）。 */
   hideWindow?: boolean
+  /**
+   * 载体页 origin（缺省 `CAPTCHA_PAGE_ORIGIN` = `https://zcode.z.ai/`）。
+   *
+   * ⚠ 仅供本地探针验证「本地 origin 行不行」，**不是生产配置**；
+   * 取值规则与红线见 {@link resolveCaptchaPageOrigin}。
+   */
+  pageOrigin?: string
   /** 就绪等待上限（毫秒）。 */
   readyTimeoutMs?: number
   /**
@@ -549,316 +580,17 @@ export interface ZcodeCaptchaBrowserOptions {
    * **两个都不来**，于是永久挂起（且因为不抛错，`pageBusy` 也不会复位）。
    */
   connectTimeoutMs?: number
-}
-
-/**
- * 挑一个**确实空闲**的调试端口。
- *
- * ⚠ 为什么不能随机取（见 `launch()` 里 `this.port` 处的完整缺陷链）：
- * 随机撞上「尚未退干净的旧实例」会让新实例启动失败、而我们连到旧实例上，
- * 最终 `dispose()` 打空 ⇒ 旧实例整棵树泄漏。
- *
- * 做法：先用 `net.createServer` **真的占用**一下候选端口来验证可用性
- * （比查「谁在监听」可靠：既覆盖监听态，也避开刚关闭进入 TIME_WAIT 的端口）。
- *
- * ⚠ 探测与真正启动之间仍有理论竞态，故 `launch()` 里还有第二道
- * 「应答端口是否一致」的校验。
- */
-async function pickFreePort(): Promise<number> {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const candidate = 9300 + Math.floor(Math.random() * 500)
-    if (await isPortFree(candidate)) return candidate
-  }
-  // 兜底：极端情况下退回随机（后续的端口校验会把问题暴露成明确报错）。
-  return 9300 + Math.floor(Math.random() * 500)
-}
-
-/** 试占一个端口判断是否空闲（能绑上就算空闲）。 */
-function isPortFree(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const server = createServer()
-    server.once('error', () => resolve(false))
-    server.once('listening', () => {
-      server.close(() => resolve(true))
-    })
-    // 只绑回环：chromium 的调试端口也在回环上。
-    try {
-      server.listen(port, '127.0.0.1')
-    } catch {
-      resolve(false)
-    }
-  })
-}
-
-/**
- * ★ 把 chromium 的窗口从**任务栏**移除（Windows）。
- *
- * ## 为什么需要（用户报障 2026-09-29）
- *
- * > captcha 打开的 chromium 虽然最小化在任务栏，但**每次刷新页面完成都会闪烁
- * > 提示**。任务栏设成自动隐藏时，它会不停**浮上来**显示那个闪烁提示，
- * > 挡住屏幕最下面一排。
- *
- * ## 根因（Win32 实测取证）
- *
- * 枚举窗口的 `exStyle` 发现，**主窗口缺 `WS_EX_TOOLWINDOW`（0x80）**：
- *
- * | 时机 | 窗口类 | exStyle | toolWindow | inTaskbar |
- * |---|---|---|---|---|
- * | 启动后（不可见） | `Chrome_WidgetWin_1` | `0x200100` | ✗ | false（未显示） |
- * | **页面加载后（可见）** | 同上 | `0x200100` | ✗ | **true** ★ |
- *
- * ⇒ 页面一渲染，窗口就**获得任务栏按钮**。有按钮，Windows 就有可闪的东西；
- * 任务栏自动隐藏时便浮出来显示它。
- *
- * ## 修法
- *
- * 给窗口加上 `WS_EX_TOOLWINDOW`：Win32 文档原话是「工具窗口**不出现在任务栏**」。
- * 没有按钮 ⇒ 没有可闪烁的提示 ⇒ 任务栏不会浮出。
- * 同时加 `WS_EX_NOACTIVATE`（不抢焦点、不前置），并清掉 `WS_EX_APPWINDOW`
- * （它会**强制**出现在任务栏，与目的相反）。
- *
- * ## 实测验证
- *
- * | 项 | 结果 |
- * |---|---|
- * | 打上后 `inTaskbar` | 13 个窗口**全部 false** |
- * | 连续 3 次 mint 后样式是否被重置 | **全部保持**（不会被 chromium 重置） |
- * | 对 captcha 功能的影响 | mint 仍成功（1802~1950ms） |
- * | 成本 | 约 1.2 秒；**只需在启动时做一次**，可与 3.7 秒的启动并行 ⇒ 几乎免费 |
- *
- * ⚠ **失败必须静默**：这是「减少打扰」的优化，不是功能依赖。
- * 借外部 PowerShell 有失败可能（策略限制/无权限），此时最坏结果是回到
- * 修复前的行为（窗口在任务栏），**绝不能让 captcha 因此不可用**。
- *
- * ⚠ 用 **`powershell.exe`**（Windows 5.1，系统自带）而不是 `pwsh` ——
- * 后者是可选安装，不能假设存在。实测本机 5.1 存在且 Add-Type 可用。
- */
-function hideWindowFromTaskbar(pid: number): void {
-  try {
-    if (process.platform === 'win32') hideWindowWindows(pid)
-    else if (process.platform === 'linux') hideWindowLinux(pid)
-    /**
-     * macOS：**不做**。
-     *
-     * ① 机制不同且更重：macOS 没有「任务栏按钮」概念，等价物是 Dock 图标
-     *   与 `NSApplicationActivationPolicy`（需改 Info.plist 或调
-     *   `TransformProcessType`，chromium 也暴露 `--activation-policy`，
-     *    但那是**启动参数**、不是后设属性）。
-     * ② 用户在 macOS 上没报过这个问题 —— 不实现未验证的代码
-     *   （本仓库的原则：能力字段与行为都要有实测依据）。
-     */
-  } catch {
-    // 静默：优化失败不影响 captcha。
-  }
-}
-
-/**
- * Windows：直接改窗口的**扩展样式**。
- *
- * 见 {@link hideWindowFromTaskbar} 的取证表（`WS_EX_TOOLWINDOW` 一出，
- * 窗口即不在任务栏）。
- */
-function hideWindowWindows(pid: number): void {
-  let dirCreated: string | undefined
-  try {
-    /**
-     * 脚本**纯 ASCII**（无中文注释）—— PS 5.1 对无 BOM 的 UTF-8 会按 ANSI
-     * 解读，含中文的脚本会损坏（实测过）。
-     *
-     * ⚠ 关键设计：**回读校验 + before 为 0 时跳过**。
-     * 内联版失败时的特征是「读到的 `exStyle` 恒为 0」，而脚本仍把样式
-     * 写成 0（可能破坏窗口）。这里明确要求 before 非 0 才写。
-     */
-    const script = `
-$ErrorActionPreference = 'SilentlyContinue'
-Add-Type @"
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public class ZcodeWinStyle {
-  public delegate bool EnumProc(IntPtr h, IntPtr l);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
-  [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
-  [DllImport("user32.dll", EntryPoint="SetWindowLongPtrW")] public static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
-  public static List<IntPtr> All() {
-    var r = new List<IntPtr>();
-    EnumWindows((h, l) => { r.Add(h); return true; }, IntPtr.Zero);
-    return r;
-  }
-}
-"@
-$EX = -20
-$TOOL = 0x80
-$APP = 0x40000
-$NOACT = 0x8000000
-$target = ${String(pid)}
-$n = 0
-$all = @([ZcodeWinStyle]::All())
-if ($all.Count -eq 0) { Write-Output 'enum-empty'; exit 0 }
-foreach ($h in $all) {
-  $wp = 0
-  [void][ZcodeWinStyle]::GetWindowThreadProcessId($h, [ref]$wp)
-  if ([int]$wp -ne $target) { continue }
-  $before = [int64][ZcodeWinStyle]::GetWindowLongPtr($h, $EX)
-  if ($before -eq 0) { continue }
-  $new = (($before -bor $TOOL -bor $NOACT) -band (-bnot $APP))
-  [void][ZcodeWinStyle]::SetWindowLongPtr($h, $EX, [IntPtr]$new)
-  $n++
-}
-Write-Output "hidden=$n"
-`
-    const dir = mkdtempSync(join(tmpdir(), 'zcode-hide-'))
-    const file = join(dir, 'hide.ps1')
-    dirCreated = dir
-    writeFileSync(file, script, 'ascii')
-    /**
-     * ⚠ 用 `-File`（**不是** `-Command`）—— 见函数头的实测对比表。
-     * `stdio: 'ignore'`：装饰路径不该因沙箱下的 stdio EPERM 而失败。
-     *
-     * ⚠ 闭包里用 `file`（局部 const）而不是可变的 let：后者在回调里会
-     * **丢失类型收窄**（TS 报 undefined 不可赋值）。
-     */
-    const child = spawn('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-WindowStyle', 'Hidden', '-File', file,
-    ], { stdio: 'ignore', windowsHide: true })
-    child.on('exit', () => { safeRemoveDir(dir) })
-    child.on('error', () => { safeRemoveDir(dir) })
-  } catch {
-    if (dirCreated !== undefined) safeRemoveDir(dirCreated)
-  }
-}
-
-/**
- * Linux（X11）：用 **EWMH** 标准机制把窗口从任务栏移除。
- *
- * ## ⚠⚠ 与 Windows 的**本质差异**（先读这段）
- *
- * | | Windows | Linux（X11） |
- * |---|---|---|
- * | 机制 | 窗口**属性**（`SetWindowLongPtr`） | **WM 协议**（EWMH 客户端消息） |
- * | 生效条件 | 立刻生效，不需 WM 配合 | **需 WM 支持 `_NET_WM_STATE_SKIP_TASKBAR`** |
- * | 依赖 | 系统自带 `powershell.exe` | **外部工具 `wmctrl`**（非自带，可能没装） |
- * | Wayland | 不适用 | **完全无效**（无 X11 访问权） |
- *
- * ⇒ **本路径是「尽力而为」**：装了就生效，没装就静默跳过（回到修复前行为）。
- * **不引入 npm 依赖**去直接发 X11 协议（那要动 X11 连接层，风险与体积都不划算）。
- *
- * ## 为什么用 `wmctrl` 而不是 `xdotool`
- *
- * `xdotool` 的 `windowstate` 只支持 `add/remove` 少数几项，**不含
- * `SKIP_TASKBAR`**；而 `wmctrl -r <win> -b add,skip_taskbar` 正是干这个的。
- * 故主选 `wmctrl`，`xdotool` 仅用于**按 pid 找窗口 id**（若 `wmctrl` 的
- * `-lp` 不够用时作为补充）。
- *
- * ## ⚠ 未在本机实测（如实标注）
- *
- * 开发机是 Windows，且 WSL 实例损坏、无 X11 工具 —— **无法真机验证 Linux 行为**。
- * 故：
- *   - 命令构造抽成纯函数 {@link buildLinuxSkipTaskbarArgs} 并**单测锁死**
- *   - 失败路径**完全静默**（最坏回到修复前）
- *   - 这里只依赖 `wmctrl` 的**文档化语义**，不做任何"猜测式"的额外调用
- */
-function hideWindowLinux(pid: number): void {
   /**
-   * ⚠ `wmctrl -lp` 列出所有窗口，格式（文档）：
-   * ```
-   * 0x0320000a  0 12345  hostname  Window Title
-   * ```
-   * 第 1 列是窗口 id、**第 3 列是 pid** —— 据此筛出我们自己的窗口。
+   * 诊断输出（可选，缺省静默）。
    *
-   * 用 `-r <id> -b add,skip_taskbar` 逐个设置。
-   * `-i` 表示按**窗口 id**（而不是标题）匹配（标题可能含特殊字符）。
+   * ⚠ 只用于**说明性**信息，目前只有一条：实际落到系统 Edge 兜底时告警
+   * （Gitee issue IKJLB1 的期望行为 2 —— 此前 Edge 是被静默选中的，
+   * 用户既不知道用了哪个浏览器，也不知道该去哪换）。
    *
-   * 为什么不写 shell 脚本（与 Windows 侧对称）：Linux 侧没有「内联脚本
-   * 被转义破坏」那类问题（`spawn` 不经 shell），但**需要解析 `-lp` 输出**
-   * 才能按 pid 过滤 —— 那段解析逻辑放在 JS 里更好测（见 `parseWmctrlList`）。
-   *
-   * ⚠ 不检查 `wmctrl` 是否存在：`spawn` 失败会走 `error` 事件（静默处理），
-   * 比预先 `which` 探测更简单且无竞态。
+   * ⚠ 形参与 `src/captcha-carrier.ts` 的 `CaptchaCarrierDeps.log` 一致，
+   * 由 `zcode-auth.ts` 传 `ctx.logger` 进来；**不给也不影响功能**。
    */
-  const list = spawn('wmctrl', ['-lp'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
-  const chunks: Buffer[] = []
-  list.stdout?.on('data', (c: Buffer) => chunks.push(c))
-  list.on('error', () => { /* 没装 wmctrl —— 静默跳过 */ })
-  list.on('exit', () => {
-    try {
-      const ids = parseWmctrlList(Buffer.concat(chunks).toString('utf8'), pid)
-      for (const id of ids) {
-        const child = spawn('wmctrl', buildLinuxSkipTaskbarArgs(id), {
-          stdio: 'ignore',
-          windowsHide: true,
-        })
-        child.on('error', () => { /* 静默 */ })
-      }
-    } catch {
-      // 静默：优化失败不影响 captcha。
-    }
-  })
-}
-
-/**
- * 构造「把窗口加入 `_NET_WM_STATE_SKIP_TASKBAR`」的 `wmctrl` 参数。
- *
- * ⚠ `-i` 必带：让 `-r` 按**窗口 id** 匹配（`0x...`），而不是按标题 ——
- * 标题里有空格/括号（chromium 的标题是「新标签页 - Chromium」）会被误解析。
- *
- * ⚠ **只加 `skip_taskbar`，不加 `skip_pager`**：前者即「不出现在任务栏」
- * （这正是要的）。`skip_pager` 是「不出现在工作区切换器」，与本次目的无关，
- * 多加会改变用户对窗口的既有预期（用户没要求隐藏工作区条目）。
- *
- * ⚠ 也**不**用 `-b add,hidden`（最小化）：chromium 已经用
- * `--window-position=-32000,-32000` 移出屏幕，再改最小化状态会与
- * captcha 流程的窗口假设冲突（那些流程依赖窗口"存在且可渲染"）。
- */
-export function buildLinuxSkipTaskbarArgs(windowId: string): string[] {
-  return ['-i', '-r', windowId, '-b', 'add,skip_taskbar']
-}
-
-/**
- * 从 `wmctrl -lp` 的输出里筛出**属于指定 pid** 的窗口 id。
- *
- * 输出格式（每行，字段以空白分隔）：
- * ```
- * 0x0320000a  0 12345  hostname  Window Title
- * └─ 窗口 id  │  └─ pid
- *            └─ 桌面号
- * ```
- *
- * ⚠ **标题可能含任意空白**，故只能按「前 4 个字段」切分，**不能**整体
- * `split(/\s+/)` 后取全部 —— 那样标题会被拆散（对本用途无害，但会让人
- * 误以为解析"完全正确"）。
- *
- * ⚠ 只取**前 4 个字段**：第 4 列（hostname）之后全是标题。
- * 用 `split(/\s+/, 5)`（限 5 段）恰好把标题保留为最后一段。
- *
- * @returns 属于该 pid 的窗口 id（形如 `0x0320000a`）；解析不到就返回空数组。
- */
-export function parseWmctrlList(output: string, pid: number): string[] {
-  const ids: string[] = []
-  for (const raw of output.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (line === '') continue
-    // 限 5 段：id / desktop / pid / host / 其余（标题）
-    const fields = line.split(/\s+/, 5)
-    if (fields.length < 3) continue
-    const id = fields[0] ?? ''
-    // 窗口 id 必须是 0x 开头的十六进制（防把标题行当数据行）
-    if (!/^0x[0-9a-f]+$/i.test(id)) continue
-    const linePid = Number(fields[2])
-    if (!Number.isInteger(linePid) || linePid !== pid) continue
-    ids.push(id)
-  }
-  return ids
-}
-
-/** 尽力删除临时目录（失败无妨，系统会回收临时目录）。 */
-function safeRemoveDir(dir: string): void {
-  try {
-    rmSync(dir, { recursive: true, force: true })
-  } catch { /* 忽略 */ }
+  log?: (message: string) => void
 }
 
 /**
@@ -895,7 +627,11 @@ interface CaptchaPage {
  * ## 为什么常驻
  *
  * 冷启动实测约 690ms，但**每次请求都冷启动**会让首字延迟凭空多一秒。
- * 而每请求的 mint 开销实测约 1.2 秒 —— 常驻后总开销就在这个量级。
+ * 而 mint 只在**上游索要验证时**才发生：复用常驻页面的稳态约 0.4–0.5 秒
+ * （中位 426ms / 平均 546ms，见 `CAPTCHA_PAGE_ORIGIN` 的矩阵），含 chromium
+ * 冷启动的首发实测 4.2 秒；至于「每次新建 page」那个 1246ms，是 origin 修正
+ * **之前**的历史值，别当现行口径（数字汇总见 README 的 ZCode 章节）。
+ * （上游不要验证的窗口里这条路**一次都不走**，见文件头的「按需」段。）
  *
  * ## 生命周期
  *
@@ -903,12 +639,15 @@ interface CaptchaPage {
  * 一个孤儿 chromium 进程（约 200-400MB）。此外还注册了进程退出钩子兜底。
  */
 export class ZcodeCaptchaBrowser {
-  private child: ChildProcess | undefined
-  private browserWs: WebSocket | undefined
-  private browserCdp: CdpConnection | undefined
-  private profileDir: string | undefined
-  private port = 0
-  private starting: Promise<void> | undefined
+  /**
+   * 共享的 chromium 会话（**进程 + 调试端口 + 浏览器级 CDP 通道**）。
+   *
+   * ⚠ 本类**不再自己**管进程、端口与「连不上旧实例」那条隐蔽链 —— 那些
+   * 全部搬到了 {@link ChromiumSession}，由它与库库AI 的登录浏览器**共用同一份
+   * 实现**（一份语义一处实现）。本类只保留 **captcha 专有**的状态：复用页池
+   * 与占用闸门。
+   */
+  private readonly session: ChromiumSession
   /**
    * 复用的 captcha 页面（停在 {@link CAPTCHA_PAGE_ORIGIN} 上）。
    *
@@ -923,151 +662,100 @@ export class ZcodeCaptchaBrowser {
    * 故用该标志把取页串行化（并发调用排队，而不是拿到同一个页面）。
    */
   private pageBusy = false
+  /** 诊断输出（见 {@link ZcodeCaptchaBrowserOptions.log}），缺省 undefined = 静默。 */
+  private readonly log: ((message: string) => void) | undefined
 
-  constructor(private readonly options: ZcodeCaptchaBrowserOptions = {}) {}
+  constructor(private readonly options: ZcodeCaptchaBrowserOptions = {}) {
+    this.log = options.log
+    /**
+     * ⚠⚠ 下面这些取值**必须与重构前逐字一致**。它们的产物是**渲染后的报错
+     * 原文**，而 spawn 护栏用例跑的是编译产物里的**真实子进程**、断言的就是
+     * 那些字 —— 少一个括注、把产品名从两词写成一词，都会变红。
+     *
+     * 逐项对应（左 = 重构前写死在 `launch()` 里的字面量，右 = 现在传的参）：
+     * - 错误消息前缀 → `label`
+     * - 「找不到浏览器」文案里紧跟其后的括注 → `notFoundHint`
+     * - Edge 兜底告警里的产品名（与错误前缀**不同**）→ `edgeLabel`
+     * - 提示用户改用的环境变量名 → `overrideEnvName`
+     * - 临时 profile 目录前缀 → `profilePrefix`
+     * - 窗口尺寸 → `windowSize`
+     */
+    this.session = new ChromiumSession({
+      executablePath: options.executablePath,
+      debugPort: options.debugPort,
+      hideWindow: options.hideWindow,
+      profilePrefix: 'zcode-captcha-',
+      readyTimeoutMs: options.readyTimeoutMs,
+      windowSize: '1280,900',
+      label: 'zcode',
+      notFoundHint: '（用于产出阿里云 captcha）',
+      edgeLabel: 'zcode captcha',
+      overrideEnvName: 'ZCODE_CHROME_PATH',
+      log: this.log,
+    })
+  }
+
+  /**
+   * 浏览器级 CDP 通道。
+   *
+   * ⚠ 必须**可读又可写**（不是只读 getter）：既有回归用例直接往这个字段
+   * 注入桩（`tests/unit/zcode-page-prepared.spec.ts` 的 `makeBrowserWithStub`）。
+   * 这里转发到会话上，避免「同一个通道在两层各存一份」。
+   */
+  private get browserCdp(): CdpConnection | undefined {
+    return this.session.cdp
+  }
+
+  private set browserCdp(value: CdpConnection | undefined) {
+    this.session.cdp = value
+  }
+
+  /**
+   * 浏览器级 WebSocket（同样转发）。
+   *
+   * ⚠ 用例注入的是 `{ readyState: 1 }` 这种**形状兼容的桩**，
+   * 故这里只按 `readyState` 用，不调用真实 WebSocket 的方法。
+   */
+  private get browserWs(): WebSocket | undefined {
+    return this.session.socket
+  }
+
+  private set browserWs(value: WebSocket | undefined) {
+    this.session.socket = value
+  }
+
+  /** 调试端口（`/json/list` 与 `/json/close` 用）。 */
+  private get port(): number {
+    return this.session.debugPort
+  }
 
   /** 浏览器是否已就绪。 */
   get ready(): boolean {
-    return this.browserCdp !== undefined && this.browserWs?.readyState === 1
+    return this.session.ready
   }
 
-  /** 启动（幂等；并发调用共享同一次启动）。 */
+  /**
+   * 启动（幂等；并发调用共享同一次启动）。
+   *
+   * ⚠ 失败时**必须连页池一起清掉**（保持重构前的行为）：起不来的那一轮里，
+   * 上一次成功会话遗留的页面已经指向一个**不存在的浏览器**，留着会让
+   * 后续 `acquirePage()` 直接交出死页面。
+   */
   async start(): Promise<void> {
-    if (this.ready) return
-    if (this.starting !== undefined) {
-      await this.starting
-      return
+    try {
+      await this.session.start()
+    } catch (error) {
+      this.resetPages()
+      throw error
     }
-    const task = this.launch().finally(() => {
-      this.starting = undefined
-    })
-    this.starting = task
-    await task
   }
 
-  private async launch(): Promise<void> {
-    const executable = this.options.executablePath ?? findBrowserExecutable()
-    if (executable === undefined) {
-      throw new Error(
-        'zcode: 找不到可用的浏览器（用于产出阿里云 captcha）。' +
-          '已尝试 scoop chromium / Chrome / Chromium / Edge；' +
-          '可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。',
-      )
-    }
-
-    this.profileDir = mkdtempSync(join(tmpdir(), 'zcode-captcha-'))
-    /**
-     * ★ **必须挑一个确实空闲的端口**（真实缺陷）。
-     *
-     * 早期是 `9300 + Math.floor(Math.random() * 500)` —— 纯随机、**不检查占用**。
-     * 若撞上一个**尚未完全退出的旧实例**的端口，会串成一条隐蔽的失效链：
-     *
-     * 1. 新 chromium 因端口被占而启动失败（自行退出）
-     * 2. 但 `fetch('/json/version')` **成功** —— 应答的是**旧实例**！
-     * 3. 于是我们连上了旧浏览器，而 `this.child` 指向那个**已死**的新进程
-     * 4. `dispose()` 的 `taskkill` 打在一个死 pid 上 → **毫无效果**
-     * 5. 真正在跑的旧实例从此无人回收 ⇒ **整棵树泄漏**（实测 10~14 个进程）
-     *
-     * 实测证据：`dispose()` 立即接下一轮时**偶发**泄漏（随机端口才撞得上），
-     * 而每轮间隔 2.5 秒时 5/5 干净 —— 正是「旧实例还没退干净」的特征。
-     *
-     * 故改为：在候选端口里**探测到空闲**的那个。
-     */
-    this.port = this.options.debugPort ?? await pickFreePort()
-    const hide = this.options.hideWindow !== false
-
-    this.child = spawn(executable, [
-      `--remote-debugging-port=${this.port}`,
-      `--user-data-dir=${this.profileDir}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-networking',
-      '--disable-sync',
-      '--disable-features=Translate',
-      '--lang=zh-CN',
-      '--window-size=1280,900',
-      /**
-       * ⚠ **不用 `--headless=new`** —— 实测 headless 一律 `F001`，必须 headful。
-       * 为了不打扰用户，把窗口移到屏幕外。
-       */
-      ...hide ? ['--window-position=-32000,-32000'] : [],
-    ], {
-      stdio: 'ignore',
-      windowsHide: hide,
-      /**
-       * ⚠ POSIX 上必须 `detached: true`：这样 chromium 自成**进程组**，
-       * `killProcessTree()` 才能用负 pid 一次杀掉全部子进程。
-       * 不加的话子进程会脱离、变成孤儿（实测留下 12 个 chrome.exe）。
-       *
-       * ⚠ Windows 不用这个（它有 `taskkill /T`），且 `detached` 在 Windows
-       * 上会额外开一个控制台窗口 —— 与「不打扰用户」冲突。
-       */
-      detached: process.platform !== 'win32',
-    })
-
-    const timeoutMs = this.options.readyTimeoutMs ?? 30_000
-    const deadline = Date.now() + timeoutMs
-    let debuggerUrl: string | undefined
-    while (Date.now() < deadline) {
-      try {
-        const response = await fetch(`http://127.0.0.1:${this.port}/json/version`, {
-          signal: AbortSignal.timeout(2_000),
-        })
-        if (response.ok) {
-          const version = await response.json() as { webSocketDebuggerUrl?: unknown }
-          if (typeof version.webSocketDebuggerUrl === 'string') {
-            debuggerUrl = version.webSocketDebuggerUrl
-            break
-          }
-        }
-      } catch {
-        // 还没起来。
-      }
-      await sleep(300)
-    }
-    if (debuggerUrl === undefined) {
-      this.kill()
-      throw new Error(`zcode: 浏览器调试端口未就绪（${timeoutMs}ms 超时）`)
-    }
-    /**
-     * ★ **确认应答的确实是我们启动的那个浏览器**（防「连到旧实例」）。
-     *
-     * 端口已经挑空闲的了，这里是**第二道防线**：万一仍有竞态（别的进程
-     * 在我们探测之后抢占了端口），`/json/version` 的 `Browser` 值/`webSocketDebuggerUrl`
-     * 里的端口会暴露它。启动时 chromium 一定会占住我们给的端口，
-     * 故再校验一次 `debuggerUrl` 里的端口号是否等于 `this.port`。
-     *
-     * ⚠ 不等就**抛错**而不是继续用 —— 继续用会导致「dispose 打空 + 真实例泄漏」
-     * 那条隐蔽链（见上面 `pickFreePort` 的说明）。
-     */
-    if (!debuggerUrl.includes(`:${this.port}/`)) {
-      this.kill()
-      throw new Error(
-        `zcode: 调试端口 ${this.port} 应答的不是本实例（${debuggerUrl}）—— ` +
-        '疑似端口被其它 chromium 占用，已放弃以避免泄漏',
-      )
-    }
-
-    const ws = new WebSocket(debuggerUrl)
-    await new Promise<void>((resolve, reject) => {
-      ws.addEventListener('open', () => resolve(), { once: true })
-      ws.addEventListener('error', () => reject(new Error('zcode: 连接浏览器调试端口失败')), { once: true })
-    })
-    this.browserWs = ws
-    this.browserCdp = new CdpConnection(ws)
-
-    /**
-     * ★ 把窗口从**任务栏**移除（Windows）—— 见 {@link hideWindowFromTaskbar}
-     * 的完整取证。
-     *
-     * ⚠ 必须在**页面渲染之前**做（此处正好：已连上 CDP、还没导航）——
-     * 实测窗口此时已存在但 `visible=false`，`exStyle` 已可设置；
-     * 而一旦页面渲染、窗口变可见，它就会获得任务栏按钮并开始闪烁。
-     *
-     * ⚠ **不 await**：这是装饰性优化，让它在后台跑（约 1.2 秒），
-     * 与后续导航重叠。失败静默，不影响 captcha。
-     */
-    if (this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid)
+  /** 关掉复用页、放开占用闸门（**不碰**浏览器进程）。 */
+  private resetPages(): void {
+    try { this.reusablePage?.cdp.close() } catch { /* 已关闭 */ }
+    try { this.reusablePage?.ws.close() } catch { /* 已关闭 */ }
+    this.reusablePage = undefined
+    this.pageBusy = false
   }
 
   /**
@@ -1457,7 +1145,7 @@ export class ZcodeCaptchaBrowser {
        * ⚠ **导航到真实 https origin**（不是 `about:blank`）——
        * 这是能否重复 mint 的关键（实测 1/3 → 5/5）。
        */
-      await cdp.send('Page.navigate', { url: CAPTCHA_PAGE_ORIGIN })
+      await cdp.send('Page.navigate', { url: resolveCaptchaPageOrigin(this.options) })
       // 等 DOM 可用（domcontentloaded 之后 body 就存在了）。
       await sleep(this.options.navigationWaitMs ?? 1_500)
       const page: CaptchaPage = { targetId, ws, cdp, lastUsedAt: Date.now() }
@@ -1503,114 +1191,20 @@ export class ZcodeCaptchaBrowser {
   }
 
   /**
-   * 终止浏览器进程**树**并清理所有 CDP 连接。
+   * 关闭浏览器并清理临时 profile。
    *
-   * ## ⚠ 为什么必须杀**整棵树**（真实缺陷）
+   * ⚠ **不再有**「只杀进程、保留 profile」的那条路：它原本只服务于
+   * `launch()` 内部的失败清理（起不来 / 端口没就绪 / 端口误配时重来一次），
+   * 而那些路径已随启动流程一起搬进 {@link ChromiumSession}，由它自己
+   * 按需调用自己的 `kill()`。留一个**没有调用方**的私有方法只会制造
+   * 「进程树有两个所有者」的错觉 —— 进程生命周期**只有一处**实现。
    *
-   * 早期只写 `this.child?.kill()` —— 那只杀**主进程**。而 Chromium 是
-   * **多进程架构**（browser / gpu / renderer / utility 各一个进程），
-   * 主进程被 `SIGTERM` 后**子进程会变成孤儿继续运行**。
-   *
-   * 实测证据（一次被中断的测试后）：
-   *   - **12 个** 残留 `chrome.exe` 全指向同一个 `--user-data-dir`
-   *   - **28 个**残留的 `zcode-captcha-*` 临时 profile 目录
-   *
-   * 生产影响：**每次会话泄漏约 200MB**（一个 Chromium 实例），
-   * 且残留进程占着调试端口，会干扰后续启动（曾让一次 `max` 档位测试
-   * 表现得像「卡住 80 秒」，实为旧实例干扰）。
-   *
-   * 修法：POSIX 用进程组（`detached: true` + `kill(-pid)`），
-   * Windows 用 `taskkill /T /F`（`/T` = 含子进程树）。
+   * ⚠ 进程树清理的全部取证（为什么必须整棵树、为什么必须同步
+   * `taskkill /T /F`、端口误配那条隐蔽链）见 `ChromiumSession`。
    */
-  private kill(): void {
-    try { this.reusablePage?.cdp.close() } catch { /* 已关闭 */ }
-    try { this.reusablePage?.ws.close() } catch { /* 已关闭 */ }
-    this.reusablePage = undefined
-    this.pageBusy = false
-    try { this.browserCdp?.close() } catch { /* 已关闭 */ }
-    try { this.browserWs?.close() } catch { /* 已关闭 */ }
-    this.browserCdp = undefined
-    this.browserWs = undefined
-    this.killProcessTree()
-  }
-
-  /**
-   * 终止浏览器及其**全部子进程**。
-   *
-   * ⚠ 不能退回成 `child.kill()`（见 {@link kill} 的说明：会留下孤儿）。
-   *
-   * ⚠⚠ **必须同步等它做完**（真实缺陷）：早期用异步 `spawn('taskkill', …)`
-   * 后立即返回 —— 调用方以为清理完了、紧接着启动下一轮，而旧实例**还活着
-   * 占着端口**。若下一轮随机撞到同一端口就会串成：
-   * 连到旧实例 → `child` 指向已退出的新进程 → `dispose()` 打空 →
-   * **旧实例整棵树泄漏**（实测 10~14 个进程）。
-   *
-   * 实测对照：`dispose()` 后**立即**下一轮会偶发泄漏；
-   * 每轮间隔 2.5 秒则 5/5 干净 —— 正是「没等它退完」的特征。
-   *
-   * 故改用 `spawnSync`：清理路径阻塞几十毫秒是可接受的，
-   * 换来确定性的「返回即已终止」。
-   */
-  private killProcessTree(): void {
-    const child = this.child
-    this.child = undefined
-    if (child === undefined || child.pid === undefined) return
-    const pid = child.pid
-    if (process.platform === 'win32') {
-      /**
-       * ⚠ Windows 没有进程组信号，用 `taskkill /T`（树）+ `/F`（强制）。
-       * 必须 `stdio: 'ignore'`：某些沙箱下捕获子进程输出会 EPERM，
-       * 而这是清理路径，不该因此失败。
-       */
-      try {
-        spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-          // 最多等 10 秒（正常几十毫秒；卡住说明系统异常，别无限等）。
-          timeout: 10_000,
-        })
-      } catch { /* 尽力而为 */ }
-      // 兜底：万一 taskkill 不可用，至少杀掉主进程。
-      try { child.kill() } catch { /* 已退出 */ }
-      return
-    }
-    /**
-     * POSIX：`detached: true` 时子进程自成进程组，负 pid 即整组。
-     * ⚠ 失败（ESRCH 等）就退回单进程 kill。
-     */
-    try {
-      process.kill(-pid, 'SIGKILL')
-    } catch {
-      try { child.kill('SIGKILL') } catch { /* 已退出 */ }
-    }
-  }
-
-  /** 关闭浏览器并清理临时 profile。 */
   dispose(): void {
-    this.kill()
-    const dir = this.profileDir
-    this.profileDir = undefined
-    if (dir === undefined) return
-    /**
-     * ⚠ 删除要**重试几次**：chromium 的子进程刚被 taskkill 掉，
-     * 句柄释放有延迟 —— 一次性 `rmSync` 实测会留下 28 个残留目录。
-     * 用退避重试（100/500/1500ms），全部失败就交给系统回收临时目录。
-     */
-    const attempts = [0, 100, 500, 1_500]
-    const tryRemove = (index: number): void => {
-      if (index >= attempts.length) return
-      const delay = attempts[index]
-      const run = (): void => {
-        try {
-          rmSync(dir, { recursive: true, force: true })
-        } catch {
-          tryRemove(index + 1)
-        }
-      }
-      if (delay === 0) run()
-      else setTimeout(run, delay).unref?.()
-    }
-    tryRemove(0)
+    this.resetPages()
+    this.session.dispose()
   }
 }
 

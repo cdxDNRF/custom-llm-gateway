@@ -60,16 +60,47 @@ export interface ZcodeProduct {
   displayName: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
-  /** 请求桥的超时（毫秒）。 */
+  /**
+   * **整轮墙钟**上限（毫秒）：覆盖 captcha 产出 → 请求 → 流式读取**全程**。
+   *
+   * ⚠⚠️ **它不是「推理超时」**（真实缺陷 IKJOVB）：早期实现把它当推理时限，
+   * 于是「模型一进入长时间思考」就必然撞满 → abort → `TIMEOUT` → harness
+   * 按可重试错误重试 → 又大思考 → 又撞满，形成死循环（用户报障：思考三分钟
+   * 被截断，接着重试，又是雷霆大思考）。**长思考的正确保护是空闲超时**
+   * （见 {@link streamIdleTimeoutMs}），不是墙钟。
+   *
+   * ⇒ 本值现已**只**兜「真正静默 / captcha 卡死」这条通道，
+   * 故给到分钟级。⚠ 不得调回 180_000（见 {@link streamIdleTimeoutMs} 的说明）。
+   */
   requestTimeoutMs: number
+  /**
+   * **流式读取空闲超时**（毫秒）：连续这么久**没读到任何字节**才判死，
+   * **每收到一帧即重新计时**，故总时长可远超该值。
+   *
+   * ## 取值直接对齐官方 ZCode（权威依据，非推测）
+   *
+   * 官方客户端 `resources/glm/zcode.cjs` 的默认配置逐字还原：
+   * ```js
+   * YV = 6e5                                  // modelStream.idleTimeoutMs
+   * Lm = { modelStream: { idleTimeoutMs: YV }, network: { timeout: 18e4 } }
+   * ```
+   * 官方**没有**保活心跳、**没有** ack 帧、也**没有**针对思考的特判 ——
+   * `thinking_delta` 与普通帧走同一个 `Promise.race` 循环。
+   *
+   * ⚠⚠️ **别再取 180_000**：那是官方配置里**另一个**字段 `network.timeout`
+   * 的值（普通 API 请求用），被早期实现误当成推理时限抄了过来。
+   * 这正是 issue 里「一思考就超时」的直接成因。
+   */
+  streamIdleTimeoutMs: number
   /** 远端模型列表不可用时的兜底目录。 */
   fallbackModels: readonly ZcodeFallbackModel[]
   /**
-   * 客户端版本的兜底值（用于 `X-ZCode-App-Version` 等头）。
+   * 客户端版本（用于 `X-ZCode-App-Version` 等头）。
    *
-   * 实际值优先由 `detectZcodeAppVersion()` 从已安装的官方客户端探测；
-   * 探测不到时用这个 —— **不让版本探测失败连带让 provider 不可用**
-   * （版本只是一个头）。
+   * ⚠ 它是**常量**，不再从已安装的官方客户端探测 ——
+   * 那是「读本机 ZCode 数据」的一部分，已于 2026-10-05 整体删除
+   * （见 `zcode.ts` 文件头）。版本只是一个头，不该成为硬依赖，
+   * 故探测的移除不会让 provider 不可用。
    */
   appVersionFallback: string
   /**
@@ -223,17 +254,29 @@ export const ZCODE: ZcodeProduct = {
    */
   defaultCredentialRef: 'ZCODE_CREDENTIAL',
   /**
-   * 单次推理请求的超时。
+   * **整轮墙钟**上限：15 分钟。
    *
-   * ⚠ 取值明显高于其它 provider（它们多为 120s）。理由：实测免费通道
-   * 单请求 **3-30 秒**（本机 GLM-5.3-Flash 实测 2.99 秒），长尾来自
-   * 上游限流重试 + 思考链；而多步 agent 的每一步都是一次独立请求。
-   * 给 180s 是为了包住长尾，不是为了让正常请求等那么久。
+   * ⚠⚠️ **不要按「推理该等多久」来定它**（真实缺陷 IKJOVB）。它只兜两件事：
+   * ① 上游**真静默**且空闲超时也失效的极端情况；② **captcha 卡死** ——
+   * `zcode-captcha.ts` 里存在**无上限的等待**（取页自旋、等 CDP WebSocket `open`），
+   * 早期实测把 `pageBusy` 卡死后整个 turn 永挂，只能靠这里兜。
    *
-   * ⚠ 不含 captcha 产出时间（那由 `zcode-captcha.ts` 自己的超时管，
-   * 实测每次约 1.2 秒）。
+   * ⚠ **180_000 是错的**（那是官方 `network.timeout`，属另一个字段，见接口注释）。
+   * 长思考该由 {@link streamIdleTimeoutMs} 管，本值可以给得很宽。
+   *
+   * ⚠ 实测 free 通道单请求 3–30 秒（本机 GLM-5.3-Flash 2.99 秒），mint 稳态
+   * 0.4–0.5 秒（中位 426ms / 均值 546ms）、含 chromium 冷启动首次 4.2 秒 ——
+   * 这些都在 15 分钟里，不构成约束。
    */
-  requestTimeoutMs: 180_000,
+  requestTimeoutMs: 15 * 60_000,
+  /**
+   * 流式读取空闲超时：**600_000ms（10 分钟）**，逐字对齐官方
+   * `modelStream.idleTimeoutMs = 6e5`（`zcode.cjs` 默认配置还原）。
+   *
+   * ⚠ 每收到一帧即续期，所以「持续大思考」可以跑满 10 分钟以上而不被判超时 ——
+   * 这正是官方 IDE 面对同一场景不报错的原因。
+   */
+  streamIdleTimeoutMs: 600_000,
   fallbackModels: ZCODE_FALLBACK_MODELS,
   appVersionFallback: ZCODE_APP_VERSION_FALLBACK,
   /**

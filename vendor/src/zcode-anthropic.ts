@@ -5,7 +5,9 @@
  *
  * ZCode 免费通道**只认 Anthropic Messages 格式**（实测：`zcode-plan` 下
  * 的 `openai` / 裸 `v1/chat/completions` 路径一律 `404 page not found`，只有
- * `/api/v1/zcode-plan/anthropic/v1/messages` 存在——无 captcha 时回 `3007`）。
+ * `/api/v1/zcode-plan/anthropic/v1/messages` 存在——在索要验证的窗口里无 captcha
+ * 时它回 `3007` 而不是 404；上游不要验证的那些窗口里它会直接 200（见 README 的
+ * ZCode 章节实测表），但**端点存在**这条结论两种形态都支持）。
  *
  * 而 `openai-compat.ts` 的 `serializeMessages()` 产出的是 **OpenAI 形态**
  * （`tool_calls` / `tool_call_id` / `tools[].function`）—— 喂给 Anthropic
@@ -36,6 +38,7 @@
 
 import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { readWithIdleTimeout } from './sse.js'
 
 /** Anthropic 内容块（本实现用到的子集）。 */
 export type AnthropicBlock =
@@ -281,14 +284,50 @@ export interface SseFrame {
  * ⚠ Anthropic 的 SSE 与 OpenAI **同构**（`event:` + `data:` 行、空行分隔），
  * 但**没有 `data: [DONE]`** —— 结束靠 `message_stop` 事件。
  * 故不能复用 `consumeOpenAiSse`（它找 `[DONE]`）。
+ *
+ * ## `idleTimeoutMs`：**空闲超时**（不是整轮墙钟）—— 真实缺陷 IKJOVB
+ *
+ * 旧实现（本函数的 `reader.read()` 裸调用）配合 `zcode-adapter.ts` 那个
+ * **整轮 180s 墙钟**定时器，导致「模型一旦长时间大思考就必然超时」
+ * （用户报障：雷霆大思考 → 3 分钟被截断 → 直接重试 → 又大思考 → 又被截断）。
+ *
+ * 官方 ZCode 的做法（`resources/glm/zcode.cjs` minify 产物还原）是
+ * **空闲超时**，逐字对齐如下：
+ *
+ * ```js
+ * YV = 6e5                                  // modelStream.idleTimeoutMs = 600_000ms
+ * RRs = 3e4                                 // 每次重试 +30s
+ * gzr = (baseTimeoutMs, retryNumber) => baseTimeoutMs + retryNumber * RRs
+ * async function readNextWithStreamIdleTimeout(it, { timeoutMs }) {
+ *   return Promise.race([ it.next(), idleTimer(timeoutMs), abortPromise ])
+ * }
+ * ```
+ *
+ * 即：**每收到一帧就重新计时**，只有「连续 N ms 一个字节都没有」才判死；
+ * 总时长（哪怕十几分钟）本身**不**构成超时。官方**没有**保活、没有 ack、
+ * 也**没有**对思考帧的特判 —— `thinking_delta` 与普通帧走同一个循环。
+ *
+ * ⚠ 不传（或传 ≤0）时退化为**无空闲超时**，保持旧行为 —— 由上层
+ * `zcode-adapter.ts` 的整轮墙钟兜底。
  */
 export async function* iterateSseFrames(
   body: ReadableStream<Uint8Array>,
-  options: { signal?: AbortSignal } = {},
+  options: {
+    signal?: AbortSignal
+    /**
+     * 空闲超时（毫秒）：连续这么久没读到任何字节就抛错。**每帧续期**，
+     * 所以总时长可以远超该值。缺省 / ≤0 ⇒ 不启用。
+     */
+    idleTimeoutMs?: number
+    /** 空闲超时的标签（错误消息前缀用），缺省 'zcode'。 */
+    label?: string
+  } = {},
 ): AsyncIterable<SseFrame> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   const signal = options.signal
+  const idleTimeoutMs = options.idleTimeoutMs ?? 0
+  const label = options.label ?? 'zcode'
   let buffer = ''
   /**
    * ★★ **中断必须在「读挂起」时也生效**（真实缺陷，2026-09-29）。
@@ -315,7 +354,17 @@ export async function* iterateSseFrames(
     for (;;) {
       // 兜底：cancel 未生效（或 signal 在 read 之前就已 abort）时也能退出。
       if (signal?.aborted === true) break
-      const { done, value } = await reader.read()
+      /**
+       * ★ 空闲超时**每帧续期**（IKJOVB）：`readWithIdleTimeout` 每次调用都新建
+       * 一个计时器，只覆盖「这一帧的等待」。因此「持续吐思考帧 10 分钟」不会被
+       * 误判超时，而「整段静默」仍会在 `idleTimeoutMs` 后落定。
+       *
+       * ⚠ 这里**不能**改回裸 `reader.read()`：那会让长思考重新被上层整轮墙钟
+       * 砍断（本 issue 的原始形态）。
+       */
+      const { done, value } = idleTimeoutMs > 0
+        ? await readWithIdleTimeout(reader, idleTimeoutMs, label, signal)
+        : await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       // SSE 以空行分隔事件（兼容 \n\n 与 \r\n\r\n）。
@@ -398,7 +447,17 @@ export function parseFrame(raw: string): SseFrame | undefined {
  */
 export async function* consumeAnthropicSse(
   body: ReadableStream<Uint8Array>,
-  options: { label: string; model: string; signal?: AbortSignal },
+  options: {
+    label: string
+    model: string
+    signal?: AbortSignal
+    /**
+     * 空闲超时（毫秒），透传给 {@link iterateSseFrames}。
+     * ⚠ 每帧续期，故它管的是「静默多久算死」，**不是**整轮时长上限
+     * （真实缺陷 IKJOVB）。缺省 ⇒ 不启用。
+     */
+    idleTimeoutMs?: number
+  },
 ): AsyncIterable<StreamChunk> {
   /**
    * ## 为什么**先缓冲再发射**（而不是边收边发）
@@ -480,7 +539,11 @@ export async function* consumeAnthropicSse(
   }
 
   // ⚠ 必须把 signal 透传下去：中断/超时要能在「读挂起」时唤醒（见 `iterateSseFrames`）。
-  for await (const frame of iterateSseFrames(body, { signal: options.signal })) {
+  for await (const frame of iterateSseFrames(body, {
+    signal: options.signal,
+    ...(options.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.idleTimeoutMs }),
+    label: options.label,
+  })) {
     const eventName = frame.event
     if (frame.data.length === 0) continue
 

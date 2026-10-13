@@ -29,7 +29,10 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { parseRateLimitError } from './llm-adapter.js'
 import {
   LOBSTERAI_CHAT_PATH,
@@ -56,6 +59,8 @@ import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableT
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
+import { planSessionTitleThinking } from './session-title.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -349,6 +354,17 @@ export interface LobsteraiAdapterOptions {
   ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerLobsteraiLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -705,6 +721,17 @@ export class LobsteraiAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: LobsteraiRemoteModel[] | undefined
+  /**
+   * 目录加载闸门：并发去重 + 失败/空结果冷却。
+   * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+   */
+  private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7c：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + wire/展示名分离的档位）。
+   */
+  private readonly catalog: ModelCatalog
   /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
   private remoteMeta: ReadonlyMap<string, LobsteraiRemoteModel> = new Map()
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
@@ -714,8 +741,24 @@ export class LobsteraiAdapter extends LlmAdapter {
     super()
     this.product = options.product ?? LOBSTERAI
     this.fetchImpl = options.fetchImpl ?? fetch
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+    )
+    // ⚠️ 共享骨架（Task 7c）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`：
+        // 「宁可少报能力，也不要报一个服务端不认的模态」）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
     )
   }
 
@@ -739,16 +782,16 @@ export class LobsteraiAdapter extends LlmAdapter {
    * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
-    try {
-      const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) {
-        this.remoteModels = models
-        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
-      }
-    } catch {
-      // 远端不可用：回退兜底目录（由 staticFallbackModels 提供）。
-    }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
+    await this.catalogGate.run(async () => {
+      const models = await fetchRemote()
+      if (models.length === 0) return false
+      this.remoteModels = models
+      this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      return true
+    })
   }
 
   /**
@@ -836,55 +879,75 @@ export class LobsteraiAdapter extends LlmAdapter {
    * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
    * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+   *
+   * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    const source = this.remoteModels ?? this.staticFallbackModels()
-    return source.map((model) => ({ id: model.id, name: displayNameFor(model) }))
+    return this.catalog.listAllModels()
   }
 
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-    // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
-    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-    await this.ensureRemoteModels()
-    const source = this.remoteModels ?? this.staticFallbackModels()
-    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? source
-      : source.filter((model) => !disabled.has(model.id))
-    return listed.map((model) => ({
-      provider: this.product.id,
+  /**
+   * 把本家条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家三处**真实差异**：
+   * 1. `contextWindow` 远端权威值优先、兜底表估值次之（见 `contextWindowFor`）；
+   * 2. `maxTokens` **仅当远端声明时**才带（不编造默认值）；
+   * 3. `reasoning` 的 `id` 用 **wire 值 `openclawLevel`**、`name` 用**产品侧
+   *    `level`** —— 两者来源不同，是本家最容易搞错的地方（见 `reasoningFor`）。
+   */
+  private toCatalogEntry(model: LobsteraiRemoteModel): CatalogEntry {
+    const contextWindow = this.contextWindowFor(model.id)
+    const maxTokens = this.remoteMeta.get(model.id)?.maxTokens
+    const reasoning = this.reasoningFor(model.id)
+    return {
       id: model.id,
       // 倍率写进 name（**不是** description）：composer 的模型切换菜单只渲染
       // `name`，description 仅用于 /model 弹窗。见 displayNameFor 的说明。
       name: displayNameFor(model),
-      ...model.description !== undefined ? { description: model.description } : {},
-      // 远端 supportsImage 权威；未声明时保守报 text（见 inputModalitiesFor）。
+      // ⚠️ `resolveModel` 用**元数据里的 name**（不带倍率）⇒ 显式提供 `bareName`。
+      bareName: this.remoteMeta.get(model.id)?.name
+        ?? this.fallbackIndex.get(model.id)?.name
+        ?? model.name,
+      // ⚠️ 远端 `supportsImage` 权威；未声明时**保守报 `['text']`**（不是省略）
+      // —— 见 `inputModalitiesFor`：宁可少报能力，也不要报一个服务端不认的模态。
       inputModalities: this.inputModalitiesFor(model.id),
-    }))
+      ...model.description !== undefined ? { description: model.description } : {},
+      ...contextWindow !== undefined ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     await this.ensureRemoteModels()
-    const remoteName = this.remoteMeta.get(model)?.name
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: remoteName ?? this.fallbackIndex.get(model)?.name ?? model,
-      inputModalities: this.inputModalitiesFor(model),
-    }
-    // 上下文窗口：远端权威值优先，兜底表估值次之（见 contextWindowFor）。
-    const contextWindow = this.contextWindowFor(model)
-    if (contextWindow !== undefined) resolved.context = { contextWindow }
-    // 单次输出上限：仅当远端声明时才带（不编造默认值）。
-    const maxTokens = this.remoteMeta.get(model)?.maxTokens
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    // 思考档位：远端 thinkingConfig 权威（见 reasoningFor 的 wire 值说明）。
-    const reasoning = this.reasoningFor(model)
-    if (reasoning !== undefined) resolved.reasoning = reasoning
-    return resolved
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => this.toCatalogEntry(model))
+  }
+
+  /**
+   * 同步视图（`listAllModels` 用）。
+   *
+   * ⚠️ **不能** `await ensureRemoteModels()`（同步契约）—— 读 `remoteModels`
+   * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => this.toCatalogEntry(model))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ 原实现里的三处判据（context / maxTokens / reasoning）现已收敛到
+   * `toCatalogEntry`；骨架的 `resolveModel` 只做回填与「不声明未知」。
+   */
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -981,6 +1044,8 @@ export class LobsteraiAdapter extends LlmAdapter {
           // 此时限流无法归属到具体账号，UI 上也显示不出标记。
           console.warn('[lobsterai] 当前凭据未匹配到账号池条目，限流记录将被跳过')
         }
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+        if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
       } catch (error) {
         console.warn('[lobsterai] 账号匹配失败（不影响本次请求）:', error)
       }
@@ -1011,13 +1076,33 @@ export class LobsteraiAdapter extends LlmAdapter {
     // 字段（见 dsh-llm 的 types.d.ts），所以 `tool_choice` 天然不会出现 ——
     // 目标状态（字段缺席）已经达成，无需再写一段无效的归一化代码。
     if (options.temperature !== undefined) bodyObj.temperature = options.temperature
-    if (options.maxTokens !== undefined) bodyObj.max_tokens = options.maxTokens
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 本模型的默认档注入进来。本家档位来自远端 `thinkingConfig.options[]`
+     * （产品侧 `level` 含 `off`，wire 值见 `openclawLevel`）⇒ 声明了 `off`
+     * 的模型**关得掉**；没声明的（无 `thinkingConfig`）则只能抬预算兜底。
+     *
+     * ⚠️ 判据用 **wire 值**（`openclawLevel`），因为下发的是它 ——
+     * 与 `reasoningFor` 里 `id` 的取值同源。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: (this.remoteMeta.get(options.model)?.thinkingConfig?.options ?? [])
+        .map((option) => option.openclawLevel),
+      maxTokens: options.maxTokens,
+    })
+    if (titlePlan.maxTokens !== undefined) bodyObj.max_tokens = titlePlan.maxTokens
     if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
     // 思考等级：仅在调用方显式传入时透传，不主动补档
     // （buddy 那套「deepseek 系必须补档否则不思考」是针对腾讯后端的实测，
     // 未在 LobsterAI 上验证，照搬会造成非法参数 400）。
-    if (options.reasoningEffort !== undefined) {
-      bodyObj.reasoning_effort = options.reasoningEffort
+    //
+    // ⚠️ 标题请求改走 `titlePlan.effort`（该模型声明了 `off` 时就是它）。
+    if (titlePlan.effort !== undefined) {
+      bodyObj.reasoning_effort = titlePlan.effort
     }
     // **不发 prompt_cache_key**：那是腾讯后端的前缀缓存机制，此处未实测支持。
     const body = JSON.stringify(bodyObj)
@@ -1151,7 +1236,7 @@ export class LobsteraiAdapter extends LlmAdapter {
       // （它们不是限流，不该留徽章），刚失败的账号仍是池里排序第一，
       // 不排除就会拿回同一个账号、命中下面的 `tried.has` 而**立即 break**
       // —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`（`pool.go:131`）。
-      const next = await this.options.accountPool.getAvailableAccount(
+      const next = await this.options.accountPool.getAvailableAccount<LobsteraiCredential>(
         this.product.id, options.model, tried,
       )
       if (!next || tried.has(next.entry.id)) {
@@ -1161,7 +1246,7 @@ export class LobsteraiAdapter extends LlmAdapter {
         })
       }
       tried.add(next.entry.id)
-      credential = next.credential as LobsteraiCredential
+      credential = next.credential
       currentAccountId = next.entry.id
       response = await this.send(credential, body, options)
     }
@@ -1706,7 +1791,12 @@ function displayNameFor(model: LobsteraiRemoteModel): string {
  */
 export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
-  const adapter = new LobsteraiAdapter(options)
+  const adapter = new LobsteraiAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

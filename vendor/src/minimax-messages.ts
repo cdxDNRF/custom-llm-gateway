@@ -63,6 +63,8 @@ import type {
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { normalizeHarnessMessages } from './message-shape.js'
+import { resolveToolPairing } from './sse.js'
 
 /**
  * 构造 Anthropic Messages 请求体。
@@ -185,15 +187,85 @@ export function serializeMinimaxMessages(
   messages: readonly Message[],
   images?: ReadonlyMap<string, MinimaxInlineImage>,
 ): Array<Record<string, unknown>> {
+  // ⚠️⚠️ 步骤 1：归一化「一等 tool 消息」形状（**本 provider 曾因此整轮 400**）。
+  //
+  // harness 把工具结果作为**独立的 `role:'tool'` 消息**下发（`toolCallId` 在
+  // **顶层**），而**没有** `tool-result` 内容块 —— 于是下面
+  // `block.type === 'tool-result'` 的判据恒不命中（`normalizeHarnessMessages`
+  // 会把它降级回「user 消息内嵌 tool-result 块」的旧形状）。
+  //
+  // ⚠️ **别被版本号误导**（2026-10-01 实测纠正）：这套形状自 dsh 0.1.7 引入，
+  // 但 **0.2.0-rc.2 仍然如此** —— 全量会话日志 34,659 条 tool/result 无一例外
+  // 都是 `role:'tool'` + 顶层 `toolCallId`，`developer` 消息也仍在。
+  // 判据是**形状**（`message.role === 'tool'`）而非版本号（`message-shape.ts`
+  // 开头即写明「探测用形状而非版本号」）—— 升级 dsh 不会让这个归一化失效。
+  //
+  // 漏掉这一步的真实后果（2026-10-01 会话 `session-871fdf61` 报障）：
+  // `400 invalid_request_error ... tool call result does not follow tool call (2013)`。
+  // ⚠️ 旧形状输入是**零成本透传**（连数组身份都不变），故既有行为逐字节不变。
+  //
+  // ⚠️ 入参签名保持 `readonly Message[]`（对外纯函数 API 不变），但归一化层吃的
+  // 是**宽松**的 `{role; content?}[]` —— `Message` 没有索引签名，直接传会报 TS2352。
+  // 既有五个适配器（llm-adapter / openai-compat / buddy / lobsterai / trae）把
+  // 入参声明成宽松结构来规避；本函数是对外导出的纯函数，改签名会波及调用方，
+  // 故在此做一次**单向放宽**（内容原样透传，归一化不改数据）。
+  const normalized = normalizeHarnessMessages(
+    messages as unknown as readonly { role: string; content?: unknown }[],
+  ) as unknown as readonly Message[]
+
+  // ⚠️ 步骤 2：剔除无法配对的 tool_use / tool_result（与五个既有适配器同口径）。
+  //
+  // Anthropic 与 OpenAI 一样拒绝孤儿：没有 tool_result 的 tool_use、指向不存在
+  // tool_use 的 tool_result，都会被服务端拒。共用 `resolveToolPairing` 是为了
+  // **一个口径**——它在内部也会先做同一套形状归一化，且已处理「空 name 的
+  // tool-call 无条件 400」这个既有教训。
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
+
   const out: Array<Record<string, unknown>> = []
-  for (const message of messages) {
+  /**
+   * ⚠️ 待发的 assistant 消息（等它的工具结果到齐后**成对**提交）。
+   *
+   * Anthropic 协议要求：同批 `tool_result` 必须**合并进紧跟 assistant(tool_use)
+   * 的那一条 user 消息**。harness 把**每个**工具调用落成**一条独立**的 tool 消息
+   * （真实会话 `session-871fdf61` 一次 tool_use 批次对应 1~3 条），逐条下发会产出
+   * **多条连续 user 消息** ⇒ 第二条前面是 user 而非 assistant ⇒ 2013。
+   *
+   * ⚠️⚠️ **不得跨 assistant 边界累积**（真实缺陷，第一版实现的错误）：
+   * 那样会变成 `assistant A / assistant B / user(A+B 的结果)`，
+   * A 的结果前面是 B 的 assistant ⇒ **同样** 2013。
+   */
+  let pendingAssistant: Record<string, unknown> | undefined
+  let pendingToolResults: Array<Record<string, unknown>> = []
+  /**
+   * 把「待发 assistant + 已累积的工具结果」**成对**提交。
+   *
+   * ⚠️ 结果为空时**仍要提交 assistant** —— 那是模型只回了正文的历史消息。
+   * ⚠️ 提交后 assistant 置空：它的结果已经配对完毕，不会再累积更多。
+   */
+  const commitPending = (): void => {
+    if (pendingAssistant === undefined && pendingToolResults.length === 0) return
+    if (pendingAssistant !== undefined) out.push(pendingAssistant)
+    if (pendingToolResults.length > 0) {
+      out.push({ role: 'user', content: pendingToolResults })
+      pendingToolResults = []
+    }
+    pendingAssistant = undefined
+  }
+
+  for (const message of normalized) {
     // ⚠️ system 角色不可能出现在这里（DSH 把它放在 options.system），
     // 但真出现时按 user 处理会让模型把它当用户指令 —— 故显式跳过。
+    // ⚠️ `developer`（只承载工具增删元数据的角色）由归一化层一并丢弃。
     if (message.role === 'system') continue
 
     const content: Array<Record<string, unknown>> = []
+    /** 本条消息的**全部**块数（用于判定「纯工具结果消息」）。 */
+    let blocks = 0
     for (const block of message.content) {
+      blocks++
       if (block.type === 'tool-call') {
+        // ⚠️ 孤儿/空名调用不产出 tool_use（否则下游 tool_result 变孤儿 → 400）。
+        if (!keepCallIds.has(String(block.id))) continue
         content.push({
           type: 'tool_use',
           id: block.id,
@@ -204,7 +276,9 @@ export function serializeMinimaxMessages(
         continue
       }
       if (block.type === 'tool-result') {
-        content.push({
+        // ⚠️ 孤儿结果不下发（服务端同样 400）。
+        if (!keepResultIds.has(String(block.toolCallId))) continue
+        pendingToolResults.push({
           type: 'tool_result',
           tool_use_id: block.toolCallId,
           // ⚠️ 工具结果内的图片也要内联（否则「工具返回截图」的场景会丢图）。
@@ -247,11 +321,37 @@ export function serializeMinimaxMessages(
       content.push({ type: 'text', text })
     }
 
-    if (content.length === 0) continue
-    // ⚠️ 工具结果所在的 user 消息**保持 user 角色**（Anthropic 约定），
-    // 不能因为「它其实是工具输出」而改角色或丢掉。
-    out.push({ role: message.role === 'assistant' ? 'assistant' : 'user', content })
+    // ⚠️⚠️ **成对提交即配对关系（真实缺陷，2026-10-01 由真实会话重放定位）**。
+    //
+    // Anthropic 要求：`tool_result` 必须**紧跟产生它的那一条** assistant(tool_use)。
+    // harness 侧形态是「一条 assistant（带 N 个 tool_use）+ N 条独立 tool 消息」。
+    // 三种错误形态都会报 2013：
+    //   ① 逐条下发 → N 条连续 user，第二条前面是 user；
+    //   ② assistant 立即下发、结果攒到下一轮 → `assistant A / assistant B / user(A+B 结果)`；
+    //   ③ 纯 reasoning 的空 assistant 被丢弃 → 其后结果失去锚点。
+    //
+    // ⇒ **assistant 与它的结果一起提交**：assistant 先进待发区，遇到它的结果
+    // （或任何非工具消息）时，才把「assistant + 累积结果」成对 push。
+    // 这样既合并了同批（不产生连续 user），也不跨 assistant 边界。
+    const isPureToolMessage = message.role !== 'assistant'
+      && content.length === 0
+      && blocks > 0
+    if (isPureToolMessage) continue
+
+    if (message.role === 'assistant') {
+      // ⚠️⚠️ 上一批若还没发出（assistant A 的结果已到齐但 A 本身待发），
+      // 先把 A + A 的结果成对发出，再把当前 assistant 转入待发区。
+      commitPending()
+      if (content.length === 0) continue
+      pendingAssistant = { role: 'assistant', content }
+      continue
+    }
+    // user 消息：先把待发的 assistant 连同已累积的结果成对发出，再发正文。
+    commitPending()
+    if (content.length > 0) out.push({ role: 'user', content })
   }
+  // ⚠️ 收尾：末尾的待发 assistant 与结果都要提交（否则留下无结果的 tool_use → 2013）。
+  commitPending()
   return out
 }
 
@@ -374,6 +474,17 @@ export async function* consumeMinimaxSse(
   let stopReason: unknown
   let usage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
   let sawAnyChunk = false
+  /**
+   * 响应原文样本（前 500 字符）。
+   *
+   * ⚠️ **只为错误文案服务**：`data:` 行解析失败（网关 HTML / 非标准信封）时，
+   * 整个响应在错误里毫无痕迹 ⇒ 适配器的轮换判据只能得到 `other` ⇒ 换号静默失效。
+   */
+  let rawSample = ''
+  const sampleRaw = (text: string): void => {
+    if (text === '' || rawSample.length >= 500) return
+    rawSample += text.slice(0, 500 - rawSample.length)
+  }
 
   /**
    * 处理一行 SSE。
@@ -414,11 +525,34 @@ export async function* consumeMinimaxSse(
     const type = typeof frame.type === 'string' ? frame.type : eventName
 
     if (type === 'error') {
-      const error = frame.error
-      const message = typeof error === 'object' && error !== null
-        ? String((error as Record<string, unknown>).message ?? '未知错误')
-        : '未知错误'
-      throw new Error(`minimax: 流内错误：${message}`)
+      const nested = frame.error
+      const record = typeof nested === 'object' && nested !== null
+        ? nested as Record<string, unknown>
+        : undefined
+      /**
+       * ⚠️ 服务端在本家**混用两种信封**（2026-10-11 真机实测）：
+       *
+       * - Anthropic 形状：`{"type":"error","error":{"type":…,"message":…}}`
+       * - **自家信封**：`{"code":401,"message":"auth failed"}` —— 401 实测就是这个，
+       *   它**根本没有 `error` 对象**。
+       *
+       * 只认 `frame.error.message` 时自家信封退化成「未知错误」⇒ 额度信息整段丢失
+       * ⇒ 适配器判 `other` ⇒ **换号静默失效**（issue 要修的事在 200 路径上原样残留）。
+       * ⇒ message 回退读顶层；`type` 与 `code` 一并带进文案，后者是适配器的
+       *   确定性通道（实测自家信封的 `code` 与 HTTP 语义同值）。
+       */
+      const messageRaw = record?.message ?? frame.message
+      const message = typeof messageRaw === 'string' && messageRaw !== '' ? messageRaw : '未知错误'
+      const kindRaw = record?.type ?? frame.type
+      // ⚠️ `frame.type` 在本分支恒为 `'error'`（那是分支判据本身），别再重复播报。
+      const kind = typeof kindRaw === 'string' && kindRaw !== '' && kindRaw !== 'error'
+        ? `（${kindRaw}）`
+        : ''
+      const codeRaw = record?.code ?? frame.code
+      const code = typeof codeRaw === 'number' || (typeof codeRaw === 'string' && codeRaw !== '')
+        ? `（code=${String(codeRaw)}）`
+        : ''
+      throw new Error(`minimax: 流内错误${kind}：${message}${code}`)
     }
     if (type === 'message_start') {
       const message = frame.message
@@ -522,20 +656,37 @@ export async function* consumeMinimaxSse(
         }
         break
       }
-      buffer += decoder.decode(value, { stream: true })
+      const piece = decoder.decode(value, { stream: true })
+      sampleRaw(piece)
+      buffer += piece
       // SSE 以空行分隔事件；按行处理，末尾不成行的部分留在 buffer 里。
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const rawLine of lines) yield* processLine(rawLine)
     }
   } finally {
+    /**
+     * ⚠️ **必须 cancel，不能只 releaseLock**（本仓既有约定，见 `sse.ts` 的
+     * `readWithIdleTimeout`）：请求级轮换会在「流内错误」时**提前离开**这条流，
+     * 只释放锁会把未读完的响应体留在连接上（一次请求最多 7 条）。
+     * 这是本家接上轮换后才出现的新累积（改动前 200 只被消费一次）。
+     */
+    await reader.cancel?.().catch(() => {})
     reader.releaseLock?.()
   }
 
   // ⚠️ 空响应必须报错：静默结束会让 harness 认为「模型正常回答但没内容」，
   // **不会重试**（与 Qoder/CodeArts 的既有约定一致）。
   if (!sawAnyChunk) {
-    throw new Error('minimax: 模型未返回任何内容块')
+    /**
+     * ⚠️ 把**响应原文样本**带上：网关 HTML / 非标准信封在这里只表现为「没有内容块」，
+     * 不带原文时适配器只能判 `other` ⇒ 换号静默失效，用户也看不到服务端说了什么。
+     * （`data:` 行解析失败时同样只有原文能提供线索。）
+     */
+    const sample = rawSample.trim()
+    throw new Error(
+      `minimax: 模型未返回任何内容块${sample === '' ? '' : `（响应原文：${sample.slice(0, 500)}）`}`,
+    )
   }
   yield { type: 'usage', usage }
   yield { type: 'finish', reason: mapMinimaxStopReason(stopReason) }

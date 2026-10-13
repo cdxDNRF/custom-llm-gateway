@@ -78,7 +78,7 @@ export const LOBSTERAI_CREDENTIAL_REF = 'LOBSTERAI_ACCESS_TOKEN'
  * 续期被后端判定为终态（refresh_token 失效）时抛出的错误。
  *
  * 与 `buddy-oauth.ts` / `oauth.ts` 同名类**刻意是各自独立的类**：
- * `src/refresh.ts:21-25` 的 `isRefreshTokenExpired` 用 `error.name` 而非
+ * `src/refresh.ts` 的 `isRefreshTokenExpired` 用 `error.name` 而非
  * `instanceof` 作判据，正是因为这些类跨模块 identity 不同。
  * 故这里也必须保证 `name` 恰为 `RefreshTokenExpiredError`。
  */
@@ -419,7 +419,7 @@ export class LobsteraiAuth extends Service {
    *
    * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
    * UI 账号卡片的「有效期」读的正是池里的值，而不是凭据里 access_token 的真实
-   * `exp`。早期这里只 `credentials.set`，于是用户点「刷新」后凭据确实续好了、
+   * `exp`。早期这里只 `credentials.set`，于是调用 `account.refresh` 后凭据确实续好了、
    * 界面却**一直显示「已过期」**，且没有任何自救手段（「重测」按钮的 refresh
    * 是刻意的 no-op）。
    *
@@ -688,8 +688,8 @@ export class LobsteraiAuth extends Service {
   async fetchModels(pool?: AccountPool): Promise<LobsteraiRemoteModel[]> {
     let credential: LobsteraiCredential | undefined
     if (pool) {
-      const available = await pool.getAvailableAccount(this.product.id, '')
-      if (available) credential = available.credential as LobsteraiCredential
+      const available = await pool.getAvailableAccount<LobsteraiCredential>(this.product.id, '')
+      if (available) credential = available.credential
     }
     if (credential === undefined) credential = await this.resolveStoredCredential()
     if (credential === undefined || credential.access_token.length === 0) return []

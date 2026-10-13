@@ -69,7 +69,7 @@ export const LOOMY_CREDENTIAL_REF = 'LOOMY_ACCESS_TOKEN'
  * 凭据已被判定失效（且**无法续期**）时抛出的错误。
  *
  * ⚠️ `name` 必须恰为 `RefreshTokenExpiredError` ——
- * `src/refresh.ts:21-25` 的 `isRefreshTokenExpired` 用 `error.name` 而非
+ * `src/refresh.ts` 的 `isRefreshTokenExpired` 用 `error.name` 而非
  * `instanceof` 作判据（这些类跨模块 identity 不同）。
  */
 export class RefreshTokenExpiredError extends Error {
@@ -324,7 +324,7 @@ export class LoomyAuth extends Service {
   }
 
   /**
-   * 探测指定 ref 的凭据有效性（账号卡片「刷新」按钮）。
+   * 探测指定 ref 的凭据有效性（RPC `account.refresh`）。
    *
    * ⚠️ 与 `refresh()` 的区别：`refresh()` 读写默认单凭据 ref，
    * 而账号卡片对应的是 `LOOMY_ACCOUNT_XXX`。用 `refresh()` 刷账号池里的

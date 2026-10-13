@@ -14,9 +14,9 @@ import { REFRESH_LEAD_MS } from './refresh.js'
  *
  * 这条分叉有两条产生路径，都真实发生过：
  *
- * 1. **按需续期不回写**：`refreshAccountCredential`（账号卡片「刷新」按钮走的
+ * 1. **按需续期不回写**：`refreshAccountCredential`（RPC `account.refresh` 走的
  *    路径）原先只有 raccoon 记得 `pool.updateAccount({ expiresAt })`，
- *    其余七个 provider 只 `credentials.set` —— 用户点了「刷新」，凭据续好了，
+ *    其余七个 provider 只 `credentials.set` —— 续期成功了、凭据换新了，
  *    UI 却纹丝不动，且没有任何自救手段（「重测」按钮的 refresh 是刻意的 no-op）。
  * 2. **定时器首轮要等满一个周期**：`src/index.ts` 的多账号续期只有 `setInterval`、
  *    没有启动时首轮，短寿命 provider（cline 1h / codearts 2h / raccoon 3h）

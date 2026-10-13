@@ -26,6 +26,8 @@
  *   （字符串经 `_$d = base64 → XOR("tqrRVttEZQ4G")` 编码）
  */
 
+import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES } from './image-budget.js'
+
 /** 兜底模型目录中的一个条目（字段口径见下方 `QODER_FALLBACK_MODELS` 的注释）。 */
 export interface QoderFallbackModel {
   /** 模型目录 **key**（如 `qfmodel`）。
@@ -288,8 +290,17 @@ export interface QoderProduct {
   /**
    * 单张请求图片的编码字节目标。
    *
-   * 未配置时用 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（1 MiB）——
-   * 取值的算术依据记在 `src/image-budget.ts`。
+   * 取 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（**1 MiB**）—— 取值的算术依据
+   * 记在 `src/image-budget.ts`。
+   *
+   * ⚠️ **这个字段必须显式赋值，不能靠 `requestImageTargetFor` 的默认参数兜底**
+   * （2026-10-12 修）：那个默认是 `REQUEST_IMAGE_MAX_BYTES` = **2 MiB**
+   * （为腾讯系那道**图片 token 预算**准备的，字节不是它的约束），
+   * 而 qoder 撞的是**请求体体积**。漏赋值时生效的是 2 MiB，于是
+   * 「24 张 × 2 MiB × 4/3 = **64 MiB**」**超过**上游写明的 50 MiB 硬限
+   * （`52428800 bytes`，issue IKKX0T 实测报文里的精确值）——
+   * 与 `image-budget.ts` 记的「1 MiB 下 24 张 ≈32 MiB，远低于实测边界」自相矛盾。
+   *
    * ⚠️ 与 raccoon 的 512 KB 不同值是**有意的**（那家硬限 10 MB），别合并。
    */
   imageMaxBytes?: number
@@ -455,6 +466,11 @@ export const QODER: QoderProduct = {
   sashClientType: '10',
   userAgentPrefix: 'qoder',
   defaultCredentialRef: 'QODER_ACCESS_TOKEN',
+  // ⚠️ **必须显式赋值**：适配器把 `undefined` 一路传给 `requestImageTargetFor`，
+  // 而那个默认参数是 **2 MiB**（为腾讯系的图片 token 预算准备的）——
+  // qoder 撞的是**请求体体积**，2 MiB 会让 24 张达 64 MiB、**超过上游的 50 MiB 硬限**
+  // （`52428800 bytes`）。详见接口里 `imageMaxBytes` 的注释。
+  imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
   fallbackModels: QODER_FALLBACK_MODELS,
 }
 
@@ -627,6 +643,9 @@ export const QODER_CN: QoderProduct = {
   // E11：CN asar 的 sash 请求头 UA 恒为 `"Qoder"`，与国际版一致。
   userAgentPrefix: 'qoder',
   defaultCredentialRef: 'QODERCN_ACCESS_TOKEN',
+  // 与国际版同因（见国际版处注释）：两站**复用同一个 `QoderAdapter` 类**，
+  // 故字节目标必须一致 —— 只给国际版赋值会让两站在同一份适配器上分叉。
+  imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
   fallbackModels: QODER_CN_FALLBACK_MODELS,
 }
 

@@ -69,7 +69,7 @@ export const CLINE_CREDENTIAL_REF = 'CLINE_ACCESS_TOKEN'
  * 续期被后端判定为终态（refresh_token 失效）时抛出的错误。
  *
  * 与其它 provider 的同名类**刻意是各自独立的类**：
- * `src/refresh.ts:21-25` 的 `isRefreshTokenExpired` 用 `error.name` 而非
+ * `src/refresh.ts` 的 `isRefreshTokenExpired` 用 `error.name` 而非
  * `instanceof` 作判据，正是因为这些类跨模块 identity 不同。
  * 故这里也必须保证 `name` 恰为 `RefreshTokenExpiredError`。
  */
@@ -349,7 +349,7 @@ export class ClineAuth extends Service {
    *
    * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
    * UI 账号卡片读的正是池里的值。早期七个 provider 都只 `credentials.set`，
-   * 于是用户点「刷新」后凭据确实续好了，界面却**一直显示「已过期」**，
+   * 于是调用 `account.refresh` 后凭据确实续好了，界面却**一直显示「已过期」**，
    * 且「重测」按钮的 refresh 是刻意的 no-op —— 等于没有任何自救手段。
    * 只有 raccoon 记得回写，故它是当时唯一能自愈的面板。
    *

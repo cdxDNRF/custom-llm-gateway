@@ -86,18 +86,45 @@ export interface TraeProduct {
    */
   function: string
   /**
-   * 要拉取的**全部**对话通道，**顺序即优先级**。
+   * **可调用通道白名单**，**顺序即优先级**。
    *
    * 真实 CN IDE 用 `batch_get_detail_param` 一次查 22 个 function，每个
    * function 各自一套模型目录；同一条目在不同通道的可用性（`is_custom_model`
    * / `is_invisible_to_user` / `config_switch`）**可以不同**，而且
-   * **模型只在列出它的通道里可调用**（发错通道 → 流内 `4001`）。
+   * **模型只在列出它的通道里可调用**（发错通道 → 流内错误码）。
    *
-   * 这里只列**实测可调用**的通道，并让 `solo_work_lite` 排在首位以保持既有
-   * 模型的通道不变（最小行为变更）；`solo_agent_remote` 补上 agent 专有模型
-   * （`glm-5.1` / `qwen-3.5` / `Doubao-Seed-Code`）与 1M 上下文声明。
+   * ⚠️ **本表是白名单，不只是排序表**（Issue IKJOZ7）：上游下发的 22 个
+   * function 里，**只有一部分**在本插件的推理端点
+   * （`/api/agent/v3/llm_utils_chat`）下真正可调用。此前实现让 `parseTraeBatchModelList`
+   * 「目录声明了什么通道就照着发什么通道」，于是 38 条目录里有 **19 条（50%）**
+   * 带着不可调用的 `function`（`chat` / `builder` / `inline_chat` / `git_ai` …），
+   * 用户一选中就稳定失败 —— 而报错文案（`the model is unknown` /
+   * `param is invalid`）指向**模型**，极易误判成「这个模型坏了」。
    *
-   * 可用 `DSH_TRAE_CHANNELS`（逗号分隔）覆盖以试验其它通道。
+   * 逐通道实测（2026-10-04，真实凭据，每个 function 各发一次最小请求；
+   * 脚本 `scripts/probe-trae-channel-callable.mjs`）：
+   *
+   * | 结果 | function |
+   * |---|---|
+   * | ✅ 可调用（**本表内容，15 个**） | `solo_agent` / `solo_work_lite` / `solo_agent_remote` / `solo_work_remote` / `solo_agent_lite` / `solo_design_lite` / `solo_design_remote` / `solo_coder` / `chat_v3` / `builder_v3` / `git_ai` / `code_reviewer` / `code_review_summary` / `multimodal` / `system_diagnosis` |
+   * | ❌ 稳定被拒 | `chat`（`code=4023 the model is unknown`）/ `builder`（`4001 param is invalid`）/ `inline_chat`（`3003 model service is unavailable`） |
+   * | ⚪️ 目录恒空 | `ui_builder_v2` / `solo_builder` / `custom_agent_generation` / `utils` |
+   *
+   * ⚠️ 与 issue 原文的两处差异（都以上表实测为准，别照抄 issue 的推测）：
+   * - **`chat_v3` 是可调用的**，不要与 `chat` 混为一谈（issue 把二者并列怀疑）；
+   * - **`solo_coder` 首测超时、复测 4/4 成功** ⇒ 归为可调用；其独有模型
+   *   （`minimax-m2.7` 等）因此得以保留。
+   *
+   * ⚠️ **顺序即优先级**：同一模型被多个白名单通道列出时，取更靠前者
+   * （见 `parseTraeBatchModelList` 的规则 2）。`solo_agent` 排首位是对齐官方
+   * Auto Mode 选择器；`solo_work_lite` 紧随其后以保既有模型的通道尽量不变。
+   * 专用通道（`multimodal` / `git_ai` / `code_reviewer` …）排末尾：只有当某个
+   * 模型**不在**任何通用通道里时，才会落到它们上面（如
+   * `multimodal_image_kimi-k2.5`）。
+   *
+   * 可用 `DSH_TRAE_CHANNELS`（逗号分隔）覆盖以试验其它通道 —— ⚠️ 覆盖的是
+   * **整张白名单**，写错即过滤掉全部模型（这是有意的：宁可空目录，也不要
+   * 再让不可调用的通道流出去）。
    */
   channels: readonly string[]
   /**
@@ -149,6 +176,38 @@ export interface TraeProduct {
   userAgent: string
   /** 远端模型列表不可用时的兜底模型目录。 */
   fallbackModels: readonly TraeFallbackModel[]
+  /**
+   * 单张请求图片的像素预算。**当前刻意不赋值** —— 见下。
+   *
+   * ## ⚠️ 这里为什么是「声明了但不赋值」
+   *
+   * TRAE 撞的是**请求体体积**（不是腾讯系那道图片 token 预算）：Gitee issue
+   * IKKX0T 的独立实测给出边界 **`(21, 24]` 张** 2560×1600 原图，
+   * 形态是流内 `code=4006 content is too large for AI to understand`。
+   *
+   * 但**本仓库尚未用自己的账号与 fixture 复测过这个边界**，而 issue 的 fixture
+   * 是 3.45 MiB/张、本仓库的是 2.87 MiB/张 —— **量纲不同，不能直接套用**。
+   * 按本仓库既定规矩（「拿不到阈值就不定值」「别为了统一塞一个猜出来的预算」），
+   * 定值前必须先复测：`pnpm test:e2e:image-bisect`
+   * （`tests/e2e/image-limit-bisect.e2e.spec.ts`，会二分到 ≤3 张并打印
+   * 「张数 → 请求体 MiB」的换算）。
+   *
+   * ⚠️ **不要**照抄别家的 1 MiB：那个值是按**各自实测边界**推出来的
+   * （见 `src/image-budget.ts` 的算术），照抄等于把一个没验证的猜测写进产品配置。
+   * ⚠️ 也**不要**因为「字段存在但没人用」就删掉它 —— 它是复测后定值的落点，
+   * 且与其余按体积设限的家形状一致（`LoomyProduct` 有同名字段）。
+   */
+  imagePixelBudget?: number
+  /**
+   * 单张请求图片的**编码字节目标**（base64 展开前）。**当前刻意不赋值** —— 理由同上。
+   *
+   * ⚠️ 复测出边界后**必须显式赋值**（不能靠 `requestImageTargetFor` 的默认参数兜底）：
+   * 那个默认是 2 MiB，为腾讯系的**图片 token 预算**准备的，而 TRAE 撞的是体积 ——
+   * 同款缺陷与后果（越过上游硬限）见 `src/image-budget.ts` 的
+   * `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES` 与 `tests/unit/image-budget.spec.ts`
+   * 的「按体积设限的家必须显式给 imageMaxBytes」段。
+   */
+  imageMaxBytes?: number
 }
 
 /** 上游 API 基址（Agent 服务）。 */
@@ -202,15 +261,21 @@ const TRAE_FALLBACK_MODELS: readonly TraeFallbackModel[] = [
 ]
 
 /**
- * 要拉取的对话通道（顺序即优先级）。
+ * **可调用通道白名单**（顺序即优先级，详见 `TraeProduct.channels` 的注释）。
  *
- * 默认含三个实测可调用通道：
- * - `solo_agent`：**首位**，对应截图 Auto Mode 的模型列表（`function_configs`
- *   中 `function: "solo_agent"` 的 `config_info_list`）。包含最多的模型（约 66
- *   条），以及 `display_contact_config` 折扣信息、`reasoning_effort_config` 等
- *   完整配置。
- * - `solo_work_lite`：本项目既有通道，`glm-5-turbo` / `sagitta` 等在此通道可用。
- * - `solo_agent_remote`：补上 agent 专有模型（`glm-5.1` / `qwen-3.5` 等）。
+ * 内容来自逐通道实测（2026-10-04）：只放行在
+ * `/api/agent/v3/llm_utils_chat` 下真正可调用的 15 个 function。
+ * `chat` / `builder` / `inline_chat` 实测稳定被拒，**不得**放入；
+ * `ui_builder_v2` / `solo_builder` / `custom_agent_generation` / `utils`
+ * 目录恒空，放进来也无意义。
+ *
+ * 前三条是通用通道（官方 Auto Mode 用的就是它们），其余为专用通道：
+ * - `solo_agent`：**首位**，对应 Auto Mode 的模型列表，包含最多的模型
+ *   （实测 18 条）与 `display_contact_config` / `reasoning_effort_config`。
+ * - `solo_work_lite`：本项目既有通道。⚠️ 历史注释说 `glm-5-turbo` / `sagitta`
+ *   在此可用 —— 那两个模型**已从目录下架**（2026-10-04 实测不在任何通道里），
+ *   该说法是过期快照，不要据此断言。
+ * - `solo_agent_remote`：补上 agent 专有模型（`glm-5.1` / `kimi-k2.7-code` 等）。
  *
  * 可用 `DSH_TRAE_CHANNELS`（逗号分隔）覆盖。
  */
@@ -220,7 +285,25 @@ export const TRAE_CHANNELS: readonly string[] = resolveChannelList(
 
 /** 解析 `DSH_TRAE_CHANNELS`；空/非法时回退默认通道列表。 */
 function resolveChannelList(raw: string | undefined): readonly string[] {
-  const fallback: readonly string[] = ['solo_agent', 'solo_work_lite', 'solo_agent_remote']
+  const fallback: readonly string[] = [
+    // ── 通用通道（顺序即优先级）──
+    'solo_agent',
+    'solo_work_lite',
+    'solo_agent_remote',
+    'solo_work_remote',
+    'solo_agent_lite',
+    // ── 专用通道（只有通用通道都不含某模型时才会命中）──
+    'chat_v3',
+    'builder_v3',
+    'solo_coder',
+    'solo_design_lite',
+    'solo_design_remote',
+    'git_ai',
+    'code_reviewer',
+    'code_review_summary',
+    'multimodal',
+    'system_diagnosis',
+  ]
   if (raw === undefined) return fallback
   const parsed = raw.split(',').map((item) => item.trim()).filter((item) => item.length > 0)
   return parsed.length > 0 ? parsed : fallback

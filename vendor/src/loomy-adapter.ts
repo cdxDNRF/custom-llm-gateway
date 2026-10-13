@@ -21,7 +21,10 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import {
   isLoomyChatModel,
   isLoomyExpired,
@@ -30,7 +33,7 @@ import {
   splitLoomyRate,
   type LoomyCredential,
 } from './loomy.js'
-import { LOOMY, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
+import { LOOMY, loomyContextWindow, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -42,6 +45,7 @@ import {
   isTransportError,
   serializeMessages,
 } from './openai-compat.js'
+import { planSessionTitleThinking } from './session-title.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `LOOMY.id`）。 */
 export const PROVIDER = 'loomy'
@@ -159,7 +163,12 @@ export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
     models.push({
       id,
       name: loomyDisplayName(rawName),
-      contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 0,
+      // ⚠️⚠️ **必须过 `loomyContextWindow`**（issue IKJW31）：远端对 `spark-x`
+      // 虚报 1048576，真实墙在 262144。只改兜底表是**无效**的 —— 远端可用时
+      // 走的就是这里。判据与证据见 `loomy-product.ts` 的覆盖表注释。
+      contextWindow: Number.isFinite(contextWindow) && contextWindow > 0
+        ? loomyContextWindow(id, contextWindow)
+        : 0,
       supportsImage: readInputModalities(entry).includes('image'),
       supportsThinking: capabilities.reasoning === true,
       // ⚠️ 档位缺失时**不写这两个键**（而不是写空数组）：下游据此区分
@@ -178,7 +187,9 @@ function fallbackToRemote(model: LoomyFallbackModel): LoomyRemoteModel {
   return {
     id: model.id,
     name: model.name,
-    contextWindow: model.contextWindow,
+    // ⚠️ 兜底表的值同样过一遍覆盖表（两条路径**同一判据**，别让它们分叉 ——
+    // 覆盖表本身就是对「照抄声明值」的纠正，与值来自哪条路径无关）。
+    contextWindow: loomyContextWindow(model.id, model.contextWindow),
     // 兜底表不声明图片能力：宁可少报（用户改用文本描述），
     // 也不要报一个服务端可能不认的模态。
     supportsImage: false,
@@ -220,6 +231,109 @@ export interface LoomyAdapterOptions {
   product?: LoomyProduct
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerLoomyLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
+}
+
+// ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
+
+/** 单次用户请求最多尝试的账号数（含首号）。与 buddy/raccoon 同语义，设上限只为防病态池。 */
+const LOOMY_MAX_ROTATE = 8
+/** 额度耗尽的冷却兜底：Loomy 的日额度（每日 5000）无可靠重置字段，按日配额记 24h。 */
+const LOOMY_QUOTA_COOLDOWN_MS = 24 * 3_600_000
+/** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
+const LOOMY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
+
+/**
+ * Loomy 的失败类别。**「要不要换号」与「要不要写冷却」是两件事**——
+ * 认证类（401/403）只换号、**绝不写冷却**。
+ *
+ * ⚠️ 真实事故（2026-10-06 凌晨，raccoon 同型实现上暴露）：上游网关对**全池**
+ * 回 `401 + authorization_verify_error`（网关侧授权校验故障）。当时把 401 也算
+ * 「可换号」且在换号前写冷却、时长取 `status === 429 ? 1h : 24h` ⇒ 一个请求内
+ * 连试 6 个号、每个写 24h ⇒ 池内候选筛空 ⇒ **整个 provider 被封一天**
+ * （下一次请求报 `no usable credential; log in first`）。
+ * buddy 的既有实现是分开的：只有限流类写标记，认证类只 `continue`。
+ */
+export type LoomyFailureClass = 'quota' | 'rate' | 'auth' | 'other'
+
+/**
+ * 判定失败类别（与 {@link RaccoonFailureClass} 同构——raccoon 与 loomy 的额度
+ * 错误形态同族：`14018 Credits exhausted`，HTTP 层无专用状态码，文案是主通道；
+ * 词表限「积分/额度/余额 + 不足/耗尽」的确定性组合，避免误伤正文里恰好讨论
+ * 「余额」的 4xx）。
+ *
+ * ## ⚠️ 401/403 **必须先判**（同型复发，2026-10-06）
+ *
+ * 本函数初版与 raccoon 的**修复前**版本逐字同形：文案先判、且 `insufficient`
+ * **单独出现**即算额度。raccoon 已在 `7b524ff` 收窄，loomy 未同步 ⇒ 同一报文
+ * 在两个 provider 上被判成**不同类别**，且危险方向恒定朝 loomy（多写冷却）：
+ *
+ * | 报文（实测，见 tests 的「与 raccoon 对拍」段） | loomy 修复前 | raccoon 已修 |
+ * |---|---|---|
+ * | `403 + insufficient permissions to access this resource` | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `403 + 积分不足` | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `401 + 余额不足` | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `401 + 14018 Credits exhausted`（网关故障通常带余额提示） | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `400 + the context window is insufficient for this model` | `quota` ⇒ 写 24h | `other` ⇒ 不换号 |
+ *
+ * 前四行正是 {@link LoomyFailureClass} 记的 2026-10-06「全池被封」事故形态
+ * （那次触发词是 `authorization_verify_error`，这次是 `insufficient permissions`
+ * / 「不足」类文案）：**认证类是账号态、不是模型冷却**，写标记会把网关侧的
+ * 授权故障放大成「整个 provider 被封 24h」。
+ *
+ * 两处修法（与 raccoon 逐字一致，方向都是「宁可漏判不可误伤」）：
+ * 1. **401/403 优先**按认证类处理 —— 状态码与额度文案并存时以状态码为准；
+ * 2. `insufficient` 须与邻近的「钱」义词（point/credit/balance/quota/token）
+ *    **共现**才算额度；上下文超长 / 数据不足等与额度无关。
+ *
+ * ⚠️ 两家的判据必须**逐格同构**：`classifyLoomyFailure` 与
+ * `classifyRaccoonFailure` 是同一张表的两个实现，任一侧单方面改动都会造成
+ * 本文件记的这起「同型复发」。回归用例用同一批真实报文喂两个分类器对拍。
+ */
+export function classifyLoomyFailure(errorText: string, status: number): LoomyFailureClass {
+  // 认证类先判：403 可能只是权限/授权问题，绝不能落到 quota 而被写 24h 冷却。
+  if (status === 401 || status === 403) return 'auth'
+  const lower = errorText.toLowerCase()
+  const quotaText = lower.includes('14018')
+    || lower.includes('credits exhausted')
+    // ⚠️ `insufficient` 单独出现**过宽**（raccoon 侧 PR !71 审计实测误伤 5 类），
+    // 必须与邻近的「钱」义词共现才算额度：上下文窗口超长（"context window is
+    // insufficient for this model"）、数据不足等都与额度无关。
+    // 方向仍是「宁可漏判不可误伤」—— 漏判只是不换号，误判会封可用账号 24h。
+    || (lower.includes('insufficient')
+      && ['point', 'credit', 'balance', 'quota', 'token'].some((w) => lower.includes(w)))
+    || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
+  if (quotaText || status === 402) return 'quota'
+  if (status === 429) return 'rate'
+  return 'other'
+}
+
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * 导出仅供单测锁定判据本身——只靠调用点顺序兜不住边界（`isRateLimited`
+ * 的 429 边界那次已验证过）。
+ */
+export function shouldRotateLoomyAccount(errorText: string, status: number): boolean {
+  return classifyLoomyFailure(errorText, status) !== 'other'
+}
+
+/** 该类别是否要写冷却标记（`auth` 不在其中，见 {@link LoomyFailureClass}）。 */
+export function recordsLoomyRateLimit(cls: LoomyFailureClass): boolean {
+  return cls === 'quota' || cls === 'rate'
 }
 
 /** Loomy 模型适配器。chat 端点用 Bearer，业务端点用 token。 */
@@ -230,12 +344,29 @@ export class LoomyAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, LoomyFallbackModel>
   /** 远端模型缓存（含展示名与能力）；未拉取时为 undefined。 */
   private remoteModels: LoomyRemoteModel[] | undefined
+  /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
+  private readonly catalogGate: RemoteCatalogGate
 
   constructor(private readonly options: LoomyAdapterOptions) {
     super()
     this.product = options.product ?? LOOMY
     this.fetchImpl = options.fetchImpl ?? fetch
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架：门控 → 读目录 → 黑名单 → 回填 → 三态，全在 `model-catalog.ts`。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.syncCatalogEntries(),
+      },
+    )
   }
 
   /**
@@ -251,77 +382,89 @@ export class LoomyAdapter extends LlmAdapter {
     return { id, name: this.product.displayName }
   }
 
+  /**
+   * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+   *
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架（实测与
+   * `minimax` / `raccoon` **归一化后逐字相同**）。现在只剩 `toCatalogEntry`
+   * 这一个**本家私有**的转换，骨架（门控 → 读目录 → 黑名单 → 回填 → 三态）
+   * 由 `src/model-catalog.ts` 统一持有。
+   */
+  private readonly catalog: ModelCatalog
+
   /** 完整目录（**不套黑名单**），带最终展示名。设置页需要它渲染被关闭的模型。 */
   listAllModels(): readonly { id: string; name: string }[] {
-    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return this.catalog.listAllModels()
   }
 
-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+  /**
+   * 取远端模型目录；**失败时不把兜底表写进缓存**。
+   *
+   * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
+   * 「已加载」记下，于是一次瞬时失败会让该 provider **整个进程生命周期**都只剩
+   * 兜底模型（用户看不到自己的模型，且无从触发重试，只能重启）。
+   * 改为：只缓存**真实远端目录**，兜底表每次现算（纯本地、零成本），
+   * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
+   */
   private async loadModels(): Promise<LoomyRemoteModel[]> {
     if (this.remoteModels !== undefined) return this.remoteModels
-    if (this.options.fetchRemoteModels !== undefined) {
-      try {
-        const fetched = await this.options.fetchRemoteModels()
-        if (fetched.length > 0) {
-          this.remoteModels = fetched
-          return fetched
-        }
-      } catch {
-        // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
-      }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote !== undefined) {
+      await this.catalogGate.run(async () => {
+        const fetched = await fetchRemote()
+        if (fetched.length === 0) return false
+        this.remoteModels = fetched
+        return true
+      })
+      if (this.remoteModels !== undefined) return this.remoteModels
     }
-    const fallback = this.product.fallbackModels.map(fallbackToRemote)
-    this.remoteModels = fallback
-    return fallback
+    return this.product.fallbackModels.map(fallbackToRemote)
   }
 
-  private inputModalitiesFor(model: LoomyRemoteModel | undefined): readonly ('text' | 'image')[] {
-    return model?.supportsImage === true ? ['text', 'image'] : ['text']
-  }
-
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
-    // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
-    // failures，界面上反而多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
+  /**
+   * 把本家私有的远端/兜底条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 这里是**唯一**还认识「倍率格式」与「supportsImage」的地方 ——
+   * 骨架不认识它们（各家格式不同）。
+   */
+  private toCatalogEntry(
+    model: LoomyRemoteModel,
+    fallback: LoomyFallbackModel | undefined,
+  ): CatalogEntry {
+    const reasoning = this.reasoningFor(model, fallback)
+    const contextWindow = model.contextWindow
+    return {
       id: model.id,
       // 倍率拼进 name（不是 description）：composer 的模型切换菜单只渲染 name。
       name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+      // ⚠️ `resolveModel` 用**裸名**（不带倍率）—— 价格只属于选择列表语境。
+      bareName: splitLoomyRate(model.name).name,
+      // ⚠️ 三态：`supportsImage` 为 false 时是**明确不支持**（不是「未知」）——
+      // 本家的远端条目**总是**带该布尔，故这里恒为数组，不会是 undefined。
+      inputModalities: model.supportsImage ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+  /** 本家全部条目（远端缓存 ?? 兜底表），已转成中间结构。 */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const fallback = this.fallbackIndex.get(model)
-    // ⚠️ name **不带倍率**（与 qoder/trae 一致）：价格只属于选择列表语境。
-    const bareName = fallback !== undefined ? splitLoomyRate(fallback.name).name : model
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry !== undefined ? splitLoomyRate(entry.name).name : bareName,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    const contextWindow = entry?.contextWindow ?? fallback?.contextWindow
-    // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-    if (contextWindow !== undefined && contextWindow > 0) {
-      resolved.context = { contextWindow }
-    }
-    // 思考档位：**远端 `reasoning_efforts` 直接生成**（用户要求）。
-    const reasoning = this.reasoningFor(entry, fallback)
-    if (reasoning !== undefined) resolved.reasoning = reasoning
-    return resolved
+    return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  /** 同步视图（`listAllModels` 用，见 `ModelCatalogConfig.syncCatalog` 的说明）。 */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
+    return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -391,7 +534,10 @@ export class LoomyAdapter extends LlmAdapter {
     const entry = all.find((item) => item.id === options.model)
     let imageUrls: Map<string, string> | undefined
     if (imageRefs.size > 0) {
-      if (!this.inputModalitiesFor(entry).includes('image')) {
+      // ⚠️ 这里**不能**走 `this.catalog` —— 它要的是「这个模型支不支持图片」这一个
+      // 判据，而 `resolveModel` 会顺带做 name 回退/context/maxTokens/reasoning，
+      // 在**发请求前**的这条路径上多算一遍没有意义（且 `resolveModel` 是 async）。
+      if (entry?.supportsImage !== true) {
         throw new LlmError(`loomy: 模型 "${options.model}" 不支持图片输入`, 'UNSUPPORTED_CONTENT')
       }
       if (this.options.readImage === undefined) {
@@ -401,6 +547,27 @@ export class LoomyAdapter extends LlmAdapter {
       // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
       imageUrls = new Map()
       for (const [id, ref] of imageRefs) {
+        /**
+         * ⚠️ **此处刻意走「原图」路径，未接 `readImageRequest` 缩放桥接**
+         * （Gitee issue IKKX0T，2026-10-12 复核）。
+         *
+         * 既有理由「loomy 实测 24 张全过、无证据说明它有约束」**已被推翻**：
+         * issue 的独立实测给出 `413 Request Entity Too Large` / `504`，
+         * 且本仓库那个「24 张」= **91.8 MiB** 恰落在 issue 的 87.4~96.6 MiB
+         * 区间**内部** —— 即当时是**侥幸通过**，不是没有约束。
+         *
+         * ⇒ **但当前仍不接**，理由只有一条：**边界未经本仓库复测**。
+         * 两家 fixture 的量纲不同（issue 3.45 MiB/张 vs 本仓库 2.87 MiB/张），
+         * 直接套用别家的 `imageMaxBytes` 等于写进一个没验证的猜测
+         * （本仓库规矩：拿不到阈值就不定值）。
+         *
+         * **复测入口**：`pnpm test:e2e:image-bisect`
+         * （`tests/e2e/image-limit-bisect.e2e.spec.ts`，二分到 ≤3 张）。
+         * 复测后：① 给 `LoomyProduct.imageMaxBytes` 赋值；
+         * ② 这里改为 `projectRequestImage(ref, {...})` 并保留「拿不到就回退原图」；
+         * ③ 宿主侧 `index.ts` 补 `readImageRequest` 桥接；
+         * ④ 删掉 `tests/unit/image-budget.spec.ts` 里那条「loomy/trae 不误接」守卫。
+         */
         const image = await this.options.readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
@@ -418,6 +585,19 @@ export class LoomyAdapter extends LlmAdapter {
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('loomy: no usable credential; log in first', 'MISSING_CREDENTIAL')
+    }
+    /**
+     * 当前请求实际使用的账号 id（请求级轮换的记账键）。语义与 raccoon 同款：
+     * 按 access_token 反查池内条目；单凭据兜底时保持空串（无池即无「下一个号」，
+     * 轮换自然失效，不误标）。
+     */
+    let activeAccountId = ''
+    if (this.options.accountPool) {
+      try {
+        activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+          this.product.id, credential.access_token,
+        ) ?? ''
+      } catch { /* 反查失败不阻断主路径 */ }
     }
 
     const messages = serializeMessages(options.messages, imageUrls)
@@ -450,10 +630,32 @@ export class LoomyAdapter extends LlmAdapter {
      */
     const effortsForModel = (await this.loadModels()).find((m) => m.id === options.model)?.efforts
       ?? this.fallbackIndex.get(options.model)?.efforts
-    const effort = options.reasoningEffort !== undefined
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 远端声明的默认档注入进来。本家远端 `reasoning_efforts` 实测形如
+     * `['none','low','medium','high','xhigh']`（**含 `none`**）⇒ 声明了它的
+     * 模型关得掉；远端未声明档位的模型只能抬预算兜底。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: effortsForModel ?? [],
+      maxTokens: options.maxTokens,
+    })
+    /**
+     * ⚠️ **仍须做档位白名单校验**（这是本家原有的判据，不能因为接入标题逻辑
+     * 而丢掉）：DSH 会把用户选的档位直接透传，给一个远端不认的值比不给更糟。
+     *
+     * 两种请求的取值来源不同，但**都要过这一关**：
+     * - 标题请求：`titlePlan.effort`（声明了 `none` 时就是它）；
+     * - 普通请求：调用方给的档位（与本次改动前**逐字节等价**）。
+     */
+    const effort = titlePlan.effort !== undefined
       && effortsForModel !== undefined
-      && effortsForModel.includes(options.reasoningEffort)
-      ? options.reasoningEffort
+      && effortsForModel.includes(titlePlan.effort)
+      ? titlePlan.effort
       : undefined
 
     /** 构造请求体。 */
@@ -461,7 +663,7 @@ export class LoomyAdapter extends LlmAdapter {
       model: options.model,
       messages: wireMessages,
       stream: true,
-      ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+      ...titlePlan.maxTokens !== undefined ? { max_tokens: titlePlan.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
       ...effort !== undefined ? { reasoning_effort: effort } : {},
@@ -511,12 +713,127 @@ export class LoomyAdapter extends LlmAdapter {
       if (refreshed === undefined || refreshed.access_token.length === 0) {
         throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
+      /**
+       * ⚠️ **必须跟着重新反查账号 id**（与 raccoon 的 `51ded6a` 同款缺陷）。
+       *
+       * `options.resolveCredential` 是**池优先 + 余额分档**的（见 `src/index.ts`
+       * 的 loomy 分支：先 `loomyBalanceSelector.select()` 再解析该号的 ref），
+       * 而 `refresh()` 探测/续期的是**池当前默认账号**
+       * （`pool.getAvailableAccount(LOOMY.id, '')`）—— 二者可能不是同一个号。
+       * ⇒ 续期后取回的凭据**可能属于另一个账号**，但 `activeAccountId` 还停在
+       * 刷新前的那个号上。
+       *
+       * 后果（与 raccoon 实测到的完全一致）：A 的 token 失效 → 刷新后拿到 B 的
+       * 凭据 → B 随后返回额度耗尽，而 24h 冷却标记**记在 A 头上** ⇒ 没耗尽的 A
+       * 被封、真该封的 B 下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+       * 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+       */
+      if (this.options.accountPool) {
+        try {
+          activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+            this.product.id, refreshed.access_token,
+          ) ?? ''
+        } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+      }
       response = await send(refreshed.access_token)
+      if (response.ok) credential = refreshed
     }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      let errorText = await response.text().catch(() => '')
+      let status = response.status
+      /**
+       * 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）。
+       *
+       * ## 为什么余额选号器救不了这个场景
+       *
+       * `loomy-balance-selector` 只在**取号时**按余额分档——余额查询与
+       * 实际扣费是两个时刻：查询时有钱、推理请求打过去时上游判额度耗尽
+       * （`14018 Credits exhausted`，日额度按次计费）。错误抛给 harness 后，
+       * 下次取号余额查询仍返回同样的排序，**同一个号被再次选中** ⇒
+       * 「卡死在一个号上」，直到它的余额 API 也刷新为止。
+       *
+       * ## 语义对齐 buddy
+       *
+       * - **可换**：额度耗尽（14018 / Credits / 积分不足等）、429、认证（401/403）；
+       *   **不可换**：其余 4xx（换号无益，按原错误抛）。
+       * - **每个账号只试一次**（`tried` 传池）。
+       * - **只有配额 / 限流类才写冷却**（24h / 1h）；**认证类只换号、绝不写标记**
+       *   —— 详见 {@link LoomyFailureClass} 记的 2026-10-06 全池被封事故。
+       * - **全部试完才报错**，带最后一次的真实原因。
+       * - ⚠️ 换到的号**绕过余额选号器**（直接用池的候选凭据）——选号器的
+       *   排序在「有余额的号」内部才有意义，此处候选已明确是坏号链，
+       *   池的手动顺序就是最合理的次序。
+       */
+      let failureClass = classifyLoomyFailure(errorText, status)
+      const accountPool = this.options.accountPool
+      if (accountPool && failureClass !== 'other') {
+        const tried = new Set<string>()
+        if (activeAccountId) tried.add(activeAccountId)
+        /**
+         * 给**当前**账号记冷却（配额 24h / 限流 1h），认证类不记。
+         *
+         * ⚠️ 必须**每次失败后立刻调用**（含第一次、也在轮换预算用尽之前），
+         * 不能挪到 `for` 循环开头：那样最后一个失败账号永远等不到下一次迭代，
+         * 就此漏记。实测（8 账号全耗尽）：挪在循环开头只记 7/8，末号漏记。
+         * 漏记的后果是下次请求又选中它 —— 正是本段要修的「卡死在一个号上」。
+         *
+         * ⚠️ 闭包读的是**实时**的 `activeAccountId` / `failureClass`（二者都在
+         * 循环内更新），不是创建时的快照 ⇒ 每次记的都是刚失败的那个号。
+         * 同款「用回调取当前账号会标错号」的坑见 AGENTS.md 的 Qoder 第 9 条。
+         */
+        const markCurrentAccount = async (): Promise<void> => {
+          // ⚠️ auth 类**不写标记**：认证失败是账号态而非模型冷却，写了会把
+          //    网关侧授权故障放大成「全池封 24h」（2026-10-06 事故）。
+          if (!activeAccountId || !recordsLoomyRateLimit(failureClass)) return
+          await accountPool.updateModelRateLimit(
+            activeAccountId,
+            options.model,
+            Date.now() + (failureClass === 'rate'
+              ? LOOMY_RATE_LIMIT_COOLDOWN_MS
+              : LOOMY_QUOTA_COOLDOWN_MS),
+          )
+        }
+        await markCurrentAccount()
+        const maxRotate = LOOMY_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          const next = await accountPool.getAvailableAccount<LoomyCredential>(
+            this.product.id, options.model, tried,
+          )
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          const nextCred = next.credential
+          if (nextCred === undefined || nextCred.access_token.length === 0) break
+          activeAccountId = next.entry.id
+          response = await send(nextCred.access_token)
+          if (response.ok) {
+            credential = nextCred
+            // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回（既有说明见下）。
+            yield* consumeOpenAiSse(response, { signal: options.signal }, {
+              label: 'loomy',
+              firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+              chunkTimeoutMs: resolveChunkTimeoutMs(),
+              ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            })
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          status = response.status
+          failureClass = classifyLoomyFailure(errorText, status)
+          await markCurrentAccount()
+          if (failureClass === 'other') {
+            throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+          }
+        }
+        throw new LlmError(
+          `loomy: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
+          failureClass === 'rate' ? 'RATE_LIMIT'
+            : failureClass === 'auth' ? 'AUTH'
+              : 'QUOTA_EXCEEDED',
+          { status },
+        )
+      }
+      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
@@ -550,7 +867,12 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerLoomyLlm(ctx: Context, options: LoomyAdapterOptions): LoomyAdapter {
   const product = options.product ?? LOOMY
-  const adapter = new LoomyAdapter(options)
+  const adapter = new LoomyAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

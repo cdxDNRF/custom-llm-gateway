@@ -35,6 +35,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import type { TokenUsage } from '@deepseek-ai/dsh-llm'
 import { jwtExpiresAtMs } from './buddy.js'
 import { TRAE_CHANNELS, type TraeProduct } from './trae-product.js'
 
@@ -1179,14 +1180,28 @@ export function parseTraeModelList(body: unknown): TraeRemoteModel[] {
  * 候选始终只来自**列出了该模型的通道**，因此无论选中哪条，都不会路由到
  * 「未列出该模型」的通道（上游对那种请求回流内 4001）。
  *
- * 同时三条硬性过滤在合并时执行：
+ * 同时四条硬性过滤在合并时执行：
  *
+ * - **`function` 不在 `channelPriority`（可调用通道白名单）内**的整组跳过
  * - `usage` 非 `chat_completion` 的排除
  * - `config_switch === false`（上游已停用）排除
  * - `is_invisible_to_user === true`（官方隐藏）排除
  *
- * @param channelPriority 通道优先级（下标越小越优先）。不在其中的通道视为
- *   最低优先级。仅用于规则 2 的择优。
+ * ⚠️ **第一条是 Issue IKJOZ7 的修复点**：`channelPriority` 此前**只用于排序**
+ * （规则 2 的择优），不参与准入 —— 于是「目录声明了什么通道，就照着发什么通道」，
+ * 而 22 个 function 里有一半在本插件的推理端点下不可调用（实测 `chat` →
+ * `4023 the model is unknown`、`builder` → `4001 param is invalid`、
+ * `inline_chat` → `3003 model service is unavailable`）。用户选中那些模型必然
+ * 失败，且错误文案指向**模型**、极易被误判成「这个模型坏了」。
+ * 现在它**同时是白名单**：不在表内的通道**整个丢弃**（连同其独有模型）。
+ *
+ * ⚠️ **丢弃是刻意的取舍**：`glm-5.1` / `DeepSeek-V4-Flash` 等模型同时也在通用
+ * 通道（`solo_agent` 等）里，故它们**不受影响**；只有「仅在不可调用通道里出现」
+ * 的条目（如 `kimi-k2` 仅见于 `inline_chat`）会被剔除 —— 那正是必然失败的那批。
+ *
+ * @param channelPriority **可调用通道白名单**，下标越小优先级越高。同时承担
+ *   两个职责：不在表内的通道被丢弃；同一模型被多个表内通道列出时取更靠前者。
+ *   覆盖它会改变**准入集合**，不只是顺序。
  */
 export function parseTraeBatchModelList(
   body: unknown,
@@ -1197,12 +1212,8 @@ export function parseTraeBatchModelList(
   const groups = record.function_configs ?? record.FunctionConfigs
   if (!Array.isArray(groups)) return []
 
-  /** 通道优先级下标；未收录的通道返回 `MAX_SAFE_INTEGER`（最低）。 */
-  const rankOf = (channel: string | undefined): number => {
-    if (channel === undefined) return Number.MAX_SAFE_INTEGER
-    const index = channelPriority.indexOf(channel)
-    return index < 0 ? Number.MAX_SAFE_INTEGER : index
-  }
+  /** 通道优先级下标（同样即白名单成员资格；非成员返回 -1 由调用处丢弃）。 */
+  const rankOf = (channel: string): number => channelPriority.indexOf(channel)
 
   const byId = new Map<string, TraeRemoteModel>()
   /** 已选条目所在通道的优先级（仅用于规则 2 的择优）。 */
@@ -1211,11 +1222,16 @@ export function parseTraeBatchModelList(
     if (typeof group !== 'object' || group === null) continue
     const g = group as Record<string, unknown>
     const channel = readStringField(g, 'function') || readStringField(g, 'Function')
+    // ⚠️ 白名单准入（Issue IKJOZ7）：未声明的通道、以及**不在白名单内的通道**
+    // 整组跳过 —— 后者的模型发出去必然被上游拒（判据见本函数注释的实测表）。
+    // 未声明 `function` 的组同样跳过：无通道可用时无法构造合法请求，
+    // 让它进目录只会变成一个「能选中但发不出去」的条目。
+    if (channel.length === 0 || rankOf(channel) < 0) continue
     const list = g.config_info_list ?? g.ConfigInfoList
     if (!Array.isArray(list)) continue
     for (const item of list) {
       if (typeof item !== 'object' || item === null) continue
-      const model = parseTraeConfigEntry(item as Record<string, unknown>, channel.length > 0 ? channel : undefined)
+      const model = parseTraeConfigEntry(item as Record<string, unknown>, channel)
       if (model === undefined) continue
       // ⚠️ 硬性过滤：三条独立条件，缺一不可，不设外部开关。只在此处（batch 端点
       // 解析时）执行，单通道的 `get_detail_param` 已按场景筛选过，不需要。
@@ -1232,7 +1248,7 @@ export function parseTraeBatchModelList(
       const incumbent = byId.get(model.id)
       if (incumbent === undefined) {
         byId.set(model.id, model)
-        chosenRank.set(model.id, rankOf(model.function))
+        chosenRank.set(model.id, rankOf(channel))
         continue
       }
       // ⚠️ 规则 1 与 2，详见函数注释（issue IKI7WT/IKILR7）。
@@ -1242,14 +1258,15 @@ export function parseTraeBatchModelList(
       if (incumbentHasEffort && !candidateHasEffort) continue
       // 规则 2：两侧都有档位时按通道优先级取更靠前者（档位与 function 同源）。
       if (incumbentHasEffort && candidateHasEffort) {
-        const current = chosenRank.get(model.id) ?? Number.MAX_SAFE_INTEGER
-        // `current` 为 MAX 表示已选条目不在优先级表内 —— 此时不设限，
-        // 退回「后覆盖前」，避免引入与优先级表无关的行为差异。
-        if (current !== Number.MAX_SAFE_INTEGER && rankOf(model.function) >= current) continue
+        // ⚠️ 这里不再需要「已选条目不在优先级表内」的兜底分支（Issue IKJOZ7）：
+        // 白名单准入已在上面跳过非白名单通道，故 `chosenRank` 与 `rankOf` 恒为
+        // 0..n-1 的合法下标，不存在 `MAX_SAFE_INTEGER`。旧代码那套兜底是
+        // 「优先级表只用于排序」时代的产物，现在是**不可达**的。
+        if (rankOf(channel) >= (chosenRank.get(model.id) ?? 0)) continue
       }
       // 规则 3：其余情形沿用既有的「后覆盖前」。
       byId.set(model.id, model)
-      chosenRank.set(model.id, rankOf(model.function))
+      chosenRank.set(model.id, rankOf(channel))
     }
   }
   return [...byId.values()]
@@ -1821,6 +1838,78 @@ export function buildOpenAIChunk(
 
 /** [DONE] 信号。 */
 export const OPENAI_DONE = 'data: [DONE]\n\n'
+
+/**
+ * SOLO `token_usage` 事件 → DSH `TokenUsage`（**互斥口径**）。
+ *
+ * ## 为什么必须单列一个函数
+ *
+ * 上游 `token_usage` 事件的**原始字段**（2026-10-12 实机直发实测，
+ * `deepseek-v4.1-flash` 与 `glm-5.2` 都验过）：
+ *
+ * ```json
+ * {"prompt_tokens":5144,"completion_tokens":32,"total_tokens":5176,
+ *  "cache_creation_input_tokens":0,"cache_read_input_tokens":5120,
+ *  "reasoning_tokens":30,"cluster":"normal_context"}
+ * ```
+ *
+ * ⚠️ **真实缺陷**（用户报障「trae 的缓存命中率一直是 0」）：早期实现只读
+ * `prompt_tokens` / `completion_tokens` / `reasoning_tokens`，把
+ * `cache_read_input_tokens` 与 `cache_creation_input_tokens` **整对丢弃**。
+ *
+ * 后果不是「少一个数字」：DSH 的 `dsh-token-meter` 投影层做的是
+ * `usage.cacheReadTokens ?? 0`（`usage-projection.js` 的 `bucketsFrom`），
+ * 字段缺席被归一成**数字 0** ⇒ 界面显示「缓存命中 0%」而非「—」——
+ * 这正是「一直是 0」这个症状的来源。本机 784 个真实会话的统计：
+ * trae 2397 条 `usage` 样本里带 `cacheReadTokens` 的是 **0 条**，
+ * 而其余十三家为 76%~100% ⇒ trae 是全机唯一的 0%。
+ *
+ * ## ⚠️ TRAE 的 `prompt_tokens` 是**含缓存**的总量（与 Anthropic 相反）
+ *
+ * 这是本函数做减法、而 `zcode-anthropic.ts` 不做减法的原因。判据是
+ * **同一前缀两次请求的对照实验**（实测 `glm-5.2`，同前缀连发两次）：
+ *
+ * | 次 | `prompt_tokens` | `cache_read_input_tokens` |
+ * |---|---|---|
+ * | 第 1 次（冷） | 4894 | 0 |
+ * | 第 2 次（复用） | **4894** | **4864** |
+ *
+ * 若 `prompt_tokens` 只含未命中部分，第 2 次的未命中应降到约 30 ——
+ * 它却纹丝不动地停在 4894，而命中量**单列**在 `cache_read_input_tokens`。
+ * ⇒ `prompt_tokens` 是「命中 + 未命中」的总输入，**必须减掉命中部分**，
+ * 否则把 DSH 的互斥口径当成含缓存口径，缓存命中率会显示偏小。
+ *
+ * ⚠️ `cache_creation_input_tokens`（缓存写入）**也是这一轮真实发出的输入**，
+ * 同样要从 `prompt_tokens` 里减出去，但它**不算命中**（不进 `cacheReadTokens`）
+ * —— 与 `openai-gateway/usage.ts` 的 `cacheWriteTokens` 约定一致。
+ *
+ * ⚠️ 减法要**钳到 0**：上游字段彼此矛盾时（第三方实现见过）宁可少算未命中，
+ * 也不能下发负数 —— `TokenUsage` 的计数字段在 DSH 侧是 `nonnegative`。
+ *
+ * @param raw `token_usage` 事件的 data 对象（`parseTraeSSELine` 原样存入的 `ev.usage`）
+ */
+export function traeUsageFromTokenUsage(raw: Record<string, unknown>): TokenUsage {
+  const num = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined
+
+  const promptTokens = num(raw.prompt_tokens)
+  const cacheRead = num(raw.cache_read_input_tokens)
+  const cacheWrite = num(raw.cache_creation_input_tokens)
+  const completionTokens = num(raw.completion_tokens)
+  const reasoningTokens = num(raw.reasoning_tokens)
+
+  // 未命中 = 总输入 - 命中 - 写入；钳到 0（见函数注释的「宁可少算」）。
+  const billed = (promptTokens ?? 0) - (cacheRead ?? 0) - (cacheWrite ?? 0)
+  const inputTokens = Math.max(0, billed)
+
+  return {
+    inputTokens,
+    outputTokens: completionTokens ?? 0,
+    ...cacheRead !== undefined && cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
+    ...cacheWrite !== undefined && cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {},
+    ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
+  }
+}
 
 /**
  * 聚合 SOLO SSE 流为单条 OpenAI chat.completion（非流式模式用）。

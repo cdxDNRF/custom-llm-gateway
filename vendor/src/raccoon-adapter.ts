@@ -29,7 +29,10 @@ import type {
   LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
 import {
   RACCOON,
@@ -42,6 +45,7 @@ import {
   type RaccoonProduct,
 } from './raccoon-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
+import { planSessionTitleThinking } from './session-title.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -192,6 +196,165 @@ export interface RaccoonAdapterOptions {
   product?: RaccoonProduct
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerRaccoonLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
+}
+
+// ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
+
+/** 单次用户请求最多尝试的账号数（含首号）。与 buddy 的全池遍历同语义，设上限只为防病态池。 */
+const RACCOON_MAX_ROTATE = 8
+/** 额度耗尽的冷却兜底：raccoon 的额度错误没有可靠重置字段（与 trae 4008 同形），按日配额记 24h。 */
+const RACCOON_QUOTA_COOLDOWN_MS = 24 * 3_600_000
+/** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
+const RACCOON_RATE_LIMIT_COOLDOWN_MS = 3_600_000
+
+/**
+ * raccoon 的失败类别。**「要不要换号」与「要不要写冷却」是两件事**，
+ * 由本分类分别决定（混为一谈曾酿成事故，见下）。
+ *
+ * | 类别 | 判据 | 换号？ | 写冷却？ |
+ * |---|---|---|---|
+ * | `quota` | `14018` / `Credits exhausted` / `insufficient` / 「积分·额度·余额 + 不足·耗尽」/ `quota exceeded`；HTTP 402 | ✅ | ✅ 24h（日配额） |
+ * | `rate` | HTTP 429 | ✅ | ✅ 1h |
+ * | `auth` | HTTP 401 / 403（如 `code=200003 authorization_verify_error`） | ✅ | ❌ **绝不写** |
+ * | `other` | 其余 4xx（400 参数错等） | ❌ | ❌ |
+ *
+ * ## 为什么 `auth` 必须「换号但不写冷却」（真实事故，2026-10-06 凌晨）
+ *
+ * 上游网关对**全池**回 `401 + authorization_verify_error`（网关侧授权校验故障，
+ * 与某个号的额度无关）。当时的实现把 401 也当「可换号」，且冷却时长写成
+ * `status === 429 ? 1h : 24h` ⇒ 401 落到 **24h**，于是一次请求内的换号循环
+ * 连试 6 个号、给每个都写了 24 小时 ⇒ 池内候选筛空 ⇒
+ * **整个 provider 被封一天**（下一次请求报 `no usable credential; log in first`）。
+ *
+ * buddy 的既有实现正是分开的：只有限流类写标记，认证类只 `continue` 换号。
+ * 认证失败是**账号态**（凭据失效），不是「该模型冷却」；写标记会让池把无辜
+ * 账号长期排除，且把网关侧故障放大成全池不可用。
+ */
+export type RaccoonFailureClass = 'quota' | 'rate' | 'auth' | 'other'
+
+/**
+ * 判定失败类别（文案 + 状态码双通道，与 `isRateLimited` 同构）。
+ *
+ * ## ⚠️ 401/403 **必须先判**（PR !71 审计）
+ *
+ * 早期实现把文案判定放在状态码之前，于是 `403 + "insufficient permissions to
+ * access this resource"` 被判成 `quota` ⇒ **给一个只是没权限的账号写 24 小时
+ * 冷却**。这与 {@link RaccoonFailureClass} 记的 2026-10-06「全池被封」事故
+ * **同型**（那次触发词是 `authorization_verify_error`，这次是
+ * `insufficient permissions`）：认证类只换号、绝不写标记，是那次事故换来的
+ * 不变式，不能被文案判据绕过。
+ *
+ * ⚠️ 顺序不能调换回去：把「先按文案判门禁、再解析」当通则会静默误伤 ——
+ * 401/403 与额度文案并存时（网关侧故障常在报文里带余额提示）必须以状态码为准。
+ *
+ * ⚠️ **本函数与 `classifyLoomyFailure`（`src/loomy-adapter.ts`）是同一张判据表的
+ * 两个实现，必须逐格同构**。真实教训（2026-10-06，**同型复发**）：本函数在
+ * `7b524ff` 收窄后 loomy 那份**未同步**，于是同一报文
+ * （`403 + insufficient permissions` / `403 + 积分不足` / `401 + 余额不足`）
+ * 在 loomy 上仍判 `quota` ⇒ **给无辜账号写 24h 冷却**，在 raccoon 上判 `auth`。
+ * 改动任一侧都必须同步另一侧，并跑 `tests/unit/loomy-adapter.spec.ts` 的
+ * 「与 raccoon 对拍」段（同一批真实报文喂两个分类器，分叉即红）。
+ */
+export function classifyRaccoonFailure(errorText: string, status: number): RaccoonFailureClass {
+  // 认证类先判：403 可能只是权限/授权问题，绝不能落到 quota 而被写 24h 冷却。
+  if (status === 401 || status === 403) return 'auth'
+  const lower = errorText.toLowerCase()
+  const quotaText = lower.includes('14018')
+    || lower.includes('credits exhausted')
+    // ⚠️ `insufficient` 单独出现**过宽**（PR !71 审计实测误伤 5 类），必须与
+    // 邻近的「钱」义词共现才算额度：上下文窗口超长（"context window is
+    // insufficient for this model"）、数据不足等都与额度无关。
+    // 方向仍是「宁可漏判不可误伤」—— 漏判只是不换号，误判会封可用账号 24h。
+    || (lower.includes('insufficient')
+      && ['point', 'credit', 'balance', 'quota', 'token'].some((w) => lower.includes(w)))
+    || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
+  if (quotaText || status === 402) return 'quota'
+  if (status === 429) return 'rate'
+  return 'other'
+}
+
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * 可换：额度耗尽、限流、认证（另一号的 token 可能有效）。
+ * 不可换：其余 4xx（400 参数错、404 路由错等）——换号无益，请求本身有问题，
+ * 换谁都会失败；按原错误抛，避免吞成「均不可用」。
+ */
+export function shouldRotateRaccoonAccount(errorText: string, status: number): boolean {
+  return classifyRaccoonFailure(errorText, status) !== 'other'
+}
+
+/**
+ * 499「客户端断开」口径的统一抛出：归 aborted 形态，而非普通错误。
+ *
+ * 🔴 实测（2026-10-11，本会话多次）：raccoon 网关返回 **HTTP 499 + body
+ * `client has aborted request`**（nginx「client closed request」＝ 连接在响应
+ * 完成前被断开，多为**请求体过大/网关超时**）。旧路径把它包成普通
+ * `LlmError`（code=httpErrorCode(499)）⇒ agent loop 按 name/code 归
+ * `kind:'error'` ⇒ 终端显示「本轮运行失败」，用户误以为 provider 坏了。
+ *
+ * 归 **aborted** 的语义收益：
+ * - 终端显示「已中止」而非「运行失败」（如实：请求没跑完，重发即可）；
+ * - **不改道**：499 的真实成因多为请求体过大（长上下文），换号重发**照样 499**
+ *   —— 改道只会烧光轮换预算；真正的恢复是压缩上下文（pressure-lane 的
+ *   预警/compaction 兜底正是干这个的）。
+ * ⚠️ 与 `aggregate-adapter.ts` 的 `isAbortLike` 第四条判据同口径（aborted
+ * request|HTTP_?499）—— aggregate 侧判「要不要原样重抛」，本侧判「直接抛
+ * 什么形态」，两处覆盖不同的到达路径（raccoon 是直接 provider，不经 aggregate）。
+ *
+ * ## ⚠️⚠️ 已知缺口：**只覆盖 HTTP 状态码路径，不覆盖 SSE 内嵌错误帧**
+ *（2026-10-12 审计实测登记）
+ *
+ * 本函数只在**两个 HTTP 非 ok 的抛出点**被调用。而本文件末尾自己写着
+ * 「业务失败也可能以 **HTTP 200 + SSE 内嵌错误帧**返回，由 `consumeOpenAiSse`
+ * 处理」—— 那条路径**不经过这里**：
+ *
+ * ```
+ * SSE 帧 {statusCodeValue:499, message:'client has aborted request'}（HTTP 200）
+ *   → consumeOpenAiSse 抛 LlmError(code='SERVER')，name ≠ 'AbortError'
+ *   → 外层判据 (signal.aborted || code==='ABORTED') === false
+ *   → kind:'error' ⇒ 终端仍显示「本轮运行失败」
+ * ```
+ *
+ * ⇒ 即**本修复的语义收益在 SSE 路径上没拿到**，两条路径口径不一致。
+ *
+ * ⚠️ **本分支不擅自扩大改动面**：修它要动 `src/openai-compat.ts` 的
+ * `consumeOpenAiSse`（**所有 provider 共享**的错误归类层），影响面远超本次
+ * 范围。故此处**如实登记**，留给维护者决定是否统一。
+ * 若要修，正确的做法是在那一层也识别 499/`aborted request` 并抛 `ABORTED`
+ *（而不是在 adapter 里再兜一层）。
+ */
+function abortLikeOrNormal(errorText: string, status: number): LlmError {
+  const message = `raccoon: ${errorDetail(errorText)}`
+  if (status === 499 || /aborted request|HTTP_?499/i.test(errorText)) {
+    const e = new LlmError(message, 'ABORTED', { status })
+    e.name = 'AbortError'
+    return e
+  }
+  return new LlmError(message, httpErrorCode(status), { status })
+}
+
+/**
+ * 该类别是否要写冷却标记。
+ *
+ * ⚠️ `auth` 不在其中 —— 见 {@link RaccoonFailureClass} 的事故说明。
+ */
+export function recordsRaccoonRateLimit(cls: RaccoonFailureClass): boolean {
+  return cls === 'quota' || cls === 'rate'
 }
 
 /** Raccoon Work 模型适配器。 */
@@ -202,12 +365,35 @@ export class RaccoonAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, RaccoonFallbackModel>
   /** 远端模型缓存；未拉取时为 undefined。 */
   private remoteModels: RaccoonRemoteModel[] | undefined
+  /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
+  private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架
+   * （实测与 `loomy` / `minimax` 归一化后逐字相同），现在只剩 `toCatalogEntry`。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: RaccoonAdapterOptions) {
     super()
     this.product = options.product ?? RACCOON
     this.fetchImpl = options.fetchImpl ?? fetch
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架（Task 7a）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.syncCatalogEntries(),
+      },
+    )
   }
 
   /**
@@ -227,29 +413,74 @@ export class RaccoonAdapter extends LlmAdapter {
    *
    * 设置页需要它渲染被关闭的模型 —— 否则那些条目只能凭 `disabledMap` 的 key
    * 补回，而那条路径拿不到展示名，会退化成裸 id（倍率与模型名随之丢失）。
+   *
+   * ⚠️ **2026-10-08 Task 7a**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return this.catalog.listAllModels()
   }
 
-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+  /**
+   * 把本家私有条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 这里是**唯一**还认识「倍率格式」与 `supportsImage` 的地方 ——
+   * 骨架不认识它们（各家格式不同）。
+   */
+  private toCatalogEntry(
+    model: RaccoonRemoteModel,
+    fallback: RaccoonFallbackModel | undefined,
+  ): CatalogEntry {
+    const contextWindow = model.contextWindow ?? fallback?.contextWindow
+    const maxTokens = positiveMaxTokens(model.maxTokens ?? fallback?.maxTokens)
+    return {
+      id: model.id,
+      name: model.name,
+      // ⚠️ `resolveModel` 用**裸名**（与 qoder/trae/loomy 一致）：
+      // 价格只属于选择列表语境。本家原本用 `replace(/ · .*$/, '')`。
+      bareName: model.name.replace(/ · .*$/, ''),
+      // ⚠️ 三态：本家远端条目**总是**带 `supportsImage` 布尔 ⇒ 恒为数组。
+      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
+      // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
+      reasoning: raccoonReasoningInfo(),
+    }
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    const all = await this.loadModels()
+    return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
+    return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  /**
+   * 取远端模型目录；**失败时不把兜底表写进缓存**。
+   *
+   * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
+   * 「已加载」记下，于是一次瞬时失败会让该 provider **整个进程生命周期**都只剩
+   * 兜底模型（用户看不到自己的模型，且无从触发重试，只能重启）。
+   * 改为：只缓存**真实远端目录**，兜底表每次现算（纯本地、零成本），
+   * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
+   */
   private async loadModels(): Promise<RaccoonRemoteModel[]> {
     if (this.remoteModels !== undefined) return this.remoteModels
-    if (this.options.fetchRemoteModels !== undefined) {
-      try {
-        const fetched = await this.options.fetchRemoteModels()
-        if (fetched.length > 0) {
-          this.remoteModels = fetched
-          return fetched
-        }
-      } catch {
-        // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
-      }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote !== undefined) {
+      await this.catalogGate.run(async () => {
+        const fetched = await fetchRemote()
+        if (fetched.length === 0) return false
+        this.remoteModels = fetched
+        return true
+      })
+      if (this.remoteModels !== undefined) return this.remoteModels
     }
-    const fallback = this.product.fallbackModels.map(fallbackToRemote)
-    this.remoteModels = fallback
-    return fallback
+    return this.product.fallbackModels.map(fallbackToRemote)
   }
 
   private inputModalitiesFor(model: RaccoonRemoteModel | undefined): readonly ('text' | 'image')[] {
@@ -257,50 +488,11 @@ export class RaccoonAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
-    // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
-    // failures，界面上反而多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      // 倍率拼进 name（不是 description）：composer 的模型切换菜单只渲染 name。
-      name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+    return this.catalog.listModels(_provider)
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const fallback = this.fallbackIndex.get(model)
-    // ⚠️ name **不带倍率**（与 qoder/trae/loomy 一致）：价格只属于选择列表语境。
-    const bareName = fallback !== undefined ? fallback.name.replace(/ · .*$/, '') : model
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry !== undefined ? entry.name.replace(/ · .*$/, '') : bareName,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    const contextWindow = entry?.contextWindow ?? fallback?.contextWindow
-    // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-    if (contextWindow !== undefined && contextWindow > 0) {
-      resolved.context = { contextWindow }
-    }
-    // ⚠️ 远端非法值必须过滤（见 positiveMaxTokens）：不声明就让 DSH 用默认值。
-    const maxTokens = positiveMaxTokens(entry?.maxTokens ?? fallback?.maxTokens)
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
-    // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
-    resolved.reasoning = raccoonReasoningInfo()
-    return resolved
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -365,6 +557,23 @@ export class RaccoonAdapter extends LlmAdapter {
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('raccoon: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
+    /**
+     * 当前请求实际使用的账号 id（请求级轮换的记账键）。
+     *
+     * ⚠️ 语义与 buddy 的 `currentAccountId` 同款：凭据来自池时按
+     * `findAccountIdByCredential` 反查；来自单凭据兜底（池空/旧安装）时
+     * 保持空串——此时轮换自然失效（没有池就没有「下一个号」），行为与
+     * 旧版一致，不会误标。
+     */
+    let activeAccountId = ''
+    if (this.options.accountPool) {
+      try {
+        // 第二参是「凭据唯一标识」字段值（raccoon 用 access_token，与 buddy 系同键）。
+        activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+          this.product.id, credential.access_token,
+        ) ?? ''
+      } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+    }
 
     const messages = serializeMessages(options.messages, imageUrls)
 
@@ -383,15 +592,31 @@ export class RaccoonAdapter extends LlmAdapter {
      *
      * ⚠️ 在 `buildBody` **之外**算一次：`buildBody` 会在重试时被多次调用，
      * 每次重算虽无害但没必要。
+     *
+     * ⚠️ **会话自动命名（`purpose: 'session-title'`）必须关闭思考**（issue
+     * IKKVDH）：DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，
+     * 而宿主会把本模型的默认档（本家恒为 `'on'`）注入进来
+     * （`effective = requested ?? reasoning.defaultEffort`）。照常开思考时实测
+     * 均值约 222 个思考 token，必然顶穿 64 ⇒ 正文 0 字符、
+     * `finish_reason:'length'` ⇒ DSH 直接拒绝、标题永远停在 fallback。
+     *
+     * 本家的档位表是**恒声明的两档**（`on`/`off`，与模型无关，见
+     * `raccoon-product.ts`）⇒ 任何模型都**关得掉**，故不需要抬预算。
      */
-    const thinking = raccoonThinkingExtraBody(options.reasoningEffort)
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: RACCOON_REASONING_EFFORTS,
+      maxTokens: options.maxTokens,
+    })
+    const thinking = raccoonThinkingExtraBody(titlePlan.effort)
 
     /** 构造请求体。 */
     const buildBody = (): string => JSON.stringify({
       model: options.model,
       messages: wireMessages,
       stream: true,
-      ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+      ...titlePlan.maxTokens !== undefined ? { max_tokens: titlePlan.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
       // ⚠️ tools 必须真的下发到请求体**顶层**：Qoder/TRAE 都因漏发而让模型
@@ -456,12 +681,111 @@ export class RaccoonAdapter extends LlmAdapter {
         throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
       credential = refreshed
+      // ⚠️ **必须跟着重新反查账号 id**（PR !71 审计发现）：`resolveCredential`
+      // 是「池优先」的（`src/index.ts` 的 raccoon 分支先 `getAvailableAccount`
+      // 再回退单凭据 ref），而 `refresh()` 续期的是**默认单凭据 ref**。
+      // ⇒ 续期后取回的凭据**可能属于另一个账号**，但 `activeAccountId` 还停在
+      // 刷新前的那个号上。
+      // 后果（实测可复现）：A 的 token 过期 → 刷新后拿到 B 的凭据 → B 随后
+      // 返回额度耗尽，而冷却标记却**记在 A 头上** ⇒ 没耗尽的 A 被封 24h，
+      // 真该封的 B 下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+      // 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+      if (this.options.accountPool) {
+        try {
+          activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+            this.product.id, refreshed.access_token,
+          ) ?? ''
+        } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+      }
       response = await send()
     }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      let errorText = await response.text().catch(() => '')
+      let status = response.status
+      /**
+       * 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）。
+       *
+       * ## 为什么必须有这一段
+       *
+       * `resolveCredential` 从池里取号按**手动顺序**（`getAvailableAccount`
+       * 的既有语义），失败类别不写标记时，下次请求取回的**仍是同一个号**。
+       * 首号余额耗尽（`14018 Credits exhausted`）→ 错误抛给 harness →
+       * 下次请求还是它 ⇒ 用户看到的是「卡死在一个号上」，池里其余账号
+       * 完好却永远轮不到。
+       *
+       * ## 语义对齐 buddy（本项目无感换号的基准实现）
+       *
+       * - **可换号**的失败类别：余额/额度耗尽（14018 / Credits / quota /
+       *   积分不足等）、限流（429）、认证（401/403——单号凭据失效时池里
+       *   可能有别的好号）；**非额度且非限流**（400 参数错等）换号无益，
+       *   按原错误抛（避免把「请求本身有问题」吞成「均不可用」）。
+       * - **每个账号只试一次**：`tried` 传给 `getAvailableAccount`——不排除
+       *   会拿回同一个号（池排序不因失败而变），换号形同虚设。
+       * - **只有配额 / 限流类才写冷却**（`recordsRaccoonRateLimit`）：
+       *   认证类（401/403）**只换号、绝不写标记** —— 详见
+       *   {@link RaccoonFailureClass} 记的 2026-10-06 全池被封事故。
+       * - **全部试完才报错**，且带**最后一次**的真实原因——笼统的
+       *   「所有账号均不可用」会丢掉服务端真正说的东西（buddy 上同款教训）。
+       * - **冷却时长按类别**：`quota` 记 24 小时（日配额；无可靠重置字段，
+       *   与 trae 4008 同形）、`rate` 记 1 小时。
+       */
+      let failureClass = classifyRaccoonFailure(errorText, status)
+      const accountPool = this.options.accountPool
+      if (accountPool && failureClass !== 'other') {
+        const tried = new Set<string>()
+        if (activeAccountId) tried.add(activeAccountId)
+        const markCurrentAccount = async (): Promise<void> => {
+          // 每次失败后立即记账，包括轮换预算用尽的最后一个账号。
+          // 认证错误只换号，不写模型冷却。
+          if (!activeAccountId || !recordsRaccoonRateLimit(failureClass)) return
+          await accountPool.updateModelRateLimit(
+            activeAccountId,
+            options.model,
+            Date.now() + (failureClass === 'rate'
+              ? RACCOON_RATE_LIMIT_COOLDOWN_MS
+              : RACCOON_QUOTA_COOLDOWN_MS),
+          )
+        }
+        await markCurrentAccount()
+        const maxRotate = RACCOON_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          const next = await accountPool.getAvailableAccount<RaccoonCredential>(
+            this.product.id, options.model, tried,
+          )
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          credential = next.credential
+          activeAccountId = next.entry.id
+          response = await send()
+          if (response.ok) {
+            // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回（既有说明见下）。
+            yield* consumeOpenAiSse(response, { signal: options.signal }, {
+              label: 'raccoon',
+              firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+              chunkTimeoutMs: resolveChunkTimeoutMs(),
+              ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            })
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          status = response.status
+          failureClass = classifyRaccoonFailure(errorText, status)
+          await markCurrentAccount()
+          if (failureClass === 'other') {
+            // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
+            throw abortLikeOrNormal(errorText, status)
+          }
+        }
+        throw new LlmError(
+          `raccoon: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
+          failureClass === 'rate' ? 'RATE_LIMIT'
+            : failureClass === 'auth' ? 'AUTH'
+              : 'QUOTA_EXCEEDED',
+          { status },
+        )
+      }
+      throw abortLikeOrNormal(errorText, status)
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
@@ -495,7 +819,12 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerRaccoonLlm(ctx: Context, options: RaccoonAdapterOptions): RaccoonAdapter {
   const product = options.product ?? RACCOON
-  const adapter = new RaccoonAdapter(options)
+  const adapter = new RaccoonAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

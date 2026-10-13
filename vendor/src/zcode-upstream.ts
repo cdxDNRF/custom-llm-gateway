@@ -34,13 +34,42 @@
 
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
+import {
+  extractZcodeLogId,
+  formatZcodeEdgePageHint,
+  hasZcodeUnusualActivity,
+  looksLikeZcodeHtmlPage,
+  parseZcodeBusinessCode,
+} from './zcode-diagnostics.js'
 import type { ZcodeRemoteModelLike } from './zcode-product.js'
+/**
+ * ⚠ **只取类型**：`zcode-captcha.ts` 反过来不 import 本文件，故无循环。
+ * 用 `import type` 是为了在编译后**不产生运行时依赖** —— captcha 那侧会拉起
+ * `chromium-session.js`（含 `node:child_process`），而本文件的调用方里有
+ * 只需要「读配置」的纯网络路径。
+ */
+import type { ZcodeCaptchaConfig } from './zcode-captcha.js'
 
 /** ZCode 平台 origin（官方默认）。 */
 export const ZCODE_ORIGIN = 'https://zcode.z.ai'
 
 /** 免费额度通道的 Anthropic 端点。 */
 export const ZCODE_PLAN_MESSAGES_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`
+
+/**
+ * 按通道返回「Messages」端点。
+ *
+ * ⚠ **积分制（`start-plan`）无论账号是 bigmodel 还是 zai，都走 `zcode.z.ai`**
+ * —— 官方分派表（`resources/config/provider/zcode-builtin.json`）的规则 2/5
+ * 明确如此，2026-10-03 实测复核。**不要**因为账号是国际版就改域名。
+ *
+ * ⚠ 订阅制（`coding-plan`）才走 `api.z.ai`（官方规则 0/1，2026-10-03 实测
+ * `GET https://api.z.ai/api/anthropic/v1/models` 返回 200 + 11 个模型）。
+ */
+export function zcodeMessagesUrl(channel: 'start-plan' | 'coding-plan'): string {
+  if (channel === 'coding-plan') return 'https://api.z.ai/api/anthropic/v1/messages'
+  return ZCODE_PLAN_MESSAGES_URL
+}
 
 /** 额度余额端点（**需要 Authorization**）。 */
 export const ZCODE_BILLING_BALANCE_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/balance`
@@ -119,6 +148,48 @@ export interface ZcodeBalanceBucket {
   availableUnits?: number
   /** 到期时间（Unix 秒）。 */
   expiresAt?: number
+  /**
+   * ★★ **该桶专属的模型**（上游 `capabilities`，实测形状 `["model:glm-5.3"]`）。
+   *
+   * ## 为什么必须读它（真实缺陷，用户报障 2026-10-12）
+   *
+   * **用户报障原文**：「智谱账号送的 8m 算力其中分为 5.3-3m 和 5.3flsh-5m，
+   * 插件判断这个账号没用完，就不会切换下一个账号使用」。
+   *
+   * 本机**只读实测**（`scripts/probe-zcode-plan-buckets.mjs`，启用账号）：
+   *
+   * ```json
+   * [bucket] show_name=GLM-5.3        capabilities=["model:glm-5.3"]
+   *          total_units=3000000   remaining_units=3000000
+   * [bucket] show_name=GLM-5.3-Flash  capabilities=["model:glm-5.3-flash"]
+   *          total_units=5000000   remaining_units=5000000
+   * ```
+   *
+   * ⇒ **8M 就是这两个桶（3M + 5M），且上游明确下发了模型归属。**
+   * 而此前本类型**没有这个字段**，`fetchZcodeBalance` 把它整体丢弃 ⇒
+   * 插件只知道「总剩余 8M」，于是 GLM-5.3 的 3M 烧光、Flash 的 5M 还在时，
+   * 折算层仍判「这账号有额度」（判据是全桶汇总的 `remaining > 0`）⇒
+   * **该模型的标记永远不写**，auto/aggregate 继续把它当可用候选派发 GLM-5.3。
+   *
+   * ⚠️ **缺失/为空 ⇒ 视为「通用桶」**（覆盖所有模型），**不要**当成「不覆盖任何模型」：
+   * 后者会让一个仍有余额的通用桶（如赠送的 1 亿 token）被忽略 ⇒ 一个**确实可用**
+   * 的账号被判成「该模型已耗尽」而被**误封**（方向相反的错误，代价更大）。
+   * 判据见 `zcode-entitlements.ts` 的 `bucketCoversModel`。
+   */
+  capabilities?: readonly string[]
+  /**
+   * 权益 id（实测 `ent_2_0817_glm_5p3` / `ent_2_0817_glm_5p3f`）。
+   *
+   * ⚠ **不参与任何判定** —— 判定一律走 {@link capabilities}
+   *（它是上游下发的**语义**字段；`entitlement_id` 是命名约定，改版就可能变）。
+   *
+   * ⚠️⚠️ **它当前是「只写不读」的数据**（审计指出 2026-10-12）：`src/` 与
+   * `plugin-src/client/` 里**零消费方**（唯一读者是本模块的单测）。
+   * 保留它的理由是**排查留证**：出问题时能一眼看出「是哪个 entitlement
+   * 在起作用」，而 `capabilities` 只给模型维度、给不出计划维度。
+   * ⇒ 别把它当「已接线」的字段用；要用它请先加消费者（并删掉这句说明）。
+   */
+  entitlementId?: string
 }
 
 /** 余额查询结果。 */
@@ -134,6 +205,18 @@ export interface ZcodeBalanceResult {
   expiresAt?: number
   /** 显示名（首个桶的模型名）。 */
   planName?: string
+  /**
+   * ★ 可领活动摘要（来自 `billing/preview`）。
+   *
+   * ⚠ **必需存在的原因**（2026-10-03 实测）：每日赠送的 start-plan 额度
+   * **不在 `buckets` 里**，只在 `preview.plans` 里 ——
+   * 同一账号 `balances` 返回 0 个桶、`preview` 返回 `…start-plan-trust-1003`。
+   * 只读 `buckets` 会让面板显示 0，而用户实际能领 1 亿 tokens。
+   *
+   * ⚠ 取不到时是**空数组**（不 undefined）：preview 失败属降级，
+   * 绝不能让它影响 `remaining`/`total` 本身。
+   */
+  claimablePlans: ZcodeClaimablePlanSummary[]
 }
 
 /** 一次可领活动。 */
@@ -141,6 +224,20 @@ export interface ZcodeClaimablePlan {
   planId: string
   priority: number
   name?: string
+  /**
+   * ★ 本次领取能拿到的**额度数值**（实测自 `plan.entitlements[].grant_units`）。
+   *
+   * ⚠ 上游**不在** plan 顶层给额度，只在 `entitlements[]` 里。拿不到时
+   *   留 undefined —— 此时 `toClaimOutcome` 退回 0（不谎报）。
+   */
+  grantUnits?: number
+  /**
+   * ★ 额度单位（`'token'` / 缺省按积分）。
+   *
+   * ⚠ ZCode 下发 `unit_type: "token"`，**不是**积分 —— 展示必须走
+   *   `formatUnits`/`unitLabel`（`plugin-src/client/credits-format.js`）。
+   */
+  unitType?: string
 }
 
 /** 领取结果。 */
@@ -153,11 +250,51 @@ export interface ZcodeClaimOutcome {
   alreadyClaimed?: boolean
   httpStatus?: number
   message?: string
+  /**
+   * 上游的 `logid`（排障凭据，2026-10-12 新增）。
+   *
+   * ⚠ 与推理侧同源：由 {@link extractZcodeLogId} **双来源**取
+   * （体顶层 `logid` 优先，HTTP 头 `x-request-id` 兜底）——
+   * 后者让**边缘 HTML 页**也有凭据可取。
+   * ⚠ 取不到即 `undefined`，不编造（诊断行会整项省略）。
+   */
+  logId?: string
 }
 
-/** 从数字字段安全取值（上游可能给 `null`）。 */
+/**
+ * 从数字字段安全取值（上游可能给 `null`）。
+ *
+ * ⚠⚠ **只认 `number`，不认数字字符串** —— 对**业务码**来说那是个真实缺陷
+ * （`{"code":"3012"}` 会被吃成 `undefined`，见 `claimZcodePlan` 里的说明），
+ * 现已改用 {@link parseZcodeBusinessCode}。
+ *
+ * ⚠ 本函数仍用于**额度数值 / priority / 上下文窗口**这些字段：它们若以字符串
+ * 下发，会静默退化成 `undefined`（`priority` → 0、`grantUnits` → 不显示额度）。
+ * 这属于**既有行为、不在本次改动范围**（改它会牵动 plan 排序与额度展示，
+ * 需单独的实发验证），故此处**如实标注限制而不擅自扩大改动**。
+ */
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 读一个桶的 `capabilities`（上游实测 `["model:glm-5.3"]`）。
+ *
+ * ⚠ **只收非空字符串**：上游可能在别的形态下给 `null` / 数字 / 空串，
+ * 让它们进数组会污染 `bucketCoversModel` 的前缀解析（`String(null)` 会得到
+ * `"null"` 这种看似合法的段）。
+ *
+ * ⚠ **全空时返回 `undefined`（而不是 `[]`）**：`undefined` 与 `[]` 在判据里
+ * **语义不同** —— 前者是「上游没说」，后者是「上游说它不覆盖任何模型」。
+ * 本仓库对这类「未知 vs 否定」的三态区分有明确规则（见 `inputModalities` 的
+ * 注释），且这里的错误方向代价很大：把 `undefined` 当成 `[]` 会让一个**仍有
+ * 余额的通用桶**被忽略，从而误封一个可用账号。
+ */
+function capabilitiesOf(record: Record<string, unknown>): readonly string[] | undefined {
+  const raw = record.capabilities
+  if (!Array.isArray(raw)) return undefined
+  const out = raw.filter((item): item is string => typeof item === 'string' && item.length > 0)
+  return out.length > 0 ? out : undefined
 }
 
 /**
@@ -226,7 +363,8 @@ export async function fetchZcodeBalance(
   const data = parsed.data
   if (data === undefined) return undefined
   if (typeof data.displayMode === 'string' && data.displayMode === 'enterprise') {
-    return { enterprise: true, buckets: [], remaining: 0, total: 0 }
+    // ⚠ 企业版**不下发额度数字**，也就没有可领活动 ⇒ 不发 preview 请求。
+    return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [] }
   }
 
   const rawBuckets = Array.isArray(data.balances) ? data.balances : []
@@ -245,6 +383,12 @@ export async function fetchZcodeBalance(
       remainingUnits: num(record.remaining_units),
       availableUnits: num(record.available_units),
       expiresAt: num(record.expires_at),
+      // ★ 模型归属（实测 `["model:glm-5.3"]`）—— 按模型判定靠它（见字段注释）。
+      ...(() => {
+        const capabilities = capabilitiesOf(record)
+        return capabilities === undefined ? {} : { capabilities }
+      })(),
+      ...typeof record.entitlement_id === 'string' ? { entitlementId: record.entitlement_id } : {},
     })
   }
 
@@ -265,6 +409,65 @@ export async function fetchZcodeBalance(
     total,
     expiresAt,
     planName: buckets[0]?.showName,
+    claimablePlans: await fetchClaimablePlans(credential, fetchImpl),
+  }
+}
+
+/** `ZcodeBalanceResult` 里由 `preview` 带出的可领活动。 */
+export interface ZcodeClaimablePlanSummary {
+  planId: string
+  showName?: string
+  amount?: number
+}
+
+/**
+ * 取「可领活动」摘要（**只读**，不消耗额度）。
+ *
+ * ## 为什么 balance 要带它（2026-10-03 实测）
+ *
+ * 同一账号：
+ * ```
+ * GET /billing/balance  → data.balances = []                          ← 0 个桶
+ * GET /billing/preview  → data.plans[0].plan_id = …start-plan-trust-1003
+ * ```
+ * ⇒ **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+ * 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+ *
+ * ⚠ **失败一律降级为空数组**，绝不影响 `balance` 本身 ——
+ *   余额是主体，preview 是补充。
+ *
+ * ⚠ 走**同一个** `preview` 端点与 `fetchZcodeClaimablePlans` 一致；
+ *   这里只是不解析成领取结果、只留展示要的三个字段（少一次字段耦合）。
+ */
+async function fetchClaimablePlans(
+  credential: ZcodeCredential,
+  fetchImpl: typeof fetch,
+): Promise<ZcodeClaimablePlanSummary[]> {
+  try {
+    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+    const response = await fetchWithTimeout(
+      fetchImpl,
+      `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`,
+      { method: 'GET', headers: buildZcodeHeaders(credential, { json: false }) },
+      15_000,
+    )
+    if (!response.ok) return []
+    const parsed = await response.json() as { data?: { plans?: unknown } }
+    const raw = Array.isArray(parsed.data?.plans) ? parsed.data.plans : []
+    const out: ZcodeClaimablePlanSummary[] = []
+    for (const item of raw as Array<Record<string, unknown>>) {
+      if (typeof item !== 'object' || item === null) continue
+      const planId = item['plan_id']
+      if (typeof planId !== 'string' || planId.length === 0) continue
+      out.push({
+        planId,
+        ...(typeof item['name'] === 'string' ? { showName: item['name'] } : {}),
+        ...(typeof item['amount'] === 'number' ? { amount: item['amount'] } : {}),
+      })
+    }
+    return out
+  } catch {
+    return []
   }
 }
 
@@ -323,10 +526,22 @@ export async function fetchZcodeClaimablePlans(
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
     if (typeof record.plan_id !== 'string' || record.plan_id.length === 0) continue
+    /**
+     * ★ 额度取自 `entitlements[]`（2026-10-03 实测）——
+     * plan 顶层**没有**额度字段，只有 `entitlements[0].grant_units`。
+     * 不读它 ⇒ `toClaimOutcome` 只能填 0 ⇒ 面板显示「+0 积分」。
+     */
+    const ents = Array.isArray(record.entitlements)
+      ? record.entitlements as Array<Record<string, unknown>>
+      : []
+    const first = ents[0] ?? {}
+    const grantUnits = num(first.grant_units)
     plans.push({
       planId: record.plan_id,
       priority: num(record.priority) ?? 0,
       name: typeof record.name === 'string' ? record.name : undefined,
+      ...(grantUnits === undefined ? {} : { grantUnits }),
+      ...(typeof first.unit_type === 'string' ? { unitType: first.unit_type } : {}),
     })
   }
   // priority 降序（与官方/第三方实现一致：先领高优先级）。
@@ -338,7 +553,8 @@ export async function fetchZcodeClaimablePlans(
  * 领取一个 plan。
  *
  * ⚠ **captcha 是一次性的**：每个 plan 都必须**重新 mint** 一个新 param。
- * 复用同一个 param 会得到 `3007`（captcha 校验失败）。
+ * 复用同一个 param 在索要验证的窗口里会得到 `3007`（captcha 校验失败）；
+ * 本路径**每个 plan 都现产一个新的**，不去赌上游这一次校不校验。
  *
  * 业务码语义（桥侧实测记录）：
  *
@@ -377,21 +593,109 @@ export async function claimZcodePlan(
     }
   }
 
-  const text = await response.text().catch(() => '')
+  /**
+   * ★★ 读响应体与解析业务码（真实缺陷，2026-10-05 对抗性审计打出）。
+   *
+   * ## ① `code` 必须认**纯数字字符串**
+   *
+   * 原先用 `num(parsed.code)`，而 `num()` **只认 `number`** ⇒ 上游回
+   * `{"code":"3012","msg":"request has been blocked due to unusual activity."}`
+   * 时 `code` 变成 `undefined`，风控码**整条丢失** —— 用户看到的正是本 issue
+   * 要修的那句裸上游串（`…: request has been blocked due to unusual activity.`），
+   * 因为该 `msg` 里**不含数字**，连「扫正文」都救不回来。
+   * ⇒ 改用 `parseZcodeBusinessCode`（见 `zcode-diagnostics.ts`），
+   * 它是全仓库**唯一**的业务码解析口径。
+   *
+   * ## ② 读体必须被包住（`F4`：此前的「自身不抛」是错的）
+   *
+   * 原先写成 `await response.text().catch(() => '')` —— 若 `fetch` 返回了
+   * **非 Response**（如 `null`，自定义 fetch / 被包装过的实现可能出现），
+   * `response.text` 的**属性访问**就同步抛 `TypeError`，`.catch` 根本挂不上
+   * ⇒ 整条穿透给调用方。真实 `fetch` 不会回 `null`，故生产影响≈0，
+   * 但 `claimDailyWith` 依赖「这里不抛」来配平埋点计数，故仍把它兜住。
+   */
+  let text = ''
   let code: number | undefined
   let message: string | undefined
   try {
+    text = await response.text()
+  } catch {
+    // 体流中断 / 响应对象异常 ⇒ 按「读不到正文」处理，不让它穿透。
+    text = ''
+  }
+  try {
     const parsed = JSON.parse(text) as { code?: unknown; msg?: unknown; message?: unknown }
-    code = num(parsed.code)
+    code = parseZcodeBusinessCode(parsed.code)
     message = typeof parsed.msg === 'string' ? parsed.msg
       : typeof parsed.message === 'string' ? parsed.message : undefined
   } catch {
-    message = text.slice(0, 200)
+    /**
+     * ⚠⚠ **边缘/CDN 的 HTML 错误页不得当文案倒给用户**（2026-10-07 审计打出）：
+     * 原先这里是 `text.slice(0, 200)`，于是用户看到的「领取失败原因」是
+     * `<!doctypehtml><html lang="zh-cn">…<style>a,body,div,h2,html,p{m` ——
+     * 一坨 CSS 噪声，且随 CDN 配置变化，将来无法据此复盘。
+     *
+     * ⇒ 与推理侧 `describeUpstreamError` **共用同一份**判据与文案
+     * （`zcode-diagnostics.ts` 是唯一出处，两侧不得各写一份）。
+     */
+    message = looksLikeZcodeHtmlPage(text)
+      ? formatZcodeEdgePageHint(text, response.status)
+      : text.slice(0, 200)
+  }
+  /**
+   * ★★ **正文里的风控必须在这里（能看到完整正文的地方）归一成 `code`**
+   * （真实缺陷，2026-10-05 审计 N1）。
+   *
+   * ## 缺陷
+   *
+   * 上面那条 `message = text.slice(0, 200)` 是为**展示**做的截断，但下游的
+   * 判据（`isClaimUnusualActivity`）读的**正是 `message`** ⇒ 当网关正文的
+   * 噪声超过 200 字符、而风控短语落在截断点**之后**时，判据看到的是被截掉的串：
+   *
+   * ```
+   * 完整 body 长度=230，hasZcodeUnusualActivity(全body)=true
+   * → code=undefined，message 长度=200，含风控短语=false
+   * → claimRecognized=false   ← 真风控被降级成通用失败
+   * ```
+   *
+   * 症状**正是本 issue 的原症状**（用户只看到一句看不懂的失败）。
+   *
+   * ## 修法
+   *
+   * 判据移到**本层**：这里持有完整 `text`，判得准。命中即把 `code` 归一成
+   * `3012`，让下游统一走「有码 ⇒ 只信码」的路径 —— 与
+   * `parseZcodeBusinessCode` 同一思路（**在信息最全的地方归一，而不是在
+   * 已经丢过信息的下游猜**）。
+   *
+   * ⚠ **只在 `code` 缺失时兜底**：上游给了权威业务码就绝不覆盖
+   *   （`{"code":1005,"msg":"quota 3012 exceeded"}` 必须仍是 1005）。
+   * ⚠ 判据是 `hasZcodeUnusualActivity`（**语义短语为主**）——
+   *   它本身已排除 `13012` / 限流里的毫秒数等误判形态。
+   *
+   * ⚠⚠⚠ **边缘/CDN 的 HTML 错误页必须豁免**（2026-10-07 审计打出，
+   * 与推理侧 `zcode-adapter.ts` 修掉的是**同一个缺陷的领取侧**）：
+   * 实测 `<html><body>request has been blocked due to unusual activity.</body></html>`
+   * 既 `looksLikeZcodeHtmlPage` 为真、`hasZcodeUnusualActivity` 也为真 ⇒
+   * `code` 被归一成 `3012` ⇒ `zcode-auth.ts` 的 `isClaimUnusualActivity` 命中
+   * ⇒ **短路本账号剩余 plan**，文案写「冷却惩罚 30 分钟→24 小时→停用」。
+   *
+   * ⇒ 一次**边缘拦截**被报成「账号风控、别重试」，还跳过了本可领取的 plan ——
+   * 与「稍后重试」的用户动作**完全相反**。
+   */
+  if (code === undefined && !looksLikeZcodeHtmlPage(text) && hasZcodeUnusualActivity(text)) {
+    code = 3012
   }
 
   // 1003 = 已领取过 —— **幂等成功，不是错误**。
   const alreadyClaimed = code === 1003
   const ok = response.ok && (code === 0 || alreadyClaimed)
+  /**
+   * ★ `logid` 在**持有 `response` 与完整 `text` 的这一层**提取（2026-10-12）——
+   * 与上面把风控归一成 `code` 同一条纪律：**在信息最全的地方取，
+   * 不要在已经丢过信息的下游猜**。下游（`zcode-auth.ts` 的 `toClaimOutcome`）
+   * 只拿得到 `message` 字符串，那里既没有 header、正文也可能已被截断。
+   */
+  const logId = extractZcodeLogId(text, response.headers)
   return {
     planId,
     code,
@@ -399,6 +703,7 @@ export async function claimZcodePlan(
     alreadyClaimed,
     httpStatus: response.status,
     message: message ?? (ok ? undefined : `HTTP ${response.status}`),
+    ...logId === undefined ? {} : { logId },
   }
 }
 
@@ -415,7 +720,7 @@ export async function claimZcodePlan(
 export async function fetchZcodeCaptchaConfig(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ region: string; prefix: string; sceneId: string } | undefined> {
+): Promise<ZcodeCaptchaConfig | undefined> {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`
   try {
@@ -425,7 +730,17 @@ export async function fetchZcodeCaptchaConfig(
     }, 20_000)
     if (!response.ok) return undefined
     const parsed = await response.json() as {
-      data?: { configs?: { captcha?: { region?: unknown; prefix?: unknown; sceneId?: unknown } } }
+      data?: {
+        configs?: {
+          captcha?: {
+            region?: unknown
+            prefix?: unknown
+            sceneId?: unknown
+            enabled?: unknown
+            skip_model_request?: unknown
+          }
+        }
+      }
     }
     const captcha = parsed.data?.configs?.captcha
     if (captcha === undefined) return undefined
@@ -435,7 +750,26 @@ export async function fetchZcodeCaptchaConfig(
     if (typeof region !== 'string' || typeof prefix !== 'string' || typeof sceneId !== 'string') {
       return undefined
     }
-    return { region, prefix, sceneId }
+    /**
+     * ★ 两个开关**只在真的是布尔时**才写进返回值 —— 与官方
+     * `getCaptchaConfig()` 的 `typeof r === 'boolean' ? { skipModelRequest: r } : {}`
+     * **逐字同口径**。
+     *
+     * ⚠ 不能写成 `enabled: captcha.enabled === true` 这类强制布尔化：
+     *   那会把「字段缺席（不知道）」压成 `false`，而 `requiresCaptchaUpfront`
+     *   靠**区分**二者来决定要不要在首发抖一个 param。
+     *   压平的方向恰好是危险侧：`enabled: false` 会一票否决、
+     *   `skipModelRequest: false` 会让它每请求白烧一个设备级配额。
+     */
+    return {
+      region,
+      prefix,
+      sceneId,
+      ...typeof captcha.enabled === 'boolean' ? { enabled: captcha.enabled } : {},
+      ...typeof captcha.skip_model_request === 'boolean'
+        ? { skipModelRequest: captcha.skip_model_request }
+        : {},
+    }
   } catch {
     return undefined
   }

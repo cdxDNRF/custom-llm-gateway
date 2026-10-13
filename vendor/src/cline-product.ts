@@ -28,12 +28,14 @@
  * 详细取证见 `docs/superpowers/specs/2026-09-25-cline-provider-design.md` §2。
  */
 
+import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES } from './image-budget.js'
+
 /**
  * 兜底模型目录中的一个条目。
  *
  * ⚠️ **本表只是兜底**：真实免费集合由远端
  * `GET /api/v1/ai/cline/recommended-models` 的 `free` 数组下发，
- * 且**内嵌目录缺 `cline-free/gemini-3.8-flash`**（远端有）。
+ * 且**内嵌目录缺 `stealth/space-bunny-alpha` 与 `cline-free/*`**（远端才有）。
  * 故本表不足以覆盖免费集合 —— 见 `src/cline-models.ts` 的合并逻辑。
  */
 export interface ClineFallbackModel {
@@ -123,7 +125,16 @@ export interface ClineProduct {
    * 未配置时适配器用 `DEFAULT_IMAGE_PIXEL_BUDGET`。
    */
   imagePixelBudget?: number
-  /** 单张请求图片的编码字节目标（未配置用 1 MiB，见 `src/image-budget.ts`）。 */
+  /**
+   * 单张请求图片的编码字节目标。
+   *
+   * 取 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（**1 MiB**，见 `src/image-budget.ts`）。
+   *
+   * ⚠️ **必须显式赋值**：`requestImageTargetFor` 的默认参数是 2 MiB
+   * （为腾讯系的**图片 token 预算**准备），而 Cline 撞的是**请求体体积** ——
+   * 漏赋值会让生效值翻倍，与 `image-budget.ts` 记的余量自相矛盾。
+   * 同款缺陷与修法见 `qoder-product.ts` 的 `imageMaxBytes` 注释。
+   */
   imageMaxBytes?: number
   /** 模型列表不可用时的兜底目录。 */
   fallbackModels: readonly ClineFallbackModel[]
@@ -140,12 +151,29 @@ export interface ClineProduct {
  * （实测 `Select-String 'cline-free/'` 零命中）—— 免费模型**只**由
  * `recommended-models` 下发。这是「只调 `/models` 会看不到任何免费模型」的原因。
  *
- * ⚠️ 内嵌目录**缺 `cline-free/gemini-3.8-flash`**（远端 `free` 有），
- * 故这里把它补进兜底表；否则离线时用户看不到截图里的那个模型。
+ * ⚠️ 内嵌目录（`cline-models.ts` 的 `BUILTIN_MODEL_CATALOG`）**缺
+ * `stealth/space-bunny-alpha` 与 `cline-free/*`**，它们只由 `recommended-models`
+ * 的 `free` 数组下发；故本兜底表把它们补上，否则离线 / 远端失败时用户看不到免费模型。
+ * ⚠️ **别把「内嵌目录」与「本兜底表」当成同一个东西**（早先的注释正是这么写的，
+ * 「内嵌目录缺 `cline-free/*`」紧跟着下面这张**含有 2 条 `cline-free/*`** 的表，
+ * 读起来自相矛盾）。内嵌目录缺的、由本表补的 —— 说的是**来源**，不是本表的内容。
+ *
+ * ⚠️ **这条表要与远端 `free` 数组同步** —— 它是**编译期快照**，上游撤掉某个
+ * 免费模型时它不会自己跟着变，而陈旧条目会让用户看到一个标着「免费」的模型、
+ * 选中却回 `404 {"error":"model not found"}`。已经发生过两次：
+ * - `gemini-3.8-flash`（2026-10-03 复测发现）；
+ * - `deepseek-v4.1-flash`（2026-10-05 复测发现，`free` 数组由 4 条降到 **3 条**）。
+ *
+ * **别照抄旧版本的表把它们加回来**（旧版本里 `gemini-3.8-flash` 带着
+ * `maxTokens: 65_536` 那条实测值，那是为解决当时的 400 而填的，见
+ * AGENTS.md「Gemini 系模型的两个 400」）。
+ *
+ * ⚠️ 与 `mergeClineModels` 的分工：本表**只在远端不可用时**整表兜底；远端可用时
+ * 那条路径会丢弃「远端已不认识」的条目（见 `cline-models.ts` 第 2 步注释），
+ * 故本表万一再次落后，也不会在在线状态下把下架模型复活。
  */
 const CLINE_FALLBACK_MODELS: readonly ClineFallbackModel[] = [
-  // ── 免费模型（远端 `free` 数组实测 2026-09-25，共 5 个）──
-  // 这 5 个正是用户截图里的清单。
+  // ── 免费模型（远端 `free` 数组实测，2026-10-05 复测：共 3 个）──
   {
     id: 'stealth/space-bunny-alpha',
     name: 'Space Bunny Alpha',
@@ -163,32 +191,6 @@ const CLINE_FALLBACK_MODELS: readonly ClineFallbackModel[] = [
     supportsImage: true,
     isFree: true,
     description: 'Mixture-of-Experts architecture with 309B total parameters',
-  },
-  {
-    id: 'cline-free/deepseek-v4.1-flash',
-    name: 'DeepSeek V4.1 Flash',
-    contextWindow: 1_048_576,
-    maxTokens: 131_072,
-    supportsImage: true,
-    isFree: true,
-    description: 'Fast and efficient with 1M context window',
-  },
-  {
-    // ⚠️ 内嵌目录里**没有**这一条（只有远端 `free` 数组下发），元数据取自
-    // 远端 description + 同名 `google/gemini-3.8-flash` 的目录实测值。
-    //
-    // ⚠️ **输出上限是 65536，不要照抄其它免费模型的 131072**（真实缺陷，
-    // 用户报障 2026-09-25）：给该模型发 `max_tokens=131072` 会被上游的
-    // vertex provider 以 400 拒绝 —— "has a maxOutputTokens value of 131072
-    // but the supported range is from 1 (inclusive) to 65537 (exclusive)"，
-    // 即上限就是 65536，与内嵌目录一致。
-    id: 'cline-free/gemini-3.8-flash',
-    name: 'Gemini 3.8 Flash',
-    contextWindow: 1_048_576,
-    maxTokens: 65_536,
-    supportsImage: true,
-    isFree: true,
-    description: "Google's most intelligent Flash model",
   },
   {
     id: 'cline-free/muse-spark-1.3-contributor',
@@ -274,6 +276,11 @@ export const CLINE: ClineProduct = {
   },
   tokenPrefix: 'workos:',
   defaultCredentialRef: 'CLINE_ACCESS_TOKEN',
+  // ⚠️ **必须显式赋值**：适配器把 `undefined` 一路传给 `requestImageTargetFor`，
+  // 而那个默认参数是 **2 MiB**（为腾讯系的图片 token 预算准备的）——
+  // Cline 撞的是**请求体体积**，2 MiB 会让生效值翻倍。详见接口里
+  // `imageMaxBytes` 的注释与 `qoder-product.ts` 的同款说明。
+  imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
   fallbackModels: CLINE_FALLBACK_MODELS,
 }
 

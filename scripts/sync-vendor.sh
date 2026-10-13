@@ -91,6 +91,30 @@ if [ -f "$LOOMY_PRODUCT" ]; then
   echo "   ✓ loomy-product.ts 密钥字段已确认为空（真值走本地 loomy.env 注入）"
 fi
 
+# ④c Google OAuth 凭据清洗（安全要求，勿删）：
+# 上游 gemini-oauth.ts 硬编码了 Google OAuth 的 client id/secret（虽然是开源
+# CLI 自带的公开值），会被 **GitHub Push Protection 判定为泄露并拒绝整个推送**
+# （GH013 / Google OAuth Client ID + Client Secret）。同步会原样带回来，
+# 故这里强制清空这两个字面量 —— 真值由环境变量注入
+# （`CMDC_PAK_GOOGLE_CLIENT_ID` / `CMDC_PAK_GOOGLE_CLIENT_SECRET`，
+#  覆盖逻辑在 resolveClientId / resolveClientSecret，无需改代码）。
+# ⚠️ 本脚本会被提交进仓库，因此**不得**包含真实凭据字面量，只能模式匹配。
+GEMINI_OAUTH="$HERE/vendor/src/gemini-oauth.ts"
+if [ -f "$GEMINI_OAUTH" ]; then
+  # 清空单行赋值的字面量；保留类型/结构，注释另行保留。
+  sed -i -E "s/(GEMINI_DEFAULT_CLIENT_ID *= *)'[^']*'/\1''/" "$GEMINI_OAUTH"
+  sed -i -E "s/(GEMINI_DEFAULT_CLIENT_SECRET *= *)'[^']*'/\1''/" "$GEMINI_OAUTH"
+  # 上游也可能把值折到下一行（形如 `= \n  'xxx'`），一并处理。
+  sed -i -E "/^export const GEMINI_DEFAULT_CLIENT_(ID|SECRET) =$/{n;s/^  '[^']*'$/  ''/;}" "$GEMINI_OAUTH"
+  if grep -qE "GEMINI_DEFAULT_CLIENT_(ID|SECRET) *= *$" "$GEMINI_OAUTH" \
+     && grep -qE "GOCSPX-|apps\.googleusercontent\.com" "$GEMINI_OAUTH"; then
+    echo "   ✗ gemini-oauth.ts 仍含 Google OAuth 凭据字面量，" >&2
+    echo "     上游格式可能已变化。请手工清空后再提交（否则 GitHub 会拒绝推送）。" >&2
+    exit 1
+  fi
+  echo "   ✓ gemini-oauth.ts 的 Google OAuth 凭据已确认为空（真值走环境变量注入）"
+fi
+
 echo "⑤ 类型检查（自有代码）…"
 if [ ! -x ./node_modules/.bin/tsc ]; then
   echo "   跳过（未装 typescript）"
