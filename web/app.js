@@ -500,13 +500,63 @@ function renderBalance(balance) {
   `
 }
 
+/**
+ * 弹一个「填文本」对话框（返回 null 表示用户取消）。
+ *
+ * ⚠️ 用自建 DOM 而不是原生 `prompt()`：原生 prompt 在部分浏览器/内嵌 WebView 里
+ * 被禁用或样式不可控，且无法展示 hint 的换行说明。
+ */
+function promptForValue(provider, input) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-overlay'
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <h3>${escapeHtml(provider.displayName)} · 添加账号</h3>
+        <input class="modal-input" type="text" autocomplete="off" spellcheck="false"
+               placeholder="${escapeHtml(input.placeholder || '粘贴凭据')}">
+        ${input.hint ? `<p class="modal-hint">${escapeHtml(input.hint)}</p>` : ''}
+        <div class="modal-actions">
+          <button class="btn btn-sm" data-role="cancel">取消</button>
+          <button class="btn btn-sm btn-primary" data-role="ok">确定</button>
+        </div>
+      </div>`
+    document.body.appendChild(overlay)
+    const field = overlay.querySelector('.modal-input')
+    const done = (value) => { overlay.remove(); resolve(value) }
+    overlay.querySelector('[data-role="ok"]').addEventListener('click', () => done(field.value))
+    overlay.querySelector('[data-role="cancel"]').addEventListener('click', () => done(null))
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null) })
+    overlay.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') done(field.value)
+      if (e.key === 'Escape') done(null)
+    })
+    field.focus()
+  })
+}
+
 async function startLogin(provider) {
   const popup = window.open('', '_blank')
   try {
-    const { loginUrl, accountId } = await api(`/api/p/${provider.id}/login`, {
+    const { loginUrl, accountId, input } = await api(`/api/p/${provider.id}/login`, {
       method: 'POST',
       body: JSON.stringify({}),
     })
+    // 「填文本」型登录（如 OpenCode API Key）：不开窗口，弹输入框。
+    // ⚠️ 必须先关掉为 OAuth 预开的空白窗口，否则会留一个空白标签页。
+    if (input !== undefined && input !== null) {
+      if (popup) popup.close()
+      const value = await promptForValue(provider, input)
+      if (value === null) return
+      const r = await api(`/api/p/${provider.id}/login/submit`, {
+        method: 'POST',
+        body: JSON.stringify({ value }),
+      })
+      if (r.ok === false) { toast(r.error || '提交失败', 'err'); await load(); return }
+      toast('账号已添加', 'ok')
+      await load()
+      return
+    }
     if (popup) popup.location.href = loginUrl
     else window.open(loginUrl, '_blank')
     toast('已打开授权页面，请在浏览器中完成登录…', 'ok')
@@ -807,48 +857,327 @@ $('#set-token').addEventListener('click', async () => {
 //
 // 只展示元数据（模型/token/耗时），不含对话内容。数据源是网关侧的
 // usage.jsonl（见 src/core/usage.ts），本面板只读不写。
-async function loadUsage() {
+/**
+ * 数据页的当前时间范围（天）。0 = 全部。默认近 30 天（与按钮初始态一致）。
+ */
+let usageRangeDays = 30
+
+/** 当前拉到的最近一次报表（切范围时复用，避免重复请求）。 */
+let usageData = null
+
+/**
+ * 取某条记录是否落在当前范围内。
+ *
+ * ⚠️ 用**本地日**（UTC+8）比较，与 usage.ts 的 `dayKey` 同口径 ——
+ * 否则"今日"会把晚上 8 点后的调用算到昨天。
+ */
+function withinRange(at, days, nowMs = Date.now()) {
+  if (days <= 0) return true
+  const day = 86400000
+  const todayStart = Math.floor((nowMs + 8 * 3600000) / day) * day - 8 * 3600000
+  return at >= todayStart - (days - 1) * day
+}
+
+/** 按 UTC+8 取 `YYYY-MM-DD`（与后端 dayKey 一致）。 */
+function dayKeyOf(at) {
+  const d = new Date(at + 8 * 3600000)
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+}
+
+/**
+ * 渲染活动方块热力图（Claude Code / GitHub 风格）。
+ *
+ * 布局：按**周为列、星期为行**（GitHub 的读法），最多显示 `maxWeeks` 周。
+ * 用纯 CSS grid + div，不用 canvas —— 便于 hover 提示与无障碍。
+ */
+function renderHeatmap(buckets, days) {
+  const box = $('#heatmap')
+  const note = $('#heat-note')
+  if (box === null) return
+  if (buckets.length === 0) {
+    box.innerHTML = '<div class="empty">该范围内暂无调用</div>'
+    if (note) note.textContent = ''
+    return
+  }
+
+  const day = 86400000
+  const now = Date.now()
+  // 以「今天」为最后一列的最后一天（UTC+8）。
+  const todayStart = Math.floor((now + 8 * 3600000) / day) * day - 8 * 3600000
+  const span = days > 0 ? days : Math.max(7, Math.ceil((now - Math.min(...buckets.map(b => Date.parse(b.key)))) / day))
+  // ⚠️ 列数用 `ceil(span / 7)`（**不 +1**）：+1 会多画一整周的空格子
+  //    （真实缺陷：30 天范围显示成 6 列 42 格，末列整列无数据）。
+  //    对齐到整周是为了让「同一列 = 同一星期几」，与 GitHub 的读法一致。
+  const maxWeeks = Math.min(53, Math.max(1, Math.ceil(span / 7)))
+  const totalDays = maxWeeks * 7
+
+  // 日期 → 调用数
+  const byDay = new Map(buckets.map(b => [b.key, b.calls]))
+  const max = Math.max(1, ...buckets.map(b => b.calls))
+
+  // 分级：0 / ≤25% / ≤50% / ≤75% / 更高 —— 与图例的 5 档对应。
+  const level = (n) => n === 0 ? 0 : n <= max * 0.25 ? 1 : n <= max * 0.5 ? 2 : n <= max * 0.75 ? 3 : 4
+
+  // 生成 totalDays 个格子，末格 = 今天；每 7 个一列。
+  const cells = []
+  for (let i = totalDays - 1; i >= 0; i--) {
+    const at = todayStart - i * day
+    const key = dayKeyOf(at)
+    cells.push({ key, calls: byDay.get(key) ?? 0 })
+  }
+  const cols = []
+  for (let i = 0; i < cells.length; i += 7) cols.push(cells.slice(i, i + 7))
+
+  const activeDays = buckets.length
+  const totalCalls = buckets.reduce((s, b) => s + b.calls, 0)
+  if (note) note.textContent = `${activeDays} 天有调用 · 共 ${totalCalls.toLocaleString('zh-CN')} 次`
+
+  box.innerHTML = `<div class="heat-weeks">${cols.map((col) => `
+    <div class="heat-col">${col.map((c) => `
+      <i class="heat-cell lv${level(c.calls)}" title="${c.key}：${c.calls} 次"></i>`).join('')}
+    </div>`).join('')}
+  </div>`
+}
+
+/**
+ * 柱状图（每日调用量）。手绘 SVG，不引第三方图表库（保证离线可用）。
+ */
+function renderBarChart(buckets, days) {
+  const box = $('#chart-bars')
+  const note = $('#bar-note')
+  if (box === null) return
+  if (buckets.length === 0) { box.innerHTML = '<div class="empty">暂无数据</div>'; if (note) note.textContent = ''; return }
+
+  // 按日期升序，且补全区间内的空日（否则柱子会被"跳过"的空日压缩，趋势失真）。
+  const day = 86400000
+  const now = Date.now()
+  const todayStart = Math.floor((now + 8 * 3600000) / day) * day - 8 * 3600000
+  const span = days > 0 ? days : Math.max(7, Math.ceil((now - Date.parse(buckets[0].key)) / day) + 1)
+  const byDay = new Map(buckets.map(b => [b.key, b]))
+  const series = []
+  for (let i = span - 1; i >= 0; i--) {
+    const key = dayKeyOf(todayStart - i * day)
+    const b = byDay.get(key)
+    series.push({ key, calls: b?.calls ?? 0, okCalls: b?.okCalls ?? 0, failures: b?.failures ?? 0 })
+  }
+
+  const W = 760, H = 190, padL = 34, padB = 22, padT = 8, padR = 6
+  const max = Math.max(1, ...series.map(s => s.calls))
+  const bw = Math.max(2, (W - padL - padR) / series.length - 2)
+
+  const bars = series.map((s, i) => {
+    const x = padL + i * ((W - padL - padR) / series.length)
+    const h = (s.calls / max) * (H - padT - padB)
+    const y = H - padB - h
+    // 失败次数用红色叠在柱子顶部，一眼看出"这天有多少失败"。
+    const fh = s.calls > 0 ? (s.failures / max) * (H - padT - padB) : 0
+    return `${fh > 0 ? `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${fh.toFixed(1)}" fill="#f4635b" rx="1.5"><title>${s.key} 失败 ${s.failures} 次</title></rect>` : ''}`
+      + `<rect class="bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0, h).toFixed(1)}" rx="2"><title>${s.key}：${s.calls} 次（失败 ${s.failures}）</title></rect>`
+  }).join('')
+
+  // Y 轴 3 条参考线
+  const grid = [0, 0.5, 1].map((r) => {
+    const y = H - padB - r * (H - padT - padB)
+    return `<line class="grid-line" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"/>`
+      + `<text class="axis-text" x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${Math.round(r * max)}</text>`
+  }).join('')
+
+  // X 轴：只标首/中/尾，避免挤成一团
+  const labelIdx = [0, Math.floor(series.length / 2), series.length - 1]
+  const xlabels = labelIdx.map((i) => {
+    const s = series[i]
+    if (s === undefined) return ''
+    const x = padL + i * ((W - padL - padR) / series.length) + bw / 2
+    return `<text class="axis-text" x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle">${s.key.slice(5)}</text>`
+  }).join('')
+
+  const total = series.reduce((s, x) => s + x.calls, 0)
+  if (note) note.textContent = `共 ${total.toLocaleString('zh-CN')} 次 · 峰值 ${max} 次/天`
+
+  box.innerHTML = `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="每日调用量柱状图">
+    <defs><linearGradient id="barGrad" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#4569c4"/><stop offset="100%" stop-color="#8fa6ff"/>
+    </linearGradient></defs>
+    ${grid}${bars}${xlabels}
+  </svg>`
+}
+
+/**
+ * 折线图（平均耗时趋势）。手绘 SVG。
+ */
+function renderLineChart(buckets, days) {
+  const box = $('#chart-line')
+  const note = $('#line-note')
+  if (box === null) return
+  if (buckets.length === 0) { box.innerHTML = '<div class="empty">暂无数据</div>'; if (note) note.textContent = ''; return }
+
+  const day = 86400000
+  const now = Date.now()
+  const todayStart = Math.floor((now + 8 * 3600000) / day) * day - 8 * 3600000
+  const span = days > 0 ? days : Math.max(7, Math.ceil((now - Date.parse(buckets[0].key)) / day) + 1)
+  const byDay = new Map(buckets.map(b => [b.key, b]))
+  const series = []
+  for (let i = span - 1; i >= 0; i--) {
+    const key = dayKeyOf(todayStart - i * day)
+    const b = byDay.get(key)
+    // ⚠️ 没调用的日子**不连线**（用 null 断开），否则会把"断档"画成一条
+    //    虚假的平滑下滑，读图的人会以为耗时真的在下降。
+    //    注意：`avgMs` 为 0 的合法值也要显示（极快的本地响应），
+    //    故判据用 `calls > 0` 而不是 `avgMs > 0`。
+    series.push({ key, avgMs: b !== undefined && b.calls > 0 ? b.avgMs : null })
+  }
+
+  const W = 760, H = 190, padL = 44, padB = 22, padT = 10, padR = 8
+  const vals = series.map(s => s.avgMs).filter(v => v !== null)
+  const max = Math.max(1000, ...vals)
+  const stepX = (W - padL - padR) / Math.max(1, series.length - 1)
+  const yOf = (v) => H - padB - (v / max) * (H - padT - padB)
+  const xOf = (i) => padL + i * stepX
+
+  // 分段（null 处断开）
+  const segs = []
+  let cur = []
+  series.forEach((s, i) => {
+    if (s.avgMs === null) { if (cur.length > 0) segs.push(cur); cur = [] }
+    else cur.push({ i, v: s.avgMs })
+  })
+  if (cur.length > 0) segs.push(cur)
+
+  const paths = segs.map((seg) => {
+    const d = seg.map((p, k) => `${k === 0 ? 'M' : 'L'}${xOf(p.i).toFixed(1)},${yOf(p.v).toFixed(1)}`).join(' ')
+    // 面积只在连续段 ≥2 点时画（单点没有面积语义）
+    const area = seg.length >= 2
+      ? `<path class="area-path" d="${d} L${xOf(seg[seg.length - 1].i).toFixed(1)},${H - padB} L${xOf(seg[0].i).toFixed(1)},${H - padB} Z"/>`
+      : ''
+    return area + `<path class="line-path" d="${d}"/>`
+  }).join('')
+
+  const dots = segs.flatMap(seg => seg.map(p =>
+    `<circle class="dot" cx="${xOf(p.i).toFixed(1)}" cy="${yOf(p.v).toFixed(1)}" r="3.2"><title>${series[p.i].key}：平均 ${(p.v / 1000).toFixed(2)}s</title></circle>`
+  )).join('')
+
+  const grid = [0, 0.5, 1].map((r) => {
+    const y = H - padB - r * (H - padT - padB)
+    return `<line class="grid-line" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"/>`
+      + `<text class="axis-text" x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${(r * max / 1000).toFixed(1)}s</text>`
+  }).join('')
+
+  const labelIdx = [0, Math.floor(series.length / 2), series.length - 1]
+  const xlabels = labelIdx.map((i) => {
+    const s = series[i]
+    if (s === undefined) return ''
+    return `<text class="axis-text" x="${xOf(i).toFixed(1)}" y="${H - 6}" text-anchor="middle">${s.key.slice(5)}</text>`
+  }).join('')
+
+  if (vals.length === 0) {
+    box.innerHTML = '<div class="empty">该范围内没有成功调用的耗时数据</div>'
+    if (note) note.textContent = ''
+    return
+  }
+  const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
+  if (note) note.textContent = `有数据 ${vals.length} 天 · 平均 ${(avg / 1000).toFixed(2)}s`
+
+  box.innerHTML = `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="平均耗时折线图">
+    <defs>
+      <linearGradient id="lineGrad" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#6b8afd"/><stop offset="100%" stop-color="#a06bfd"/>
+      </linearGradient>
+      <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#6b8afd33"/><stop offset="100%" stop-color="#6b8afd00"/>
+      </linearGradient>
+    </defs>
+    ${grid}${paths}${dots}${xlabels}
+  </svg>`
+}
+
+/** 把概览卡片 + 三张图表 + 三张表整体渲染出来。 */
+function renderUsage(data) {
   const box = $('#usage-summary')
   const tables = $('#usage-tables')
-  if (!box || !tables) return
-  try {
-    const data = await api('/api/usage?recent=30')
-    if (data.enabled === false) {
-      box.innerHTML = '<div class="empty">用量统计未启用</div>'
-      tables.innerHTML = ''
-      return
-    }
-    const t = data.total || {}
-    const fmtNum = (n) => (n ?? 0).toLocaleString('zh-CN')
-    const fmtDur = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms ?? 0}ms`)
-    const failRate = t.calls > 0 ? ((t.failures / t.calls) * 100).toFixed(1) : '0.0'
+  if (box === null || tables === null) return
 
-    box.innerHTML = `
-      <div class="usage-card">
-        <div class="usage-num">${fmtNum(t.calls)}</div>
-        <div class="usage-label">调用次数</div>
-      </div>
-      <div class="usage-card">
-        <div class="usage-num">${fmtNum((t.inputTokens ?? 0) + (t.outputTokens ?? 0))}</div>
-        <div class="usage-label">总 token（入 ${fmtNum(t.inputTokens)} / 出 ${fmtNum(t.outputTokens)}）</div>
-      </div>
-      <div class="usage-card">
-        <div class="usage-num">${fmtDur(t.avgMs)}</div>
-        <div class="usage-label">平均耗时</div>
-      </div>
-      <div class="usage-card${(t.failures ?? 0) > 0 ? ' usage-card-warn' : ''}">
-        <div class="usage-num">${fmtNum(t.failures)} <span class="usage-sub">(${failRate}%)</span></div>
-        <div class="usage-label">失败次数</div>
-      </div>
-      <div class="usage-card">
-        <div class="usage-num">${fmtNum(data.size ?? 0)}</div>
-        <div class="usage-label">累计记录（本页显示 ${fmtNum(data.sampled ?? 0)} 条）</div>
-      </div>`
+  const all = data.byDay ?? []
+  const days = usageRangeDays
+  // 范围过滤在**客户端**做：后端一次给全量（最多 5000 条内存索引），
+  // 切「今日/7 天/30 天/全部」无需重新请求，切换无延迟。
+  const inRange = all.filter((b) => withinRange(Date.parse(b.key) + 12 * 3600000, days))
 
-    // 表格：按天 / 按供应商 / 按模型
-    const table = (title, rows, keyLabel) => {
-      if (!rows || rows.length === 0) return `<div class="usage-block"><h4>${title}</h4><div class="empty">暂无数据</div></div>`
-      const body = rows.slice(0, 15).map((r) => `
+  const calls = inRange.reduce((s, b) => s + b.calls, 0)
+  const okCalls = inRange.reduce((s, b) => s + (b.okCalls ?? 0), 0)
+  const failures = inRange.reduce((s, b) => s + (b.failures ?? 0), 0)
+  const inputTokens = inRange.reduce((s, b) => s + (b.inputTokens ?? 0), 0)
+  const outputTokens = inRange.reduce((s, b) => s + (b.outputTokens ?? 0), 0)
+  // 均耗时按**调用数加权**（不能对日均值再取平均 —— 那会让低流量日的均值权重过大）。
+  const totalMs = inRange.reduce((s, b) => s + (b.avgMs ?? 0) * b.calls, 0)
+  const avgMs = calls > 0 ? Math.round(totalMs / calls) : 0
+
+  const fmtNum = (n) => (n ?? 0).toLocaleString('zh-CN')
+  const fmtDur = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms ?? 0}ms`)
+  const failRate = calls > 0 ? ((failures / calls) * 100).toFixed(1) : '0.0'
+  const scope = days <= 0 ? '全部时间' : days === 1 ? '今日' : `近 ${days} 天`
+
+  box.innerHTML = `
+    <div class="usage-card">
+      <div class="usage-num">${fmtNum(calls)}</div>
+      <div class="usage-label">${scope}调用次数</div>
+    </div>
+    <div class="usage-card">
+      <div class="usage-num">${fmtNum(inputTokens + outputTokens)}</div>
+      <div class="usage-label">总 token（入 ${fmtNum(inputTokens)} / 出 ${fmtNum(outputTokens)}）</div>
+    </div>
+    <div class="usage-card">
+      <div class="usage-num">${fmtDur(avgMs)}</div>
+      <div class="usage-label">平均耗时（按调用数加权）</div>
+    </div>
+    <div class="usage-card${failures > 0 ? ' usage-card-warn' : ''}">
+      <div class="usage-num">${fmtNum(failures)} <span class="usage-sub">(${failRate}%)</span></div>
+      <div class="usage-label">失败次数（成功 ${fmtNum(okCalls)}）</div>
+    </div>
+    <div class="usage-card">
+      <div class="usage-num">${fmtNum(data.size ?? 0)}</div>
+      <div class="usage-label">累计记录（本次统计 ${fmtNum(data.sampled ?? 0)} 条）</div>
+    </div>`
+
+  renderHeatmap(inRange, days)
+  renderBarChart(inRange, days)
+  renderLineChart(inRange, days)
+
+  // 表格：供应商 / 模型（按范围重算，与卡片同口径）
+  //
+  // ⚠️ 后端的 byProvider/byModel 是**全量**口径（无时间维度），范围过滤只覆盖
+  //    byDay。故这里在范围内时用 `recent` 记录重算，保证与卡片一致；全量范围
+  //    则直接用后端的聚合结果（更准，`recent` 只有最近 50 条）。
+  const rowsSource = days <= 0
+    ? {
+        byProvider: data.byProvider ?? [],
+        byModel: data.byModel ?? [],
+      }
+    : (() => {
+        const recent = (data.recent ?? []).filter((r) => withinRange(r.at, days))
+        const agg = (keyOf) => {
+          const m = new Map()
+          for (const r of recent) {
+            const k = keyOf(r)
+            const cur = m.get(k) ?? { key: k, calls: 0, okCalls: 0, failures: 0, inputTokens: 0, outputTokens: 0, _ms: 0 }
+            cur.calls++
+            if (r.ok) cur.okCalls++; else cur.failures++
+            cur.inputTokens += r.inputTokens ?? 0
+            cur.outputTokens += r.outputTokens ?? 0
+            cur._ms += r.ms ?? 0
+            m.set(k, cur)
+          }
+          return [...m.values()].map((v) => ({ ...v, avgMs: v.calls > 0 ? Math.round(v._ms / v.calls) : 0 }))
+            .sort((a, b) => b.calls - a.calls)
+        }
+        return {
+          byProvider: agg((r) => r.provider),
+          byModel: agg((r) => `${r.provider}/${r.model}`),
+        }
+      })()
+
+  const table = (title, rows, keyLabel) => {
+    if (rows.length === 0) return `<div class="usage-block"><h4>${title}</h4><div class="empty">暂无数据</div></div>`
+    const body = rows.slice(0, 15).map((r) => `
         <tr>
           <td class="usage-key">${escapeHtml(r.key)}</td>
           <td>${(r.calls ?? 0).toLocaleString('zh-CN')}</td>
@@ -856,26 +1185,53 @@ async function loadUsage() {
           <td>${r.avgMs >= 1000 ? (r.avgMs / 1000).toFixed(1) + 's' : r.avgMs + 'ms'}</td>
           <td class="${r.failures > 0 ? 'usage-fail' : ''}">${r.failures ?? 0}</td>
         </tr>`).join('')
-      return `
-        <div class="usage-block">
-          <h4>${title}</h4>
-          <table class="usage-table">
-            <thead><tr><th>${keyLabel}</th><th>次数</th><th>token</th><th>均耗时</th><th>失败</th></tr></thead>
-            <tbody>${body}</tbody>
-          </table>
-        </div>`
+    return `
+      <div class="usage-block">
+        <h4>${title}</h4>
+        <table class="usage-table">
+          <thead><tr><th>${keyLabel}</th><th>次数</th><th>token</th><th>均耗时</th><th>失败</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>`
+  }
+
+  tables.innerHTML =
+    table('按供应商', rowsSource.byProvider, '供应商') +
+    table('按模型', rowsSource.byModel, '模型')
+
+  const stamp = $('#usage-updated')
+  if (stamp) stamp.textContent = `更新于 ${new Date().toLocaleTimeString()}`
+}
+
+async function loadUsage() {
+  const box = $('#usage-summary')
+  const tables = $('#usage-tables')
+  if (box === null || tables === null) return
+  try {
+    // `recent=200`：范围过滤时要用它重算供应商/模型维度（后端聚合无时间维度）。
+    const data = await api('/api/usage?recent=200')
+    if (data.enabled === false) {
+      box.innerHTML = '<div class="empty">用量统计未启用</div>'
+      tables.innerHTML = ''
+      return
     }
-
-    tables.innerHTML =
-      table('按天', data.byDay, '日期') +
-      table('按供应商', data.byProvider, '供应商') +
-      table('按模型', data.byModel, '模型')
-
-    const stamp = $('#usage-updated')
-    if (stamp) stamp.textContent = `更新于 ${new Date().toLocaleTimeString()}`
+    usageData = data
+    renderUsage(data)
   } catch {
     box.innerHTML = '<div class="empty">读取用量失败</div>'
   }
+}
+
+// 时间范围按钮
+for (const btn of document.querySelectorAll('.range')) {
+  btn.addEventListener('click', () => {
+    usageRangeDays = Number(btn.dataset.range) || 0
+    for (const other of document.querySelectorAll('.range')) {
+      other.classList.toggle('is-active', other === btn)
+    }
+    if (usageData !== null) renderUsage(usageData)
+    else void loadUsage()
+  })
 }
 
 $('#usage-refresh')?.addEventListener('click', () => { void loadUsage() })
@@ -890,9 +1246,43 @@ $('#usage-clear')?.addEventListener('click', async () => {
   }
 })
 
+// ── 分页切换 ──
+//
+// 三页：供应商 / 网关 / 数据。用 `hidden` 属性切换（CSS 里已确保 [hidden] 生效）。
+// 选择记在 localStorage，刷新后停在原页；URL hash 也同步，便于分享直链。
+function showPage(name) {
+  const target = ['providers', 'gateway', 'data'].includes(name) ? name : 'providers'
+  for (const section of document.querySelectorAll('.page')) {
+    section.hidden = section.dataset.page !== target
+  }
+  for (const tab of document.querySelectorAll('.tab')) {
+    tab.setAttribute('aria-selected', String(tab.dataset.page === target))
+  }
+  try { localStorage.setItem('dsh-gateway-page', target) } catch { /* 隐私模式忽略 */ }
+  if (location.hash.slice(1) !== target) location.hash = target
+  // 切到数据页时刷新一次（否则可能显示的是很久前的数据）。
+  if (target === 'data') void loadUsage()
+}
+
+for (const tab of document.querySelectorAll('.tab')) {
+  tab.addEventListener('click', () => showPage(tab.dataset.page))
+}
+window.addEventListener('hashchange', () => {
+  const want = location.hash.slice(1)
+  if (want.length > 0) showPage(want)
+})
+
+let initialPage = 'providers'
+try { initialPage = location.hash.slice(1) || localStorage.getItem('dsh-gateway-page') || 'providers' } catch { /* 忽略 */ }
+showPage(initialPage)
+
 load()
 loadLogs()
 loadUsage()
 setInterval(loadLogs, 4000)
 setInterval(load, 20000)
-setInterval(loadUsage, 30000)
+setInterval(() => {
+  // 只在数据页可见时轮询，避免后台页白刷（也省 CPU）。
+  const dataPage = document.querySelector('.page[data-page="data"]')
+  if (dataPage !== null && dataPage.hidden === false) void loadUsage()
+}, 30000)

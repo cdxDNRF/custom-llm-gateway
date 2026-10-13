@@ -43,12 +43,32 @@ export interface AccountView {
 
 /** 一次登录尝试。 */
 export interface LoginStart {
-  /** 待用户打开的授权 URL。 */
+  /** 待用户打开的授权 URL。**空串**表示无需跳转（见 `input`）。 */
   loginUrl: string
   /** 账号 id（占位，授权完成后填充凭据）。 */
   accountId: string
   /** 授权完成后 resolve。 */
   completed: Promise<{ ok: boolean; error?: string }>
+  /**
+   * 「需要用户填一串文本」型登录（如 OpenCode 的 API Key）。
+   *
+   * 有该字段时前端**不开新窗口**，而是弹输入框，把值 POST 到
+   * `/api/p/<id>/login/submit` 的 `submitLogin`。
+   * 适用于上游不给授权页、只发 Key 的场景 —— 用「打开 URL」的形态会得到
+   * 一个空白页，用户无从下手。
+   */
+  input?: {
+    /** 输入框提示语（如「粘贴 OpenCode API Key（sk- 开头）」）。 */
+    placeholder: string
+    /** 说明文字（可选，展示在输入框下方）。 */
+    hint?: string
+  }
+}
+
+/** 「填文本」型登录的提交回调。 */
+export interface LoginSubmit {
+  /** 用户填写的值（已 trim）。 */
+  value: string
 }
 
 /** 积分/余额读数。 */
@@ -98,6 +118,14 @@ export interface Provider {
 
   /** 启动一次登录，立即返回授权 URL（两步式，避免弹窗被拦截）。 */
   startLogin(nickname?: string): Promise<LoginStart>
+
+  /**
+   * 提交「填文本」型登录（`LoginStart.input` 存在时）。
+   *
+   * 未支持的 provider 不实现该方法 —— 调用方应只在 `input` 存在时调用。
+   * 返回成功与否；失败时 `error` 给出可直接展示给用户的原因。
+   */
+  submitLogin?(input: LoginSubmit): Promise<{ ok: boolean; error?: string }>
 
   /** 删除账号。 */
   removeAccount(accountId: string): Promise<void>

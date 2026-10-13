@@ -555,7 +555,32 @@ export class OverviewServer {
       const started = await provider.startLogin(nickname)
       // ⚠️ 立即返回 URL（两步式）：后台继续等授权回调。
       // 前端拿到后会 window.open，然后再轮询 /accounts 看结果。
-      sendJson(response, 200, { loginUrl: started.loginUrl, accountId: started.accountId })
+      // ⚠️ `input` 必须一并透传：有它时前端弹输入框（而非开窗口），
+      //    漏传会让「填 Key」型登录退化成打开一个空 URL（真实缺陷）。
+      sendJson(response, 200, {
+        loginUrl: started.loginUrl,
+        accountId: started.accountId,
+        ...(started.input !== undefined ? { input: started.input } : {}),
+      })
+      return
+    }
+
+    // ── 提交「填文本」型登录（OpenCode API Key 等）──
+    if (action === 'login/submit' && request.method === 'POST') {
+      let parsed: { value?: unknown } = {}
+      try {
+        parsed = JSON.parse(await readBody(request)) as { value?: unknown }
+      } catch {
+        sendJson(response, 400, { error: '请求体不是合法 JSON' })
+        return
+      }
+      const value = typeof parsed.value === 'string' ? parsed.value : ''
+      if (provider.submitLogin === undefined) {
+        sendJson(response, 400, { error: `${provider.displayName} 不支持填写式登录` })
+        return
+      }
+      const result = await provider.submitLogin({ value })
+      sendJson(response, result.ok ? 200 : 400, result)
       return
     }
 

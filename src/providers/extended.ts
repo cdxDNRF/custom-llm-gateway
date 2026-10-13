@@ -19,6 +19,7 @@ import type {
   BalanceView,
   CheckinResult,
   LoginStart,
+  LoginSubmit,
   Provider,
   ProviderCapabilities,
 } from '../core/provider.js'
@@ -132,6 +133,7 @@ class GenericImpl extends GenericProviderBase implements Provider {
   readonly pool: AccountPool
   readonly gateway: GatewayContext
   readonly loginImpl: (nickname?: string) => Promise<LoginStart>
+  readonly submitLoginImpl: ((input: LoginSubmit) => Promise<{ ok: boolean; error?: string }>) | undefined
 
   constructor(init: {
     id: string
@@ -141,6 +143,8 @@ class GenericImpl extends GenericProviderBase implements Provider {
     pool: AccountPool
     gateway: GatewayContext
     loginImpl: (nickname?: string) => Promise<LoginStart>
+    /** 「填文本」型登录的提交回调（见 LoginStart.input）。 */
+    submitLoginImpl?: (input: LoginSubmit) => Promise<{ ok: boolean; error?: string }>
     refreshAll: () => Promise<void>
     queryBalance?: () => Promise<BalanceView | undefined>
     checkin?: () => Promise<CheckinResult>
@@ -154,10 +158,18 @@ class GenericImpl extends GenericProviderBase implements Provider {
     this.pool = init.pool
     this.gateway = init.gateway
     this.loginImpl = init.loginImpl
+    this.submitLoginImpl = init.submitLoginImpl
   }
 
   async startLogin(nickname?: string): Promise<LoginStart> {
     return this.loginImpl(nickname)
+  }
+
+  async submitLogin(input: LoginSubmit): Promise<{ ok: boolean; error?: string }> {
+    if (this.submitLoginImpl === undefined) {
+      return { ok: false, error: `${this.displayName} 不支持填写式登录` }
+    }
+    return this.submitLoginImpl(input)
   }
 
   async refreshAll(): Promise<void> {
@@ -883,25 +895,51 @@ export async function createOpencodeProvider(
     },
     adapter, pool, gateway,
     loginImpl: async () => {
-      // ⚠️ 匿名通道：无授权页。建一条 `api_key: 'public'` 的账号即完成「登录」。
-      //    用 `ensureDefaultAnonymousSlot` 而不是自己拼 id/ref，保证与插件侧
-      //    同款命名与判据（它幂等，已有匿名槽时返回空串）。
-      const created = await ensureDefaultAnonymousSlot(
-        async (entry) => { await pool.addAccount(entry) },
-        async (refName, value) => { gateway.credentials.set(refName, value) },
-        () => pool.listAccounts('opencode').then((a) => a.map((x) => ({ id: x.id }))) as never,
-        () => false,
-      )
-      if (created.length === 0) {
-        throw new Error('无法创建匿名通道（可能已存在或写入失败）')
-      }
-      gateway.logger.info(`已创建 OpenCode 匿名通道 ${created}（免费模型可用；收费模型需真实 API Key）`)
-      // 无跳转：直接返回「已完成」，前端会提示成功而不是等用户去点链接。
+      // ⚠️ opencode 的主用法是**填 API Key**（上游不给授权页），故这里返回
+      //    `input` 让前端弹输入框；真正的建号在 `submitLoginImpl` 里做。
+      //
+      //    匿名通道（`api_key: 'public'`）仍保留为一条**快捷路径**，但注意：
+      //    上游已封禁匿名免费推理（实测 403 FreeTierError），故不再作为主入口，
+      //    仅通过 `submitLoginImpl` 接受空值时的显式分支创建。
       return {
         loginUrl: '',
-        accountId: created,
+        accountId: '',
         completed: Promise.resolve({ ok: true }),
+        input: {
+          placeholder: '粘贴 OpenCode API Key（sk- 开头）',
+          hint: '在 opencode.ai 的 workspace 里生成。留空则创建匿名通道（仅目录可用，上游已封禁其推理）。',
+        },
       }
+    },
+
+    /**
+     * 收到用户填的 Key → 建号并写凭据。
+     *
+     * 空值 = 显式要匿名通道（保留该路径，但界面上已说明它调不通）。
+     */
+    submitLoginImpl: async ({ value }) => {
+      const key = value.trim()
+      const anonymous = key.length === 0
+      if (!anonymous && !key.startsWith('sk-')) {
+        return { ok: false, error: 'OpenCode 的 Key 应以 sk- 开头，请检查是否复制完整' }
+      }
+      const id = `opencode-${anonymous ? 'anon' : 'key'}-${shortId()}`
+      const refName = `OPENCODE_${anonymous ? 'ANON' : 'KEY'}_${shortId().toUpperCase()}`
+      await pool.addAccount({
+        id, provider: 'opencode',
+        nickname: anonymous ? '匿名通道' : `Key ...${key.slice(-6)}`,
+        enabled: true,
+        credentialRef: refName,
+        // 匿名通道没有可续期凭据（标 true 是不实承诺）；API Key 也无续期端点。
+        refreshable: false,
+        createdAt: Date.now(),
+      })
+      await gateway.credentials.set(refName, JSON.stringify({
+        api_key: anonymous ? OPENCODE.anonymousKey : key,
+        nickname: anonymous ? '匿名通道' : 'API Key',
+      }))
+      gateway.logger.info(`账号 ${id} 已创建（${anonymous ? '匿名通道' : 'API Key'}）`)
+      return { ok: true }
     },
     refreshAll: async () => {
       // 匿名通道无可续期凭据；真实 API Key 亦无续期端点。空实现。

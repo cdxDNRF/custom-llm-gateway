@@ -3,68 +3,124 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>dsh-llm-gateway · 多供应商 LLM 网关</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">
-    <span class="dot"></span>
-    <h1>dsh-llm-gateway</h1>
-    <span class="sub">本地多供应商 LLM 网关</span>
+    <span class="logo" aria-hidden="true"></span>
+    <div class="brand-text">
+      <h1>dsh-llm-gateway</h1>
+      <span class="sub">本地多供应商 LLM 网关</span>
+    </div>
   </div>
+
+  <nav class="tabs" role="tablist" aria-label="主导航">
+    <button class="tab" role="tab" data-page="providers" aria-selected="true">供应商</button>
+    <button class="tab" role="tab" data-page="gateway" aria-selected="false">网关</button>
+    <button class="tab" role="tab" data-page="data" aria-selected="false">数据</button>
+  </nav>
+
   <div class="topbar-actions">
     <span id="conn" class="pill pill-muted">连接中…</span>
-    <button id="set-token" class="btn" title="设置/清除访问令牌（局域网访问需要；本机 127.0.0.1 访问可留空）">🔑 令牌</button>
-    <button id="checkin-all" class="btn" title="对所有支持签到的供应商各签一次（今天已领的会跳过）">✓ 一键签到</button>
-    <button id="refresh-models-all" class="btn" title="从上游重新拉取所有供应商的模型目录">↻ 重拉模型目录</button>
-    <button id="refresh-all" class="btn" title="对所有账号执行一次静默续期">续期全部账号</button>
+    <button id="set-token" class="btn btn-icon" title="设置/清除访问令牌（局域网访问需要；本机 127.0.0.1 可留空）">令牌</button>
+    <button id="checkin-all" class="btn btn-icon" title="对所有支持签到的供应商各签一次（今天已领的会跳过）">一键签到</button>
+    <button id="refresh-models-all" class="btn btn-icon" title="从上游重新拉取所有供应商的模型目录">重拉模型</button>
+    <button id="refresh-all" class="btn btn-icon" title="对所有账号执行一次静默续期">续期全部</button>
   </div>
 </header>
 
 <main>
-  <section class="panel">
-    <div class="panel-head">
+  <!-- ─────────────── 第 1 页：供应商 ─────────────── -->
+  <section class="page" data-page="providers">
+    <div class="page-head">
       <h2>供应商</h2>
-      <p class="hint">每个供应商独立监听一个端口，可直接接入任意 OpenAI 兼容客户端；也可用聚合端点一次接入全部。</p>
+      <p class="hint">
+        每个供应商独立监听一个端口，可直接接入任意 OpenAI 兼容客户端；也可用「网关」页的聚合端点一次接入全部。
+      </p>
     </div>
     <div id="providers" class="grid"></div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>接入方式 <span id="lan-updated"></span></h2>
+  <!-- ─────────────── 第 2 页：网关 ─────────────── -->
+  <section class="page" data-page="gateway" hidden>
+    <div class="page-head">
+      <h2>接入方式 <span id="lan-updated" class="stamp"></span></h2>
       <p class="hint">
         支持 <b>OpenAI</b> 与 <b>Anthropic</b> 两种协议（同一组地址、不同路径）。
-        手机 / 平板 / 酒馆请用「🌐 局域网接入」里的地址（IP 实时探测，校园网变化后会自动更新），
-        本机客户端用 127.0.0.1。地址与令牌都可点击复制。
+        手机 / 平板 / 酒馆请用「局域网接入」里的地址（IP 实时探测，网络变化后自动更新），本机客户端用 127.0.0.1。
+        地址与令牌均可点击复制。
       </p>
     </div>
     <div id="endpoints" class="endpoints"></div>
-  </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>用量统计 <span id="usage-updated"></span></h2>
-      <p class="hint">
-        记录每次调用的模型、token 与耗时（<b>只记元数据，不记对话内容</b>）。
-        数据追加写入数据目录的 <code style="font-size:11px">usage.jsonl</code>，可随时导出分析。
-      </p>
-      <div class="usage-actions">
-        <button id="usage-refresh" class="btn btn-sm">↻ 刷新</button>
-        <button id="usage-clear" class="btn btn-sm btn-danger-ghost">清空统计</button>
-      </div>
-    </div>
-    <div id="usage-summary" class="usage-summary"></div>
-    <div id="usage-tables" class="usage-tables"></div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
+    <div class="page-head page-head-spaced">
       <h2>运行日志</h2>
       <p class="hint">最近 300 条（登录、签到、限流切换等都会出现在这里）。</p>
     </div>
     <pre id="logs" class="logs"></pre>
+  </section>
+
+  <!-- ─────────────── 第 3 页：数据 ─────────────── -->
+  <section class="page" data-page="data" hidden>
+    <div class="page-head">
+      <h2>用量统计 <span id="usage-updated" class="stamp"></span></h2>
+      <p class="hint">
+        记录每次调用的模型、token 与耗时（<b>只记元数据，不记对话内容</b>）。
+        数据追加写入数据目录的 <code class="inline-code">usage.jsonl</code>，可随时导出分析。
+      </p>
+      <div class="head-actions">
+        <button id="usage-refresh" class="btn btn-icon">刷新</button>
+        <button id="usage-clear" class="btn btn-icon btn-danger-ghost">清空统计</button>
+      </div>
+    </div>
+
+    <!-- 时间范围切换 -->
+    <div class="range-bar" role="group" aria-label="时间范围">
+      <button class="range" data-range="1">今日</button>
+      <button class="range" data-range="7">近 7 天</button>
+      <button class="range is-active" data-range="30">近 30 天</button>
+      <button class="range" data-range="0">全部</button>
+    </div>
+
+    <div id="usage-summary" class="usage-summary"></div>
+
+    <!-- 活动方块（Claude Code / GitHub 风格） -->
+    <div class="chart-card">
+      <div class="chart-head">
+        <h3>调用活跃度</h3>
+        <span class="chart-note" id="heat-note"></span>
+      </div>
+      <div id="heatmap" class="heatmap"></div>
+      <div class="heat-legend">
+        <span>少</span>
+        <i class="heat-cell lv0"></i><i class="heat-cell lv1"></i><i class="heat-cell lv2"></i>
+        <i class="heat-cell lv3"></i><i class="heat-cell lv4"></i>
+        <span>多</span>
+      </div>
+    </div>
+
+    <!-- 柱状图 + 折线图 -->
+    <div class="chart-row">
+      <div class="chart-card">
+        <div class="chart-head">
+          <h3>每日调用量</h3>
+          <span class="chart-note" id="bar-note"></span>
+        </div>
+        <div id="chart-bars" class="chart-body"></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head">
+          <h3>平均耗时趋势</h3>
+          <span class="chart-note" id="line-note"></span>
+        </div>
+        <div id="chart-line" class="chart-body"></div>
+      </div>
+    </div>
+
+    <div id="usage-tables" class="usage-tables"></div>
   </section>
 </main>
 
