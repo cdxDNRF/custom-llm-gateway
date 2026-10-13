@@ -45,6 +45,22 @@
 
   <section class="panel">
     <div class="panel-head">
+      <h2>用量统计 <span id="usage-updated"></span></h2>
+      <p class="hint">
+        记录每次调用的模型、token 与耗时（<b>只记元数据，不记对话内容</b>）。
+        数据追加写入数据目录的 <code style="font-size:11px">usage.jsonl</code>，可随时导出分析。
+      </p>
+      <div class="usage-actions">
+        <button id="usage-refresh" class="btn btn-sm">↻ 刷新</button>
+        <button id="usage-clear" class="btn btn-sm btn-danger-ghost">清空统计</button>
+      </div>
+    </div>
+    <div id="usage-summary" class="usage-summary"></div>
+    <div id="usage-tables" class="usage-tables"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
       <h2>运行日志</h2>
       <p class="hint">最近 300 条（登录、签到、限流切换等都会出现在这里）。</p>
     </div>

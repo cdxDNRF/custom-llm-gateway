@@ -14,6 +14,7 @@ import { loadConfig, createProviders, generateAccessToken, persistOverviewSettin
 import { ProviderServer } from './core/provider-server.js'
 import { OverviewServer } from './core/server.js'
 import { ProviderRuntime } from './core/provider-runtime.js'
+import { UsageStore } from './core/usage.js'
 import { lanAddresses } from './core/net.js'
 
 async function main(): Promise<void> {
@@ -80,6 +81,12 @@ async function main(): Promise<void> {
   }
 
   // ── 总览服务（Web UI + 聚合端点）──
+  // ── 用量统计（JSONL 追加 + 内存聚合，见 usage.ts）──
+  //
+  // ⚠️ load() 读入历史尾部数据，让重启后报表不归零（全量仍在 usage.jsonl）。
+  const usage = new UsageStore({ dataDir: config.dataDir })
+  usage.load()
+
   const overview = new OverviewServer({
     providers: providers.filter((p) => providerPorts[p.id] !== undefined),
     port: config.webPort,
@@ -88,6 +95,7 @@ async function main(): Promise<void> {
     providerPorts,
     dataDir: config.dataDir,
     runtime,
+    usage,
   })
   await overview.start()
 

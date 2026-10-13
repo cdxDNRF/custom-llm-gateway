@@ -803,7 +803,96 @@ $('#set-token').addEventListener('click', async () => {
   await load().catch(() => {})
 })
 
+// ── 用量统计 ──
+//
+// 只展示元数据（模型/token/耗时），不含对话内容。数据源是网关侧的
+// usage.jsonl（见 src/core/usage.ts），本面板只读不写。
+async function loadUsage() {
+  const box = $('#usage-summary')
+  const tables = $('#usage-tables')
+  if (!box || !tables) return
+  try {
+    const data = await api('/api/usage?recent=30')
+    if (data.enabled === false) {
+      box.innerHTML = '<div class="empty">用量统计未启用</div>'
+      tables.innerHTML = ''
+      return
+    }
+    const t = data.total || {}
+    const fmtNum = (n) => (n ?? 0).toLocaleString('zh-CN')
+    const fmtDur = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms ?? 0}ms`)
+    const failRate = t.calls > 0 ? ((t.failures / t.calls) * 100).toFixed(1) : '0.0'
+
+    box.innerHTML = `
+      <div class="usage-card">
+        <div class="usage-num">${fmtNum(t.calls)}</div>
+        <div class="usage-label">调用次数</div>
+      </div>
+      <div class="usage-card">
+        <div class="usage-num">${fmtNum((t.inputTokens ?? 0) + (t.outputTokens ?? 0))}</div>
+        <div class="usage-label">总 token（入 ${fmtNum(t.inputTokens)} / 出 ${fmtNum(t.outputTokens)}）</div>
+      </div>
+      <div class="usage-card">
+        <div class="usage-num">${fmtDur(t.avgMs)}</div>
+        <div class="usage-label">平均耗时</div>
+      </div>
+      <div class="usage-card${(t.failures ?? 0) > 0 ? ' usage-card-warn' : ''}">
+        <div class="usage-num">${fmtNum(t.failures)} <span class="usage-sub">(${failRate}%)</span></div>
+        <div class="usage-label">失败次数</div>
+      </div>
+      <div class="usage-card">
+        <div class="usage-num">${fmtNum(data.size ?? 0)}</div>
+        <div class="usage-label">累计记录（本页显示 ${fmtNum(data.sampled ?? 0)} 条）</div>
+      </div>`
+
+    // 表格：按天 / 按供应商 / 按模型
+    const table = (title, rows, keyLabel) => {
+      if (!rows || rows.length === 0) return `<div class="usage-block"><h4>${title}</h4><div class="empty">暂无数据</div></div>`
+      const body = rows.slice(0, 15).map((r) => `
+        <tr>
+          <td class="usage-key">${escapeHtml(r.key)}</td>
+          <td>${(r.calls ?? 0).toLocaleString('zh-CN')}</td>
+          <td>${((r.inputTokens ?? 0) + (r.outputTokens ?? 0)).toLocaleString('zh-CN')}</td>
+          <td>${r.avgMs >= 1000 ? (r.avgMs / 1000).toFixed(1) + 's' : r.avgMs + 'ms'}</td>
+          <td class="${r.failures > 0 ? 'usage-fail' : ''}">${r.failures ?? 0}</td>
+        </tr>`).join('')
+      return `
+        <div class="usage-block">
+          <h4>${title}</h4>
+          <table class="usage-table">
+            <thead><tr><th>${keyLabel}</th><th>次数</th><th>token</th><th>均耗时</th><th>失败</th></tr></thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>`
+    }
+
+    tables.innerHTML =
+      table('按天', data.byDay, '日期') +
+      table('按供应商', data.byProvider, '供应商') +
+      table('按模型', data.byModel, '模型')
+
+    const stamp = $('#usage-updated')
+    if (stamp) stamp.textContent = `更新于 ${new Date().toLocaleTimeString()}`
+  } catch {
+    box.innerHTML = '<div class="empty">读取用量失败</div>'
+  }
+}
+
+$('#usage-refresh')?.addEventListener('click', () => { void loadUsage() })
+$('#usage-clear')?.addEventListener('click', async () => {
+  if (!confirm('清空用量统计？\n\n原文件会被重命名备份（usage.jsonl.bak-<时间戳>），不会直接删除。')) return
+  try {
+    const r = await api('/api/usage/clear', { method: 'POST', body: '{}' })
+    toast(`已清空 ${r.removed ?? 0} 条统计${r.backup ? '（已备份）' : ''}`, 'ok')
+    await loadUsage()
+  } catch (error) {
+    toast(String(error.message || error), 'err')
+  }
+})
+
 load()
 loadLogs()
+loadUsage()
 setInterval(loadLogs, 4000)
 setInterval(load, 20000)
+setInterval(loadUsage, 30000)

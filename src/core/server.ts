@@ -16,6 +16,7 @@ import { collectCompletion, streamChunksToSse, toGenerateOptions, type OpenAiCha
 import { recentLogs } from './logger.js'
 import { lanAddresses } from './net.js'
 import { corsHeaders } from './cors.js'
+import { tapUsage, type StreamUsage, type UsageStore } from './usage.js'
 import {
   anthropicToOpenAiRequest,
   streamChunksToAnthropicSse,
@@ -42,6 +43,8 @@ export interface OverviewServerOptions {
   dataDir: string
   /** 运行时管理器：让启用/停用立即生效（热插拔）。 */
   runtime?: ProviderRuntime
+  /** 用量统计（记录每次调用的模型/token/耗时）。 */
+  usage?: UsageStore
 }
 
 import type { ProviderRuntime } from './provider-runtime.js'
@@ -98,6 +101,7 @@ export class OverviewServer {
   private readonly providerPorts: Record<string, number>
   private readonly dataDir: string
   private readonly runtime: ProviderRuntime | undefined
+  private readonly usage: UsageStore | undefined
 
   constructor(options: OverviewServerOptions) {
     this.providers = options.providers
@@ -107,6 +111,7 @@ export class OverviewServer {
     this.providerPorts = options.providerPorts
     this.dataDir = options.dataDir
     this.runtime = options.runtime
+    this.usage = options.usage
   }
 
   get baseUrl(): string {
@@ -376,6 +381,36 @@ export class OverviewServer {
 
     if (path === '/api/logs' && request.method === 'GET') {
       sendJson(response, 200, { logs: recentLogs(300) })
+      return
+    }
+
+    // ── 用量统计 ──
+    //
+    // 只记**元数据**（模型/token/耗时/状态），不记请求与响应正文（见 usage.ts）。
+    if (path === '/api/usage' && request.method === 'GET') {
+      if (this.usage === undefined) {
+        sendJson(response, 200, { enabled: false })
+        return
+      }
+      const url = new URL(request.url ?? '/', this.baseUrl)
+      const recent = Number(url.searchParams.get('recent') ?? '50')
+      sendJson(response, 200, {
+        enabled: true,
+        file: this.usage.path,
+        bytes: this.usage.bytes(),
+        size: this.usage.size,
+        ...this.usage.summary(Number.isFinite(recent) && recent > 0 ? Math.min(recent, 500) : 50),
+      })
+      return
+    }
+    // 清空统计：文件会被**重命名备份**而非删除，避免误点丢数据。
+    if (path === '/api/usage/clear' && request.method === 'POST') {
+      if (this.usage === undefined) {
+        sendJson(response, 200, { ok: true, removed: 0 })
+        return
+      }
+      const result = this.usage.clear()
+      sendJson(response, 200, { ok: true, ...result })
       return
     }
 
@@ -689,6 +724,7 @@ export class OverviewServer {
   }
 
   private async aggregateChat(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const startedAt = Date.now()
     let body: OpenAiChatRequest
     try {
       body = JSON.parse(await readBody(request)) as OpenAiChatRequest
@@ -721,20 +757,37 @@ export class OverviewServer {
     })
     const id = `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     const created = Math.floor(Date.now() / 1000)
+    const stream = body.stream === true
+    // 用量采集上下文（旁路，见 tapUsage）。
+    const tap: StreamUsage = { inputTokens: 0, outputTokens: 0, finished: false }
 
     let chunks: AsyncIterable<never>
     try {
       chunks = provider.adapter.stream(generate) as AsyncIterable<never>
     } catch (error) {
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'openai', stream,
+        ok: false, error: String(error), tap, startedAt,
+      })
       sendJson(response, 502, { error: { message: String(error) } })
       return
     }
 
-    if (body.stream !== true) {
+    const tapped = tapUsage(chunks as AsyncIterable<{ type: string }>, tap) as AsyncIterable<never>
+
+    if (!stream) {
       try {
-        const completion = await collectCompletion(chunks, { id, model: raw, created })
+        const completion = await collectCompletion(tapped, { id, model: raw, created })
+        this.recordUsage({
+          at: startedAt, provider: providerId, model: modelId, api: 'openai', stream: false,
+          ok: true, tap, startedAt, completionUsage: completion.usage,
+        })
         sendJson(response, 200, completion)
       } catch (error) {
+        this.recordUsage({
+          at: startedAt, provider: providerId, model: modelId, api: 'openai', stream: false,
+          ok: false, error: String(error), tap, startedAt,
+        })
         sendJson(response, 502, { error: { message: String(error) } })
       }
       return
@@ -748,15 +801,64 @@ export class OverviewServer {
       'x-accel-buffering': 'no',
     })
     try {
-      for await (const frame of streamChunksToSse(chunks, { id, model: raw, created })) {
+      for await (const frame of streamChunksToSse(tapped, { id, model: raw, created })) {
         response.write(frame)
       }
       response.write('data: [DONE]\n\n')
       response.end()
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'openai', stream: true,
+        ok: true, tap, startedAt,
+      })
     } catch (error) {
       response.write(`data: ${JSON.stringify({ error: { message: String(error) } })}\n\n`)
       response.write('data: [DONE]\n\n')
       response.end()
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'openai', stream: true,
+        ok: false, error: String(error), tap, startedAt,
+      })
+    }
+  }
+
+  /**
+   * 落一条用量记录。
+   *
+   * ⚠️ **绝不抛错、绝不 await 阻塞**：统计是旁路，任何异常都不能影响请求。
+   * `UsageStore.record` 内部已有 try/catch，这里再包一层是防御未来改动。
+   */
+  private recordUsage(input: {
+    at: number
+    provider: string
+    model: string
+    api: 'openai' | 'anthropic'
+    stream: boolean
+    ok: boolean
+    error?: string
+    tap: StreamUsage
+    startedAt: number
+    /** 非流式时由 collectCompletion 给出的权威 usage（优先于 tap 采集）。 */
+    completionUsage?: { prompt_tokens?: number; completion_tokens?: number } | undefined
+  }): void {
+    if (this.usage === undefined) return
+    try {
+      const inputTokens = input.completionUsage?.prompt_tokens ?? input.tap.inputTokens
+      const outputTokens = input.completionUsage?.completion_tokens ?? input.tap.outputTokens
+      this.usage.record({
+        at: input.at,
+        provider: input.provider,
+        model: input.model,
+        api: input.api,
+        stream: input.stream,
+        ok: input.ok,
+        ...(input.error !== undefined ? { error: input.error } : {}),
+        inputTokens,
+        outputTokens,
+        ms: Date.now() - input.startedAt,
+        ...(input.tap.firstByteAt !== undefined ? { ttftMs: input.tap.firstByteAt - input.startedAt } : {}),
+      })
+    } catch {
+      // 统计失败不影响请求。
     }
   }
 
@@ -810,21 +912,38 @@ export class OverviewServer {
     })
     // Anthropic 的消息 id 惯例是 `msg_` 前缀。
     const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+    const startedAt = Date.now()
+    const stream = body.stream === true
+    const tap: StreamUsage = { inputTokens: 0, outputTokens: 0, finished: false }
 
     let chunks: AsyncIterable<never>
     try {
       chunks = provider.adapter.stream(generate) as AsyncIterable<never>
     } catch (error) {
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream,
+        ok: false, error: String(error), tap, startedAt,
+      })
       sendAnthropicError(502, 'api_error', String(error))
       return
     }
 
+    const tapped = tapUsage(chunks as AsyncIterable<{ type: string }>, tap) as AsyncIterable<never>
+
     // 非流式：聚合成 OpenAI 完成对象后翻译
-    if (body.stream !== true) {
+    if (!stream) {
       try {
-        const completion = await collectCompletion(chunks, { id, model: raw, created: Math.floor(Date.now() / 1000) })
+        const completion = await collectCompletion(tapped, { id, model: raw, created: Math.floor(Date.now() / 1000) })
+        this.recordUsage({
+          at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream: false,
+          ok: true, tap, startedAt, completionUsage: completion.usage,
+        })
         sendJson(response, 200, openAiCompletionToAnthropic(completion))
       } catch (error) {
+        this.recordUsage({
+          at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream: false,
+          ok: false, error: String(error), tap, startedAt,
+        })
         sendAnthropicError(502, 'api_error', String(error))
       }
       return
@@ -839,10 +958,14 @@ export class OverviewServer {
       'x-accel-buffering': 'no',
     })
     try {
-      for await (const frame of streamChunksToAnthropicSse(chunks, { id, model: raw })) {
+      for await (const frame of streamChunksToAnthropicSse(tapped, { id, model: raw })) {
         response.write(frame)
       }
       response.end()
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream: true,
+        ok: true, tap, startedAt,
+      })
     } catch (error) {
       // 流已开始，无法改状态码；按 Anthropic 的 error 事件下发。
       response.write(`event: error\ndata: ${JSON.stringify({
@@ -850,6 +973,10 @@ export class OverviewServer {
         error: { type: 'api_error', message: String(error) },
       })}\n\n`)
       response.end()
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream: true,
+        ok: false, error: String(error), tap, startedAt,
+      })
     }
   }
 }
