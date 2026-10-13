@@ -804,3 +804,107 @@ export async function createGeminiProvider(
     },
   })
 }
+
+// ─────────────────────────── OpenCode（Zen） ───────────────────────────
+
+/**
+ * OpenCode Zen 通道。
+ *
+ * ## 与其它家的根本差异：**匿名可用**
+ *
+ * 它有一个凭据为字面量 `public` 的**匿名通道**（`OPENCODE.anonymousKey`），
+ * 服务端认它作免费通道 —— **无需登录、无需 API Key 就能调 7 个免费模型**
+ * （`big-pickle` / `space-bunny-free` / `nemotron-*` 等）。
+ * 但**收费模型必须用真实 API Key**（匿名送付费模型必然 401/403，
+ * 适配器的 `pickSlot` 已按此规则跳过匿名槽）。
+ *
+ * 故本 provider 的 `loginImpl` 与其它家不同：**不跳转授权页、不扫码**，
+ * 直接建一条匿名账号即可用；想用收费模型则需在别处（插件侧）登录后把
+ * 真实 Key 填进账号。
+ *
+ * ## 多身份槽（指纹隔离）
+ *
+ * 每条账号会被派生成一个「身份槽」（`listIdentitySlots`），带各自的
+ * project 指纹（匿名槽用**条目 id** 派生，避免多条匿名通道指纹相同）。
+ * 指纹用于上游的项目级隔离；`generation` 变更即轮换指纹。
+ *
+ * ## 代理
+ *
+ * 凭据里可带 `proxy` 字段（每条账号独立出口 IP）。空/非法一律**降级为直连**
+ * 而非报错（适配器注释明确：用户临时填错地址不该让整个 provider 停摆）。
+ */
+export async function createOpencodeProvider(
+  dataDir: string,
+  logLevel?: 'debug' | 'info' | 'warn' | 'error',
+): Promise<Provider> {
+  const { gateway, pool } = await makeBase('opencode', dataDir, logLevel)
+  const { OpencodeAdapter } = await import('../../vendor/src/opencode-adapter.js')
+  const { OPENCODE } = await import('../../vendor/src/opencode-product.js')
+  const { listIdentitySlots, ensureDefaultAnonymousSlot } = await import('../../vendor/src/opencode-auth.js')
+
+  /**
+   * 组装身份槽：读账号池 → 解析各自凭据 → 交给 `listIdentitySlots`。
+   *
+   * ⚠️ 每次都现读（不缓存）：用户在界面上停用/新增账号后应立即生效，
+   *    缓存会让开关看起来失灵。
+   */
+  const identitySlots = async () => {
+    const entries = await pool.listAccounts('opencode')
+    const snapshots = entries.map((entry) => {
+      const raw = gateway.credentials.get(entry.credentialRef)
+      let parsed: { api_key?: unknown; proxy?: unknown } = {}
+      try { parsed = raw === undefined ? {} : JSON.parse(raw) } catch { parsed = {} }
+      return {
+        id: entry.id,
+        enabled: entry.enabled,
+        apiKey: typeof parsed.api_key === 'string' ? parsed.api_key : '',
+        ...(typeof parsed.proxy === 'string' && parsed.proxy.length > 0 ? { proxy: parsed.proxy } : {}),
+      }
+    })
+    return listIdentitySlots(snapshots, OPENCODE.defaultUserAgent)
+  }
+
+  const adapter = new OpencodeAdapter({
+    identitySlots,
+    warn: (message: string) => gateway.logger.warn(message),
+    // 限流回调：把上游给的解禁时刻写回该槽（账号）的模型标记。
+    markLimited: async (slotId: string, modelId: string, resetAtMs: number) => {
+      await pool.updateModelRateLimit(slotId, modelId, resetAtMs).catch(() => {})
+    },
+    disabledModels: () => new Set(), // 黑名单由账号池侧统一处理（与其它家一致）
+  }) as LlmAdapter
+
+  return new GenericImpl({
+    id: 'opencode',
+    displayName: 'OpenCode (Zen)',
+    capabilities: {
+      login: true, dailyCheckin: false, balance: false,
+      permanentLock: false, multiAccount: true, refresh: false,
+    },
+    adapter, pool, gateway,
+    loginImpl: async () => {
+      // ⚠️ 匿名通道：无授权页。建一条 `api_key: 'public'` 的账号即完成「登录」。
+      //    用 `ensureDefaultAnonymousSlot` 而不是自己拼 id/ref，保证与插件侧
+      //    同款命名与判据（它幂等，已有匿名槽时返回空串）。
+      const created = await ensureDefaultAnonymousSlot(
+        async (entry) => { await pool.addAccount(entry) },
+        async (refName, value) => { gateway.credentials.set(refName, value) },
+        () => pool.listAccounts('opencode').then((a) => a.map((x) => ({ id: x.id }))) as never,
+        () => false,
+      )
+      if (created.length === 0) {
+        throw new Error('无法创建匿名通道（可能已存在或写入失败）')
+      }
+      gateway.logger.info(`已创建 OpenCode 匿名通道 ${created}（免费模型可用；收费模型需真实 API Key）`)
+      // 无跳转：直接返回「已完成」，前端会提示成功而不是等用户去点链接。
+      return {
+        loginUrl: '',
+        accountId: created,
+        completed: Promise.resolve({ ok: true }),
+      }
+    },
+    refreshAll: async () => {
+      // 匿名通道无可续期凭据；真实 API Key 亦无续期端点。空实现。
+    },
+  })
+}

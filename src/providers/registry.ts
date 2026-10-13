@@ -25,6 +25,7 @@ import {
   createQoderCnProvider,
   createZcodeProvider,
   createGeminiProvider,
+  createOpencodeProvider,
 } from './extended.js'
 import { CodeArtsProvider } from './codearts.js'
 import { PROVIDER_CATALOG, catalogEntry } from './catalog.js'
@@ -221,6 +222,7 @@ function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): 
     minimax: () => createMinimaxProvider(dir, level),
     zcode: () => createZcodeProvider(dir, level),
     gemini: () => createGeminiProvider(dir, level),
+    opencode: () => createOpencodeProvider(dir, level),
   }
   return table[id]
 }
@@ -258,6 +260,7 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createMinimaxProvider(dir, level),
     () => createZcodeProvider(dir, level),
     () => createGeminiProvider(dir, level),
+    () => createOpencodeProvider(dir, level),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)
 

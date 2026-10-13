@@ -14,7 +14,8 @@
     "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.4",
     "jose": "^6.2.8",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "undici": "^8.11.2"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
