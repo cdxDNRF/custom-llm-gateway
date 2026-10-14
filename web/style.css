@@ -432,3 +432,75 @@ main { max-width: 1500px; margin: 0 auto; padding: 22px 24px 60px; }
   .usage-summary { grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); }
   .chart-row, .usage-tables { grid-template-columns: 1fr; }
 }
+
+/* ─────────────────────────── 模型管理面板 ─────────────────────────── */
+/*
+ * ⚠️ 这套样式原先**完全缺失**：`.model-row` 没有 display 规则，于是 29 个模型
+ * 退化成行内文本、全部挤成一坨（用户报障 2026-10-14：「堆在一起不合适吧」）。
+ * 这里补成自适应网格 —— 宽屏多列、窄屏单列。
+ */
+
+.model-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin: 10px 0;
+}
+.model-search {
+  flex: 1 1 190px; min-width: 140px;
+  background: #0d1017; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 7px 12px;
+  color: var(--text); font-size: 12.5px; outline: none;
+  transition: border-color .15s;
+}
+.model-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.model-search::placeholder { color: var(--text-faint); }
+/* 去掉 type=search 的原生清除按钮（各浏览器样式不一，且与暗色不搭） */
+.model-search::-webkit-search-cancel-button { -webkit-appearance: none; }
+
+.model-toolbar .btn.is-active {
+  color: #fff; background: #232b3f; border-color: #3a4a7a;
+}
+.model-count { color: var(--text-faint); font-size: 11.5px; margin-left: auto; }
+
+/*
+ * ⚠️ 单元格最小宽度取 **196px**（不是 258px）：卡片本身只有约 430px 宽
+ * （`.grid` 是 minmax(370px,1fr) 的三列布局），258px 的下限在里面**只能放一列**
+ * —— 「网格」等于没生效（实测：29 行仍排成竖直一列，与修复前的"挤成一坨"
+ * 是不同表现、但同样难用）。
+ * 196px 能在卡片内稳定给出 2 列，且 `model-name` 的省略号仍能容纳常见模型名。
+ */
+.model-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+  gap: 6px;
+  max-height: 420px; overflow-y: auto;
+  padding: 2px;
+}
+.model-row {
+  display: flex; align-items: center; gap: 9px;
+  background: var(--surface-2); border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); padding: 8px 10px;
+  cursor: pointer; min-width: 0;
+  transition: border-color .15s, background .15s;
+}
+.model-row:hover { border-color: #333c4c; background: var(--surface-3); }
+.model-row[hidden] { display: none; }
+/* 停用：整行弱化（不是隐藏 —— 用户要能重新启用） */
+.model-row.is-off { opacity: .5; }
+.model-row.is-off .model-name { text-decoration: line-through; }
+.model-check { accent-color: var(--accent); cursor: pointer; flex: none; width: 15px; height: 15px; }
+
+.model-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.model-name {
+  font-size: 12.5px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.model-id {
+  font-family: ui-monospace, monospace; font-size: 10.5px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.model-row .tag { flex: none; font-size: 10.5px; padding: 2px 7px; }
+.tag-empty { color: var(--text-faint); background: transparent; }
+
+@media (max-width: 860px) {
+  .model-list { grid-template-columns: 1fr; max-height: 360px; }
+}

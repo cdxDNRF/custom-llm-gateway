@@ -119,6 +119,10 @@ function fmtExpiry(ms) {
   return days >= 1 ? `${days} 天后续期（${fmtTime(ms)}）` : `${hours} 小时后（${fmtTime(ms)}）`
 }
 
+/* 模型管理面板的搜索词（provider id → 关键词）。重渲染后要保留，否则
+   每勾一个模型就丢失搜索状态，批量操作时很难用。 */
+const modelFilter = new Map()
+
 /* 每个供应商卡片上「展开区」的当前视图：'' | 'models' | 'balance' */
 const expandedView = new Map()
 
@@ -436,6 +440,47 @@ async function renderExtra(provider, box, kind) {
       return
     }
     const enabledCount = models.filter((m) => m.enabled).length
+    // 保留上一个搜索词（重渲染后不丢）—— 用模型列表的 provider id 做键。
+    const query = modelFilter.get(provider.id) ?? ''
+    /**
+     * 倍率与"免费"判据。
+     *
+     * ⚠️ **倍率藏在 `name` 里**（真实发现，2026-10-14）：`LlmModelInfo` 本身
+     * 没有价格字段，但 vendor 适配器把它**拼进了展示名**，实测形如
+     * `"Hy4 preview · x0.29"` / `"Step-5-Preview · x0.00→免费"`。
+     * 故这里从 `name` 解析，并把倍率单独显示（`name` 里那份仍保留 ——
+     * 它是 vendor 的原始展示口径，不擅自改写）。
+     */
+    const priceOf = (m) => {
+      const name = String(m.name ?? '')
+      if (/免费/.test(name)) return { free: true, text: '免费' }
+      const x = /x(\d+(?:\.\d+)?)/i.exec(name)
+      if (x !== null) return { free: false, text: `x${x[1]}` }
+      // 兜底：id 命名线索（如 `space-bunny-free`）。
+      return /-free$/i.test(String(m.id ?? '')) ? { free: true, text: '免费' } : undefined
+    }
+    const isFree = (m) => priceOf(m)?.free === true
+
+    /**
+     * 展示名里剥掉倍率后缀（`"Hy4 preview · x0.29"` → `"Hy4 preview"`）。
+     *
+     * ⚠️ vendor 把倍率拼进了 `name`，而我们**另外**用标签呈现倍率 ⇒
+     * 不剥就会显示两次（实测截图：`DeepSeek-V3... x0.29` + 右侧 `x0.29` 标签）。
+     * 标签比内联更易扫读（右对齐一列），故保留标签、剥掉内联那份。
+     */
+    const bareName = (m) => {
+      const name = String(m.name ?? m.id ?? '')
+      return name
+        .replace(/\s*·\s*x\d+(?:\.\d+)?(?:→免费)?\s*$/i, '')
+        .replace(/\s*·\s*免费\s*$/i, '')
+        .trim() || String(m.id ?? '')
+    }
+    const sorted = [...models].sort((a, b) => {
+      const fa = isFree(a) ? 0 : 1
+      const fb = isFree(b) ? 0 : 1
+      if (fa !== fb) return fa - fb
+      return bareName(a).localeCompare(bareName(b), 'zh-CN')
+    })
     box.innerHTML = `
       <div class="extra-head">
         <span>模型管理</span>
@@ -444,18 +489,75 @@ async function renderExtra(provider, box, kind) {
           <button class="btn btn-sm" data-act="refreshModels" style="margin-left:8px">↻ 重拉</button>
         </span>
       </div>
-      <div class="model-list">
-        ${models.map((m) => `
-          <label class="model-row ${m.enabled ? '' : 'model-off'}">
-            <input type="checkbox" ${m.enabled ? 'checked' : ''}
-                   data-act="modelToggle" data-model="${escapeHtml(m.id)}" data-enabled="${m.enabled}">
-            <span class="model-name">${escapeHtml(m.name || m.id)}</span>
-            <span class="model-id">${escapeHtml(m.id)}</span>
-            ${m.credits ? `<span class="tag">${escapeHtml(m.credits)}</span>` : ''}
+      <div class="model-toolbar">
+        <input class="model-search" type="search" placeholder="搜索模型名或 id…"
+               value="${escapeHtml(query)}" data-role="model-search"
+               autocomplete="off" spellcheck="false">
+        <button class="btn btn-sm" data-role="only-free">只看免费</button>
+        <button class="btn btn-sm" data-role="only-disabled">只看停用</button>
+        <span class="model-count" data-role="model-count"></span>
+      </div>
+      <div class="model-list" data-role="model-list">
+        ${sorted.map((m) => `
+          <label class="model-row ${m.enabled ? '' : 'is-off'}"
+                 data-model="${escapeHtml(m.id)}"
+                 data-search="${escapeHtml((bareName(m) + ' ' + m.id).toLowerCase())}"
+                 data-free="${isFree(m) ? '1' : '0'}"
+                 data-enabled="${m.enabled ? '1' : '0'}">
+            <input type="checkbox" class="model-check" ${m.enabled ? 'checked' : ''}
+                   data-act="modelToggle" data-model="${escapeHtml(m.id)}">
+            <span class="model-main">
+              <span class="model-name">${escapeHtml(bareName(m))}</span>
+              <span class="model-id">${escapeHtml(m.id)}</span>
+            </span>
+            ${(() => {
+              const price = priceOf(m)
+              if (price === undefined) return ''
+              return `<span class="tag ${price.free ? 'tag-ok' : ''}">${escapeHtml(price.text)}</span>`
+            })()}
           </label>
         `).join('')}
       </div>
     `
+
+    /**
+     * 按搜索词 + 两个筛选开关刷新可见性。
+     *
+     * ⚠️ 用 `hidden` 属性隐藏行（CSS 已确保 `.model-row[hidden]` 生效）：
+     * 直接 `display:none` 内联样式会在下次重渲染时丢失，而重渲染很频繁
+     * （每次切换模型都会）。
+     */
+    const applyFilter = () => {
+      const list = box.querySelector('[data-role="model-list"]')
+      if (list === null) return
+      const q = (box.querySelector('[data-role="model-search"]')?.value ?? '').trim().toLowerCase()
+      const onlyFree = box.querySelector('[data-role="only-free"]')?.classList.contains('is-active') === true
+      const onlyOff = box.querySelector('[data-role="only-disabled"]')?.classList.contains('is-active') === true
+      let shown = 0
+      for (const row of list.querySelectorAll('.model-row')) {
+        let ok = true
+        if (q.length > 0 && !(row.dataset.search ?? '').includes(q)) ok = false
+        if (onlyFree && row.dataset.free !== '1') ok = false
+        if (onlyOff && row.dataset.enabled !== '0') ok = false
+        row.hidden = !ok
+        if (ok) shown++
+      }
+      const counter = box.querySelector('[data-role="model-count"]')
+      if (counter !== null) counter.textContent = `显示 ${shown} / ${sorted.length}`
+    }
+
+    const search = box.querySelector('[data-role="model-search"]')
+    search?.addEventListener('input', () => {
+      modelFilter.set(provider.id, search.value)
+      applyFilter()
+    })
+    for (const role of ['only-free', 'only-disabled']) {
+      box.querySelector(`[data-role="${role}"]`)?.addEventListener('click', (e) => {
+        e.currentTarget.classList.toggle('is-active')
+        applyFilter()
+      })
+    }
+    applyFilter()
     // 复选框的 click 会冒泡到卡片的 data-act 处理；这里直接复用同一处理路径。
     box.querySelectorAll('input[data-act="modelToggle"]').forEach((input) => {
       input.addEventListener('click', (e) => e.stopPropagation())
