@@ -794,6 +794,7 @@ export async function createGeminiProvider(
   const { GeminiAuth } = await import('../../vendor/src/gemini-auth.js')
   const { GeminiAdapter } = await import('../../vendor/src/gemini-adapter.js')
   const { GEMINI } = await import('../../vendor/src/gemini.js')
+  const { fetchGeminiCreditBalance } = await import('../../vendor/src/gemini-credits.js')
   // ⚠️ 必须在构造 Auth **之前**注入：`geminiClientId()` 只认环境变量。
   const { configured: geminiConfigured } = await loadGeminiOAuthCredentials(dataDir)
   if (!geminiConfigured) {
@@ -891,6 +892,74 @@ export async function createGeminiProvider(
     },
     refreshAll: async () => {
       await auth.refreshAll(pool)
+    },
+
+    /**
+     * 额度读数：与 DSH 插件面板同口径（**两个配额窗口 + 账号规格**）。
+     *
+     * ## 为什么不能用通用的 `sumBalances`
+     *
+     * `sumBalances` 只把各家读数**累加成一个数字**，而 Gemini 的额度是
+     * **双窗口**（5 小时 / 周），每个窗口都有"已用百分比 + 剩余量"两个维度。
+     * 累加会丢掉窗口语义 —— 用户最需要知道的恰是"哪个窗口快满了"。
+     * 故直接返回完整 `BalanceView`（`sumBalances` 支持 `{ view }` 形态），
+     * 窗口逐条放进 `items`。
+     *
+     * ⚠️ **账号规格（tier）在 `BalanceView` 里无处安放**（没有 tier 字段），
+     * 而 `items[].name` 是自由文本 ⇒ 把档位作为一条只读附注放进 items
+     * （`remain: 0`）。这比丢掉它好：DSH 面板能看到"账号规格 Free"，
+     * 本网关也应能看到。
+     */
+    queryBalance: async () => {
+      const accounts = (await pool.listAccounts('gemini')).filter((a) => a.enabled)
+      if (accounts.length === 0) return undefined
+
+      let total = 0
+      const items: NonNullable<BalanceView['items']> = []
+      let got = false
+
+      for (const account of accounts) {
+        const raw = gateway.credentials.get(account.credentialRef)
+        if (raw === undefined) continue
+        let credential: unknown
+        try { credential = JSON.parse(raw) } catch { continue }
+        try {
+          // ⚠️ 本函数**不抛错**（vendor 契约）：未授权时返回
+          //    `{ balance: null, error: '尚未授权 Google 账号' }`。
+          const result = await fetchGeminiCreditBalance(credential as never, GEMINI)
+          got = true
+          if (result.balance === null) {
+            // 未授权/查不到：如实记一条（不静默跳过，否则用户只看到"无数据"）。
+            items.push({ name: `${account.nickname}：${result.error ?? '查不到额度'}`, remain: 0 })
+            continue
+          }
+          for (const pkg of result.balance.packages ?? []) {
+            // ⚠️ `CreditPackage` **没有 `expireAt`**（那是别的 provider 的字段名）：
+            //    它的失效时间是 `deductionEndTime`（毫秒，实测才是"何时作废"的真相源
+            //    —— `expiredTime` 只在包**真正失效后**才由服务端回填，见 credits.ts 长注释）。
+            //    未激活的包如实标注，避免用户以为那些额度还能用。
+            const suffix = pkg.active ? '' : '（已失效）'
+            items.push({
+              name: `${account.nickname} · ${pkg.name}${suffix}`,
+              remain: pkg.remaining,
+              ...(typeof pkg.deductionEndTime === 'number' && pkg.deductionEndTime > 0
+                ? { expireAt: pkg.deductionEndTime }
+                : {}),
+            })
+          }
+          if (result.tier !== undefined) {
+            // `GeminiAccountTier` 有 `label` 字段（'Free' / 'Pro' / 'Ultra'），
+            // 正是 DSH 面板"账号规格"那一栏的取值。
+            items.push({ name: `${account.nickname} · 账号规格 ${result.tier.label}`, remain: 0 })
+          }
+          total += result.balance.total
+        } catch (error) {
+          gateway.logger.warn(`账号 ${account.id} 额度查询失败:`, error)
+        }
+      }
+
+      if (!got) return undefined
+      return { total, unit: 'credits', items, at: Date.now() }
     },
   })
 }
