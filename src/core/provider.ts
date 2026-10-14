@@ -76,9 +76,23 @@ export interface BalanceView {
   /** 总额（单位由 provider 决定：积分或 token）。 */
   total: number
   /** 量纲说明，便于前端如实标注。 */
-  unit: 'credits' | 'tokens'
+  /**
+   * 量纲。
+   *
+   * ⚠️ 必须如实标注：Gemini 的额度是**剩余百分比**（上游单位就是 `'%'`，
+   * 见 `gemini-credits.ts` 的 `GEMINI_QUOTA_UNIT`），不是积分。
+   * 早先只有 `credits` / `tokens` 两种，把 Gemini 的百分比渲染成「积分」
+   * —— 用户会以为还有 100 积分可用（真实报障 2026-10-14）。
+   */
+  unit: 'credits' | 'tokens' | 'percent'
   /** 分项（如多个资源包）。 */
-  items?: { name: string; remain: number; expireAt?: number }[]
+  /**
+   * 分项。
+   *
+   * ⚠️ `note: true` 表示这是**纯说明行**（如"账号规格 Free"、"尚未授权"），
+   * `remain` 无意义 —— 前端**不应**把它渲染成数量（否则显示「0 %」误导）。
+   */
+  items?: { name: string; remain: number; expireAt?: number; note?: boolean }[]
   /** 取得该读数的时间。 */
   at: number
 }

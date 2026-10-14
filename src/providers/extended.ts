@@ -930,7 +930,7 @@ export async function createGeminiProvider(
           got = true
           if (result.balance === null) {
             // 未授权/查不到：如实记一条（不静默跳过，否则用户只看到"无数据"）。
-            items.push({ name: `${account.nickname}：${result.error ?? '查不到额度'}`, remain: 0 })
+            items.push({ name: `${account.nickname}：${result.error ?? '查不到额度'}`, remain: 0, note: true })
             continue
           }
           for (const pkg of result.balance.packages ?? []) {
@@ -950,7 +950,7 @@ export async function createGeminiProvider(
           if (result.tier !== undefined) {
             // `GeminiAccountTier` 有 `label` 字段（'Free' / 'Pro' / 'Ultra'），
             // 正是 DSH 面板"账号规格"那一栏的取值。
-            items.push({ name: `${account.nickname} · 账号规格 ${result.tier.label}`, remain: 0 })
+            items.push({ name: `${account.nickname} · 账号规格 ${result.tier.label}`, remain: 0, note: true })
           }
           total += result.balance.total
         } catch (error) {
@@ -959,7 +959,10 @@ export async function createGeminiProvider(
       }
 
       if (!got) return undefined
-      return { total, unit: 'credits', items, at: Date.now() }
+      // ⚠️ `unit: 'percent'`：Gemini 的额度是**剩余百分比**（上游的
+      //    `GEMINI_QUOTA_UNIT` 就是 `'%'`），不是积分。写成 `credits`
+      //    会让前端显示「100 积分」——用户会以为有 100 积分可用。
+      return { total, unit: 'percent', items, at: Date.now() }
     },
   })
 }

@@ -484,20 +484,31 @@ async function renderExtra(provider, box, kind) {
 
 function renderBalance(balance) {
   if (!balance) return '<div class="empty">查不到余额（未登录、账号未开通，或上游接口变动）</div>'
-  const unit = balance.unit === 'tokens' ? 'tokens' : '积分'
-  const items = (balance.items || []).map((item) => `
+  // ⚠️ 三态如实标注：百分比不能显示成「积分」（Gemini 的额度就是百分比）。
+  const unit = balance.unit === 'tokens' ? 'tokens' : balance.unit === 'percent' ? '%' : '积分'
+  const items = (balance.items || []).map((item) => {
+    // 失效时刻（有则显示，说明"这批额度什么时候作废"）。
+    const exp = item.expireAt
+      ? ` <span class="endpoint-note">（至 ${new Date(item.expireAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}）</span>`
+      : ''
+    // `note: true` = 纯说明行（账号规格 / 未授权），不显示数量。
+    const amount = item.note === true ? '' : `<code>${item.remain} ${unit}</code>`
+    return `
     <div class="endpoint">
-      <span class="endpoint-label">${escapeHtml(item.name)}</span>
-      <code>${item.remain} ${unit}</code>
-    </div>
-  `).join('')
-  return `
-    <div class="endpoint" style="margin-bottom:6px">
-      <span class="endpoint-label"><b>合计</b></span>
-      <code>${balance.total} ${unit}</code>
-    </div>
-    ${items}
-  `
+      <span class="endpoint-label">${escapeHtml(item.name)}${exp}</span>
+      ${amount}
+    </div>`
+  }).join('')
+  const header = balance.unit === 'percent'
+    ? `<div class="endpoint" style="margin-bottom:6px">
+         <span class="endpoint-label"><b>合计</b> <span class="endpoint-note">（两个窗口剩余百分比的均值）</span></span>
+         <code>${balance.total} %</code>
+       </div>`
+    : `<div class="endpoint" style="margin-bottom:6px">
+         <span class="endpoint-label"><b>合计</b></span>
+         <code>${balance.total} ${unit}</code>
+       </div>`
+  return header + items
 }
 
 /**

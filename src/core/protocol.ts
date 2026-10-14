@@ -126,9 +126,20 @@ export function toDshMessages(messages: OpenAiMessage[]): {
         blocks.push({ type: 'text', text: `[image omitted: ${image.url.slice(0, 64)}]` })
       }
       blocks.push({ type: 'text', text })
+      // ⚠️⚠️ **必须始终是块数组**，不能退化成裸字符串（真实缺陷，2026-10-14）。
+      //
+      // DSH 的 `RequestMessage.content` 契约是**块数组**（`ContentBlock[]`）。
+      // 这里曾写成 `blocks.length === 1 ? text : blocks` —— 只有文字时退化成
+      // 字符串，多数 provider 恰好按字符串处理所以没暴露；但
+      // `gemini-messages.ts` / `minimax-messages.ts` 是 `for (const block of
+      // message.content)`：**字符串会被逐字符迭代**，产出 0 个有效 part，
+      // 最终抛 `gemini: messages 里没有可用内容`（症状：任何请求都失败）。
+      //
+      // 症状与根因相距极远（"没有可用内容"听起来像用户没发东西），
+      // 故此处一律产出块数组，不做任何形态退化。
       out.push({
         role: 'user',
-        content: blocks.length === 1 ? text : blocks,
+        content: blocks,
       } as unknown as RequestMessage)
       continue
     }
