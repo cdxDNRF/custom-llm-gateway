@@ -40,7 +40,7 @@ import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -53,6 +53,9 @@ import { planSessionTitleThinking } from './session-title.js'
 // （400/11128），而「排查这个风控问题的会话」必然会把那句复述进正文 ——
 // 只在网关补 = 换一个入口又被拦。依据见那个文件的头。
 import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js'
+// ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
+import { detailFieldText } from './openai-compat.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -676,6 +679,9 @@ function errorDetail(body: string): string {
       // 腾讯系用 `msg` 而非 `message`。
       typeof data.msg === 'string' ? data.msg : undefined,
       typeof data.message === 'string' ? data.message : undefined,
+      // ⚠️ 上游代理的 `{"error":"…","detail":"<真实原因>"}` 形态（IKLBSH A1）。
+      // 判据只留一份实现（`openai-compat.ts` 的 `detailFieldText`）；必须是最后一条腿。
+      detailFieldText(data),
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch {
@@ -2226,6 +2232,11 @@ export class BuddyAdapter extends LlmAdapter {
      * 整块丢掉（比循环本身更糟）。
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    /**
+     * DSML 标记归一化器（见 sse.ts `createDsmlMarkerNormalizer`）。
+     * ⚠️ **每个 `stream()` 调用一个实例**：待定缓冲是跨帧状态，共用会串流。
+     */
+    const dsmlFix = createDsmlMarkerNormalizer()
     let proseLoopDetected = false
     // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
     // 它逐帧匹配标签来决定收尾是否切分，而标签**必然跨帧**（上游可切成任意片段），
@@ -2383,8 +2394,16 @@ export class BuddyAdapter extends LlmAdapter {
             // 现改为收尾**无条件**调用 `splitThinkTaggedContent`
             // （无标签时返回 undefined，普通响应逐字节不变）。
             if (!proseLoopDetected) {
-              block.text += delta.content
-              yield { type: 'text-delta', index: block.index, text: delta.content }
+              // ⚠️ **先归一化再累积**（2026-10-13）：step-5-preview 实测把
+              //    `<｜DSML｜invoke…>` 写坏成 `<｜｜DSML｜｜`（全角双竖线，
+              //    分词器保真度问题）⇒ 宿主解析器不认，工具调用整段当正文，
+              //    模型「停住不动」。push() 流式安全（跨帧由待定缓冲拼齐，
+              //    与 openai-compat.ts 的 consumeOpenAiSse 同款）。
+              const fixedDelta = dsmlFix.push(delta.content)
+              block.text += fixedDelta
+              if (fixedDelta.length > 0) {
+                yield { type: 'text-delta', index: block.index, text: fixedDelta }
+              }
             }
           }
           if (delta?.reasoning_content) {
@@ -2550,6 +2569,18 @@ export class BuddyAdapter extends LlmAdapter {
         },
       }
     }
+    // ── DSML 归一化收尾：下发待定缓冲 ──（与 openai-compat.ts 同款）
+    // 扣住的尾部在流结束时必须放行，block-end 才能带上它。
+    {
+      const tail = dsmlFix.flush()
+      if (tail.length > 0 && !proseLoopDetected) {
+        const tailBlock = blocks.find(candidate => candidate.kind === 'text')
+        if (tailBlock !== undefined) {
+          tailBlock.text += tail
+          yield { type: 'text-delta', index: tailBlock.index, text: tail }
+        }
+      }
+    }
     if (textBlock !== undefined) {
       // ── think 标签归位（见 `splitThinkTaggedContent`）──
       // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
@@ -2597,13 +2628,17 @@ export class BuddyAdapter extends LlmAdapter {
         : textOut
       // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
       const cleaned = stripCourseLeakIfEnabled(truncated)
+      // ⚠️ DSML 归一化**整串兜底**（幂等，与 openai-compat.ts 同款）：增量路径
+      //    已逐帧修过，这里再过一遍防御跨缓冲边界漏网；block-end 是权威覆盖，
+      //    发的必须是归一化后的文本，否则会把增量修好的又改回去。
+      const dsmlCleaned = fixDsmlMarkers(cleaned)
       // ⚠️ 归位后正文可能为空串（实测 seq=34768 形态）—— 空块会污染会话，
       // 且 DSH 的 `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，
       // 故本响应仍有产出，不会被误判为零块。
-      if (cleaned !== '') {
+      if (dsmlCleaned !== '') {
         blockCount += 1
-        emittedProse = cleaned
-        yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
+        emittedProse = dsmlCleaned
+        yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: dsmlCleaned } }
       }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')

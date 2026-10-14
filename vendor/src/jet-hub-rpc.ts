@@ -18,6 +18,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { openIncognitoWindow } from './login.js'
 import { AccountPool } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
@@ -56,6 +57,15 @@ import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
+// OfficeAce（华为 MaaS 云端直连）：面板状态探测 / 登录流程 / 余额查询所需的
+// 产品配置与鉴权模块（协议逆向见 `officeace-auth.ts` 模块头）。
+import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
+import type * as OfficeAceAuthModule from './officeace-auth.js'
+/** 以模块命名空间为类型（`startLogin` / `pollLoginCode` / `fetchSubscriptionSummary` 等纯函数）。 */
+type OfficeAceAuth = typeof OfficeAceAuthModule
+import type { AccioAuth } from './accio-auth.js'
+import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
+import { ACCIO } from './accio-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -181,6 +191,7 @@ import type {
   RpcListAccountsRequest,
   RpcCreateAccountRequest,
   RpcPollLoginRequest,
+  RpcPollLoginResponse,
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
   RpcReorderAccountsRequest,
@@ -988,7 +999,7 @@ function providerIdsOf(
  */
 /**
  * 各 provider auth 实例的**共同部分**（结构化类型），使 `authOf` 不必依赖
- * 13 个具体类。
+ * 各家具体类（逐个 import 会把它们全拖进依赖图）。
  *
  * ⚠️ **名字里的 `JetHub` 比实际语义窄（2026-10-08 独立复审 M-5 实测）**：
  * 本接口有两个**不同层次**的使用方，第二个并不在 JetHub RPC 里 ——
@@ -999,7 +1010,7 @@ function providerIdsOf(
  * | `refreshAll` | **`index.ts` 的 runtime 注册循环**（填 `ProviderRuntime.auth.refreshAll`，即 `wiredRefreshTargets()` 的派生依据）。实测本文件里**只有声明、零调用** |
  *
  * ⇒ 读到这里别以为 `refreshAll` 有 JetHub 调用方；它的价值是「让注册循环能用
- * 一个统一的形状遍历 13 家」。**没有改名**是刻意的：改名要动 `index.ts` 的
+ * 一个统一的形状遍历各家的实例」。**没有改名**是刻意的：改名要动 `index.ts` 的
  * import 与类型标注，而收益只是名字更准；**语义澄清写在这里即可**。
  */
 export interface JetHubAuthLike {
@@ -1009,7 +1020,7 @@ export interface JetHubAuthLike {
    *
    * ⚠️ 2026-10-08（Task 10）：`index.ts` 的注册循环用它填
    * `ProviderRuntime.auth.refreshAll`，而后者是 `wiredRefreshTargets()` 的派生依据。
-   * 实测 13 家签名**完全一致**（`(pool) => Promise<void>`）⇒ 无需逐家适配。
+   * 实测各家签名**完全一致**（`(pool) => Promise<void>`）⇒ 无需逐家适配。
    */
   refreshAll(pool: AccountPool): Promise<void>
 }
@@ -1026,9 +1037,14 @@ export interface JetHubAuthLike {
  *
  * ⇒ 调用点写 `qodercn: qoderCn`（**键是 id、值是变量**），这是刻意的。
  *
- * ⚠️ **13 个字段都必须保留具体类型**（不要都改成 `JetHubAuthLike`）——
- * 那会丢掉「13 个键必须都在」的类型检查，而「漏接一个 provider 就编译不过」
+ * ⚠️ **每个字段都必须保留具体类型**（不要都改成 `JetHubAuthLike`）——
+ * 那会丢掉「全部键必须都在」的类型检查，而「漏接一个 provider 就编译不过」
  * 正是本次改名的核心价值。
+ *
+ * ⚠️ **刻意不写「N 个字段」**：条数随 provider 增删必然腐坏（本仓库已多次
+ * 记录「注释里的数字先烂」），且「数字对不上」会让人怀疑整段约定。
+ * 权威条数以本接口的字段为准，一致性由
+ * `tests/unit/zcode-wiring.spec.ts` 的「接口键 === 调用点键」锁死。
  */
 export interface JetHubAuths {
   readonly codearts: CodeArtsAuth
@@ -1045,6 +1061,15 @@ export interface JetHubAuths {
   readonly minimax: MinimaxAuth
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
+  /**
+   * OfficeAce（华为 ModelArts MaaS 云端直连）。
+   *
+   * ⚠️ 值是 **auth 模块命名空间**（`import * as officeaceAuth`），不是 Service 实例
+   * —— 该模块导出的是纯函数（`startLogin` / `pollLoginCode` / `completeLogin` /
+   * `fetchSubscriptionSummary`），没有类实例。见 `officeace-auth.ts` 模块头。
+   */
+  readonly officeace: OfficeAceAuth
+  readonly accio: AccioAuth
 }
 
 /**
@@ -1062,7 +1087,7 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
 }
 
 /**
- * ⚠️ 2026-10-08 改：13 个 provider 形参从**位置传参**改为**命名对象**（`auths`）。
+ * ⚠️ 2026-10-08 改：各 provider 形参从**位置传参**改为**命名对象**（`auths`）。
  *
  * 原注释记录「历史上已因少传/插队错位复发 **6 次**」—— 位置参数天生有这个缺陷
  *（改签名顺序、插一个新 provider 都会静默错位，而症状是「某个 provider 在用
@@ -1100,7 +1125,7 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
 export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
-  /** ⚠️ 命名对象，不是 13 个位置参数。键是 provider id（见 `JetHubAuths`）。 */
+  /** ⚠️ 命名对象，不是位置参数。键是 provider id（见 `JetHubAuths`）。 */
   auths: JetHubAuths,
   /**
    * provider → 适配器实例（可选）。
@@ -1597,7 +1622,7 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax, zcode, gemini,
+    trae, cline, loomy, raccoon, minimax, zcode, gemini, accio,
   } = auths
   /**
    * 积分能力表。
@@ -1704,11 +1729,19 @@ function registerJetHubEndpoints(
    *
    * - loomy / zcode：没有 refresh 端点，其 `refreshAccountCredential` 做的是
    *   **有效性探测**，拿来当续期用只会白发请求；
-   * - opencode：匿名通道，无凭据可续。
+   * - opencode：匿名通道，无凭据可续（且它**不在** `JetHubAuths` 里）。
    *
-   * ⚠️ 本集合的**成员关系**必须与 `JetHubAuths` 的键一致（去掉 loomy / zcode）——
+   * ⚠️ 本集合的**成员关系**必须与 `JetHubAuths` 的键一致，**只去掉 loomy / zcode**
+   * 这两家「设计上没有 refresh 端点」的（opencode 根本不在 `JetHubAuths` 里）——
    * 合并 2026-10-08 的 provider 抽象重构后用 {@link authOf} 查表，
    * 故这里只是**能力判据**（该不该尝试自愈），不是分派表本身。
+   *
+   * ⚠️⚠️ **这个「只去掉两家」的方向此前没有守卫**（2026-10-12 复审实测）：
+   * `credits-balance-self-heal.spec.ts` 原先只锁「本集合 ⊆ `JetHubAuths` 的键」
+   * （挡住假 id），**反向没有** —— 于是新 provider 进了 `JetHubAuths` 却忘了
+   * 登记到这里时**全绿**，而它的过期账号**永不自愈**（issue IKKHL5 的形态：
+   * 积分行报「未登录」而上游其实只需一次 refresh）。现该文件已补上反向用例
+   * （逐键点名 + 显式豁免表），新增 provider 漏登记会**点名变红**。
    */
   const SELF_HEAL_REFRESHABLE_PROVIDERS: ReadonlySet<string> = new Set([
     'codearts',
@@ -1722,6 +1755,18 @@ function registerJetHubEndpoints(
     RACCOON.id,
     MINIMAX.id,
     GEMINI.id,
+    // ⚠️ officeace（2026-10-13 审计补）：STS 寿命**约 2 小时**，正落在
+    // 「睡眠/挂起恢复后到定时器补触发那一轮之间」这个窗口内 ⇒ 漏登记的症状
+    // 与 issue IKKHL5 逐字相同（卡片红「已过期」+ 积分行 HTTP 401 + 窗口内
+    // 无手动自救），且**日志零字**。
+    // 同款陷阱已发生过一次（accio），见 `docs/agent-notes/providers-accio.md`
+    // 的「接线陷阱（新 provider 通用）」。⚠️ 它有真实 refresh 端点
+    // （`officeace-auth.ts` 的 `doRefreshCredential` 打华为 STS），故不属于豁免。
+    OFFICEACE.id,
+    // ⚠️ accio **有** refresh 端点（`accio-auth.ts` 的 `refreshCredential`）且
+    // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
+    // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
+    ACCIO.id,
   ])
 
   /**
@@ -1941,6 +1986,370 @@ function registerJetHubEndpoints(
   const pendingSmsMsgid = new Map<string, { phone: string; msgid: string }>()
 
   /**
+   * OfficeAce 登录的中间状态（账号 id → `{ state, codeVerifier, dpopPrivateJwk }`）。
+   *
+   * 华为云 OAuth 需要三件东西跨「发起登录」与「轮询取码」两次 RPC 保持：
+   * - `state`：云侧签发的一次性状态（**必须**来自 `POST /v1/claw/auth/state`，
+   *   自制 state 会在轮询时 404 —— 实测踩过）；
+   * - `codeVerifier`：PKCE 原文（换 token 时用）；
+   * - `dpopPrivateJwk`：DPoP 的 ES256 私钥（换 token 时签名，且**刷新要复用**）。
+   *
+   * ⚠️ 放内存而不落盘：`state` 与 `code` 都是**分钟级一次性**凭据，登录完成即无意义；
+   *    落盘只会留下无用的秘密副本。真正需要持久化的凭据在 `persistLogin` 之后
+   *    由 **DSH 凭据库**接管（按 `credentialRef` 索引，见 `officeace-auth.ts`）。
+   *
+   * ⚠️ `credentialRef` **必须跟着走**：登录完成时按它把凭据写进**这一个账号**
+   *    的槽位。缺了它，新凭据就落到公共 `session.json` 覆盖了别人（2026-10-13）。
+   */
+  type PendingOfficeAceState = {
+    state: string
+    codeVerifier: string
+    dpopPrivateJwk: import('./officeace-auth.js').DpopPrivateJwk
+    credentialRef: string
+  }
+
+  const pendingOfficeAceState = new Map<string, PendingOfficeAceState>()
+
+  /**
+   * OfficeAce 交换的**单飞表**（accountId → 正在进行的交换结果）。
+   *
+   * ## 为什么必须有（2026-10-14 独立审计查出的净回归）
+   *
+   * 客户端 `plugin-src/client/jet-hub.js` 的 `setInterval(..., 1000)` **没有
+   * in-flight 闸门**（只挡「再点一次新建」），而一次交换含多次网络往返
+   *（取 code → 换 token → modelInfo → 落库），通常远超 1 秒 ⇒ **两拍重叠几乎必然**。
+   * 同一个 `code` 只能换一次，于是后一拍必然失败 —— 若各拍独立走失败收尾，
+   * 后一拍会把**前一拍刚登好的账号与凭据删掉**（实测：修前池 `[]` + 凭据键 `[]`，
+   * 而正确的结局是一次成功登录）。
+   *
+   * ⇒ 后一拍**复用**前一拍的 promise，而不是各自去换。
+   * ⚠️ 这只覆盖「真正重叠」的那一段；**顺序**重放同一条 code（前一次已结束）
+   * 仍会走到失败分支，由 `hasOfficeAceCredential` 那道护栏兜住 —— 两道都要在。
+   */
+  const officeAceExchangeInFlight = new Map<
+    string,
+    Promise<{ done: boolean; success?: boolean; error?: string }>
+  >()
+
+  /**
+   * 登录**终态失败**记录（账号 id → `{ message, at }`；`message` 即下发给前端的原文）。
+   *
+   * ## 为什么必须有这张表（Gitee issue IKLI7J，真实缺陷）
+   *
+   * `login.poll` 原先**只有一条**终态通道：`done:true`，而它**只在成功时下发**。
+   * 失败侧走的是「删掉占位条目」的清理路径 ⇒ 下一次轮询命中
+   * `if (!entry) return {done:false}`，把
+   * 「账号尚未登记（用户还没授权完）」与「登录已被拒绝并清理」**混成同一个返回**。
+   * 前端只会判 `done`，于是**任何 provider 的登录失败都变成静默转圈 5 分钟**
+   * （5 分钟是客户端自己的轮询上限，不是服务端超时），用户分不清是网络问题、
+   * 账号未开通服务、自己关掉了弹窗，还是插件 bug。
+   *
+   * 实测代价（issue 附件）：OfficeAce 因「账号未订阅 ModelArts MaaS」失败时，
+   * 云侧早已用 `HTTP 200 + subscription:null` 讲清原因，而用户只能看到转圈 ——
+   * 报告方为此改宿主代码加文件日志才定位。
+   *
+   * ## 生命周期
+   *
+   * 写入：各 provider 后台登录失败后的收尾（统一走 `failLogin`，**不要**各自
+   * 手写 `removeAccount` —— 漏一处就是「那一家失败时前端仍静默转圈」且完全无痕）。
+   * 读取：`login.poll` **在查账号池之前**先查这里。顺序是刻意的：
+   * `failLogin` 先同步记原因、再异步删条目，故「记录已写、条目未删」的窗口里
+   * 也必须能报出终态。
+   *
+   * ⚠️ **读后不删**（与 `pendingOfficeAceState` 的一次性中间态不同）：终态原因
+   * 要**幂等**——客户端 1 秒一次轮询、`setInterval` 的异步回调可能重叠，若
+   * 「读到即清」，一次丢包/慢响应就把唯一次原因吃掉，又退回静默转圈。
+   * 记录按**账号 id** 索引，而 id 由 `account.create` 每次新生成（`shortId()`），
+   * 不存在「旧记录被下一次登录读到」的可能，故保留无害。过期与容量由
+   * `LOGIN_FAILURE_TTL_MS` / `LOGIN_FAILURE_LIMIT` 兜住。
+   */
+  const loginFailures = new Map<string, { message: string; at: number }>()
+
+  /** 终态失败记录的保留时长。客户端轮询上限是 5 分钟，留 6 倍余量。 */
+  const LOGIN_FAILURE_TTL_MS = 30 * 60_000
+
+  /**
+   * 条数上限（写入时按插入序淘汰最旧的）：挡住异常路径下的无界增长。
+   *
+   * ⚠️ 必须**远大于任何可能的「同时在轮询的登录数」**：淘汰会把一条**仍在被轮询**
+   * 的失败记录挤掉 ⇒ 那条登录退回静默（只剩客户端超时文案兜底）。客户端同一时刻
+   * 只允许一轮登录（`pollRef` 闸门），但 `login.poll` 可被外部脚本调用 ——
+   * 独立审计实测「连做 65 次失败登录」即可触发 64 上限的淘汰。真正的内存边界
+   * 是 `LOGIN_FAILURE_TTL_MS`（30 分钟），上限只是护栏。
+   */
+  const LOGIN_FAILURE_LIMIT = 256
+
+  /**
+   * 归一化异常为可读文案。
+   *
+   * ⚠️ **必须显式挡 `undefined` / `null`**：`String(undefined)` 不报错，会拼出
+   * 字面量 `"undefined"`（`docs/agent-notes/misc.md` §2 记过同型缺陷）——
+   * 那会让用户看到「登录失败：undefined」这种零线索文案。
+   */
+  function loginReasonText(reason: unknown): string {
+    if (reason === undefined || reason === null) return '未知错误'
+    const text = reason instanceof Error ? reason.message : String(reason)
+    return text.trim().length > 0 ? text : '未知错误'
+  }
+
+  /**
+   * 终端失败对用户可见的文案。
+   *
+   * ⚠️ **只此一处构造**：首次报出（各 provider 的失败收尾 / OfficeAce 的交换失败）
+   * 与后续轮询读表，必须是**逐字相同**的一句话 —— 两处各写一份必然漂移，
+   * 用户会看到「第一次说 A、再点一次说 B」。
+   */
+  function loginFailureMessage(reason: unknown): string {
+    return `登录失败：${loginReasonText(reason)}。请重新点击「+ 新建账号」。`
+  }
+
+  /**
+   * 记一条登录终态失败，并**返回**落库的文案（调用方可据此立即回终态，与后续轮询一致）。
+   */
+  function recordLoginFailure(accountId: string, reason: unknown): string {
+    const message = loginFailureMessage(reason)
+    if (accountId.length > 0) {
+      const now = Date.now()
+      // ⚠️ **先 delete 再 set**：Map 的迭代序是**插入序**，覆盖已存在的 key
+      //    不会把它移到末尾 —— 少了这一步，淘汰序会停在「第一次失败的时刻」。
+      loginFailures.delete(accountId)
+      loginFailures.set(accountId, { message, at: now })
+      for (const [key, value] of loginFailures) {
+        if (now - value.at > LOGIN_FAILURE_TTL_MS) loginFailures.delete(key)
+      }
+      while (loginFailures.size > LOGIN_FAILURE_LIMIT) {
+        const oldest = loginFailures.keys().next()
+        if (oldest.done === true) break
+        loginFailures.delete(oldest.value)
+      }
+    }
+    return message
+  }
+
+  /** 读某账号的终态失败文案（不过期就不删，见 `loginFailures` 的说明）。 */
+  function loginFailureOf(accountId: string): string | undefined {
+    const record = loginFailures.get(accountId)
+    if (record === undefined) return undefined
+    if (Date.now() - record.at > LOGIN_FAILURE_TTL_MS) {
+      loginFailures.delete(accountId)
+      return undefined
+    }
+    return record.message
+  }
+
+  /**
+   * 该账号此刻的池内条目；**读不到时返回 `'unknown'`**（≠「没有这个账号」）。
+   *
+   * ⚠️ 为什么要区分「没有」与「读不到」：`failLogin` 会**删账号 + unset 凭据**，
+   * 那是不可逆的。池实现抛错（或测试替身没实现 `findAccount`）时若被当成
+   * 「账号不存在 / 没有凭据」，就会把一次**可能已经成功**的登录销毁 ——
+   * 正是 `failLogin` 要防的事。⇒ 读不到时**不删**（宁可留一张卡片让用户自己删；
+   * 反过来则无法恢复）。
+   */
+  function poolEntryOf(accountId: string): { credentialRef: string } | undefined | 'unknown' {
+    try {
+      const find = (pool as unknown as { findAccount?: (id: string) => unknown }).findAccount
+      if (typeof find !== 'function') return 'unknown'
+      return find.call(pool, accountId) as { credentialRef: string } | undefined
+    } catch {
+      return 'unknown'
+    }
+  }
+
+  /**
+   * 这次登录**是否已经真的成了**（该账号的凭据已落库）。
+   *
+   * ## 为什么失败收尾必须先问这一句（2026-10-14 两轮独立审计查出的**净回归**）
+   *
+   * 各 provider 后台 `.then` 里，**记账**（`pool.updateAccount` → `state.json` 落盘）
+   * 排在**凭据落盘之后**；而 `AccountPool` 的落盘失败会**抛错**
+   *（`account-pool.ts` 的 `writeAccounts` —— 本仓库自己记过「落盘抛错时账号
+   * **已经是可用状态**」）。于是「登录其实成了、只是记账失败」会走进 `.catch`
+   * ⇒ `failLogin` ⇒ **删号 + 报「登录失败」**，用户被误导去重新登录
+   *（同一个上游账号会变成两条）。红队实测：codearts 一支在 `credentials.set`
+   * 之后让 `updateAccount` 抛错，修前回 `success:true`，改后回 `success:false`
+   * 而账号与凭据其实都在。
+   *
+   * ⇒ 判据：**凭据在 ⇒ 这次登录就是成了**。`failLogin` 据此把「登录真的失败」与
+   * 「登录成功后的记账失败」分开（后者只记日志，不删号、不报失败）。
+   *
+   * ⚠️ 这个判据**只此一处实现**：OfficeAce 那条一度另写了一份同义判据 ——
+   * 一个文件两套同义判据必然漂移（`docs/agent-notes/misc.md` §1）。
+   */
+  async function loginCredentialLanded(accountId: string): Promise<boolean> {
+    const refs = new Set<string>()
+    const entry = poolEntryOf(accountId)
+    if (entry !== undefined && entry !== 'unknown') refs.add(entry.credentialRef)
+    // OfficeAce 的凭据按 `pending.credentialRef ?? entry.credentialRef` 落库 ⇒ 两个都查
+    //（正常路径同值；改造期存量数据可能只有其一）。
+    const pending = pendingOfficeAceState.get(accountId)
+    if (pending !== undefined) refs.add(pending.credentialRef)
+    for (const name of refs) {
+      if (name.length === 0) continue
+      const resolved = await ctx.credentials.resolve(credentialRef(name)).catch(() => undefined)
+      if (resolved !== undefined && resolved.value.length > 0) return true
+    }
+    return false
+  }
+
+  /**
+   * 登录失败的**统一收尾**：先判「其实是否已经成功」→ 真失败才记终态 + 删占位条目。
+   *
+   * 十余处 provider 后台 `.catch()` 都走这里，**不要各自手写两行** ——
+   * 漏接的那一家会继续静默转圈（计数断言锁死接线），而「失败不留幽灵账号」
+   * 这条腿也**只由这里**保证（除 raccoon 外没有任何行为用例覆盖它）。
+   *
+   * @returns 需要报给前端的失败文案；**`undefined` = 这次登录其实已经成功**
+   *（凭据已落库，只是后续记账失败）—— 调用方**不得**把它当作失败。
+   */
+  async function failLogin(accountId: string, error: unknown): Promise<string | undefined> {
+    if (await loginCredentialLanded(accountId)) {
+      ctx.logger.warn(
+        `[jet-hub] ${accountId} 登录已拿到凭据、后续记账失败（按成功处理：不记失败、不删账号）：`
+        + `${loginReasonText(error)}`,
+      )
+      return undefined
+    }
+    const entry = poolEntryOf(accountId)
+    if (entry === 'unknown') {
+      // 读不到池（实现抛错 / 替身缺方法）：**不当成失败去删**（不可逆）。
+      ctx.logger.warn(
+        `[jet-hub] ${accountId} 登录收尾时读不到账号池，已记终态但**不删账号**（宁可留卡片）：`
+        + `${loginReasonText(error)}`,
+      )
+      return recordLoginFailure(accountId, error)
+    }
+    // 条目已被（用户）删除：不要把内部错误串（`Account xxx not found`）丢给用户。
+    if (entry === undefined) {
+      return recordLoginFailure(accountId, new Error('该账号条目已被删除（可能是你手动删掉了它）'))
+    }
+    const message = recordLoginFailure(accountId, error)
+    void pool.removeAccount(accountId).catch(() => {})
+    return message
+  }
+
+  /**
+   * 跑完一次 OfficeAce 交换：取 code → 换 token → 落库 → 回填账号条目。
+   * 返回 `login.poll` 的 value（**由调用方包进 `{ ok: true, value }`**）。
+   *
+   * ⚠️⚠️ **三段式：交换 / 落库 / 回填各有自己的失败语义**
+   *（2026-10-14 独立审计查出的**净回归**，真实缺陷，**别退回单 `try`**）。
+   *
+   * 拆开之前：一个 `try` 罩住 `completeLogin` + `persistLogin` +
+   * `pool.updateAccount`，catch 一律当「code 过期 / 交换失败」并 `failLogin`
+   * （= **删账号**，而 `AccountPool.removeAccount` 会连带 unset 凭据）。
+   * 两个真实可达的后果（都已实测）：
+   *
+   * ① **回填**（`updateAccount`）抛错 ⇒ 凭据**已经写好**，却连账号带凭据一起被删：
+   *    池 `[]` + 凭据键 `[]` + 前端看到「登录失败」。
+   * ② **两拍重叠** ⇒ 后一拍必然换失败（同一 code 只能用一次），却把**前一拍刚登好的
+   *    账号与凭据删掉**：修前实测池 `[]` + 凭据键 `[]` + 持续报失败，
+   *    而正确的结局是一次成功登录。
+   *
+   * ⇒ 判据：**凭据在 ⇒ 这次登录就是成了**（与 `login.poll` 的成功判据同源），
+   * 此后任何一步失败都**不许**再删号/删凭据。
+   */
+  async function exchangeOfficeAceLogin(
+    accountId: string,
+    entry: { credentialRef: string },
+    pending: PendingOfficeAceState,
+  ): Promise<{ done: boolean; success?: boolean; error?: string }> {
+    const code = await auths.officeace.pollLoginCode(pending.state).catch(() => undefined)
+    if (code === undefined) {
+      // 未就绪（用户还没完成授权）：继续轮询。
+      return { done: false }
+    }
+    const exchanged = await auths.officeace
+      .completeLogin(code, pending.codeVerifier, pending.dpopPrivateJwk)
+      .then(
+        (credential) => ({ ok: true as const, credential }),
+        (error: unknown) => ({ ok: false as const, error }),
+      )
+    if (!exchanged.ok) {
+      /**
+       * ⚠️ **失败收尾统一走 `failLogin`**（它内部先判「凭据是否其实已落库」）：
+       * 并发的另一拍可能**已经用同一个 code 换成功**（本拍拿到的错误恰恰是
+       * 「code 已被使用」）⇒ 那种情况下 `failLogin` 返回 `undefined`，
+       * 我们必须按成功回，**绝不能删号/删凭据**。这与上面的单飞表是**两道**，
+       * 缺一不可：单飞只挡真正重叠的那一段，顺序重放（前一次已结束）要这道兜。
+       *
+       * code 过期 / 交换失败：授权 code 一次性，保留 state 继续轮询没有意义
+       *（云侧不会再给新 code）—— 清中间态，用户需重新发起登录。
+       */
+      const failure = await failLogin(accountId, exchanged.error)
+      pendingOfficeAceState.delete(accountId)
+      if (failure === undefined) return { done: true, success: true }
+      /**
+       * ⚠️⚠️ **失败是业务终态，必须 `done:true` + `success:false`**
+       *（Gitee issue IKLI7J 根因 1，真实缺陷）。
+       *
+       * 原先是 `{done:false, error}` —— 意图是「把原因交给前端」，
+       * 但**前端在 `!pollRes.done` 时直接 `return`**（它只判 `done`），
+       * ⇒ 这句唯一指路的原因（本例是「账号未订阅 ModelArts MaaS」）
+       * 从未到达用户眼前，只剩 5 分钟静默转圈。
+       * 实测取证：本仓库探针跑真 `registerJetHubRpc`，交换失败时第 1 次
+       * 轮询确实回 `{done:false,error}`、第 2 次起连 `error` 都没有
+       *（`pendingOfficeAceState` 已删 ⇒ 退化成普通 `{done:false}`）。
+       *
+       * ⚠️ 只把 `done` 改成 `true` 还不够、也**不能**只改前端：
+       * 两侧必须同改（前端不判 `success` 就仍读不到原因）。
+       * ⚠️ `failLogin` **顺手删掉占位条目**：授权 code 一次性、state 已清，
+       * 该条目永远不会再拿到凭据 —— 与其余十二家的失败收尾一致
+       *（原先不删，用户会看到一张「凭据未配置」的幽灵卡片）。
+       */
+      return { done: true, success: false, error: failure }
+    }
+    const credential = exchanged.credential
+    pendingOfficeAceState.delete(accountId)
+    /**
+     * ⚠️ **落库走 DSH 凭据库（标准范式）**：与 gemini / raccoon /
+     *    minimax 的 `persistLogin(credential, { refName })` 同款 ——
+     *    凭据按 `credentialRef` 索引 ⇒ 每个账号一份，互不覆盖。
+     *    这是号池多账号能成立的根（自己写 session.json 的版本
+     *    必然串号，2026-10-13 改造）。
+     *
+     * ⚠️ 它抛错**不等于没落库**（可能写成功后才抛，例如凭据库实现了写后校验）
+     *    ⇒ 先看凭据在不在，**只有确实没有凭据**才判失败。
+     */
+    let accountLabel = credential.accountId ?? ''
+    try {
+      const persisted = await auths.officeace.persistLogin(credential, {
+        refName: pending.credentialRef ?? entry.credentialRef,
+        credentials: ctx.credentials as never,
+      })
+      accountLabel = persisted.accountId ?? credential.accountId ?? ''
+    } catch (error) {
+      // ⚠️ `persistLogin` 抛错**不等于没落库**（可能写成功后才抛）⇒ 交给
+      //    `failLogin` 的通用判据（它先看凭据是否已落库）；返回 `undefined`
+      //    就说明凭据在 ⇒ 按成功继续。
+      const failure = await failLogin(accountId, error)
+      if (failure !== undefined) return { done: true, success: false, error: failure }
+    }
+    /**
+     * **回填展示字段**：失败**不改变登录结论**（凭据已落盘），只记日志。
+     *
+     * ⚠️ 池里的 `refreshable` / `expiresAt` 是凭据的镜像，下一轮 `refreshAll`
+     *    对账会自愈（见 `src/expiry-sync.ts`），故这里**绝不**因回填失败去删账号。
+     */
+    try {
+      await pool.updateAccount(accountId, {
+        nickname: accountLabel.length > 0 ? `OfficeAce ${accountLabel.slice(0, 8)}` : accountId,
+        refreshable: true,
+        // ⚠️ **必须回填 expiresAt**（与 gemini / zcode 同款）：漏写时
+        //    卡片「有效期」永远显示「未知」（真实症状 2026-10-13，
+        //    用户重登成功后面板仍显示未知）。STS 寿命 2 小时，
+        //    `credential.expiresAt` 是 ISO 字符串。
+        expiresAt: new Date(credential.expiresAt).getTime(),
+      })
+    } catch (error) {
+      ctx.logger.warn(
+        `[jet-hub] officeace 登录成功但回填账号条目失败（凭据已在，不判失败）：${String(error)}`,
+      )
+    }
+    return { done: true, success: true }
+  }
+
+  /**
    * 用量徽标的显示偏好（`$DSH_HOME/jet-hub/ui-preferences.json`）。
    *
    * ⚠️ 与账号池**分开**的独立文档：`state.json` 是整体替换语义，同机另一条工作区
@@ -1957,7 +2366,7 @@ function registerJetHubEndpoints(
    * 把它计为「跳过」。客户端的能力表（`credits-capabilities.js`）仍是唯一权威。
    *
    * ⚠️ 「有账号的渠道」由账号池派生（`pool.listAllAccounts()` 只是同步内存副本
-   * 的异步外壳），不遍历 12 个渠道里没账号的那些 —— 那些调下去只会拿到空结果。
+   * 的异步外壳），不遍历**没有账号**的那些渠道 —— 那些调下去只会拿到空结果。
    */
   const autoCheckin = createAutoCheckin({
     store: createAutoCheckinStore(ctx),
@@ -2222,6 +2631,41 @@ function registerJetHubEndpoints(
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
         const accounts = await pool.listAccounts(req.provider)
+        // ⚠️ OfficeAce 自愈回填（2026-10-13 修正）：`expiresAt` 回填是后加的
+        //    （`6fb110f`），修复前登录留下的池条目缺这个字段 ⇒ 卡片恒显示
+        //    「未知」且不会自己补上。列表时若发现缺失，从凭据文件读真实
+        //    有效期补上并**写回池**（一次性自愈，之后走正常的登录/续期回填）。
+        //
+        // ⚠️⚠️ **必须逐账号按 ref 读凭据**（2026-10-13 审计修正，原为广播缺陷）：
+        //    原实现调 `readOfficeAceCredential()`（**无 ref** ⇒ 读共享的
+        //    `session.json`，即「最后一次登录的那个账号」）再把同一个值写给
+        //    **所有**缺 `expiresAt` 的账号 ⇒ 多账号下 A 的有效期显示成 B 的，
+        //    方向还可能相反（把好账号显示成已过期）。
+        //    这是 AGENTS.md「位置/键错位」防线复发的那一类（已复发 7 次）。
+        if (req.provider === OFFICEACE.id && accounts.some((a) => a.expiresAt === undefined)) {
+          for (const account of accounts) {
+            if (account.expiresAt !== undefined) continue
+            // ⚠️ 逐账号 resolve：该账号自己的 `credentialRef`（**不是** ref 名）。
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              .catch(() => null)
+            if (!resolved) continue
+            let expiresAt = Number.NaN
+            try {
+              // ⚠️ `expiresAt` 是 STS 的 ISO 8601 字符串（不是数值时间戳 ——
+              //    华为这侧没有 buddy / accio 那条秒/毫秒混淆，故无需归一化）。
+              const credential = JSON.parse(resolved.value) as { expiresAt?: unknown }
+              if (typeof credential.expiresAt === 'string') {
+                expiresAt = Date.parse(credential.expiresAt)
+              }
+            } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
+            // ⚠️ 解析不出来就**跳过这个账号**（绝不广播、也绝不写 NaN：
+            // `updateAccount` 落盘时 `JSON.stringify` 会整个丢弃 `undefined`，
+            // 写 NaN 则会让卡片显示「已过期」——两者都比「显示未知」更糟）。
+            if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
+            account.expiresAt = expiresAt
+            void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+          }
+        }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
@@ -2275,8 +2719,8 @@ function registerJetHubEndpoints(
             })
           }).catch((err) => {
             ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${err}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, err)
           })
           return { ok: true, value: { accountId: id, loginUrl: authUrl } }
         } else if (provider === 'codearts') {
@@ -2313,8 +2757,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background codearts login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === LOBSTERAI.id) {
@@ -2341,7 +2785,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${LOBSTERAI.id} login failed for ${id}: ${String(error)}`)
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (isQoderFamily(provider)) {
@@ -2389,8 +2834,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === TRAE.id) {
@@ -2419,8 +2864,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${TRAE.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === CLINE.id) {
@@ -2455,8 +2900,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${CLINE.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === LOOMY.id) {
@@ -2509,8 +2954,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${LOOMY.id} wechat login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
 
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
@@ -2564,8 +3009,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${RACCOON.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
 
           return { ok: true, value: { accountId: id, loginUrl: raccoonStarted.loginUrl } }
@@ -2618,8 +3063,8 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${MINIMAX.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
 
           return { ok: true, value: { accountId: id, loginUrl: minimaxStarted.loginUrl } }
@@ -2726,8 +3171,8 @@ function registerJetHubEndpoints(
             await pool.updateAccount(id, { nickname: `ZCode ${label}` })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${ZCODE.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === GEMINI.id) {
@@ -2785,11 +3230,136 @@ function registerJetHubEndpoints(
             })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${GEMINI.id} login failed for ${id}: ${String(error)}`)
-            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
-            void pool.removeAccount(id).catch(() => {})
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
           })
 
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
+        } else if (provider === OFFICEACE.id) {
+          /**
+           * OfficeAce（华为 ModelArts MaaS）走**华为云 OAuth（PKCE + DPoP）**，
+           * 全程**不依赖 OfficeAce 客户端**（协议逆向见 `officeace-auth.ts` 模块头）。
+           *
+           * ⚠️ 两步式（同 zcode / gemini）：`window.open` 只在用户手势窗口内有效，
+           * 等授权完成才返回 URL 会被浏览器拦截 —— 这里先返回 authorizeUrl，
+           * 后台轮询 `code` 再换 token（`login.poll` 里做）。
+           *
+           * ⚠️ 华为 SSO 通常**自动重定向**（无需扫码 / 无需输密码），用户开页即完成。
+           *
+           * ⚠️ `state` **必须**用云侧签发的那一个（`POST /v1/claw/auth/state`）：
+           * 自制 state 会在轮询时 404（实测踩过）。`codeVerifier` 与 `dpopPrivateJwk`
+           * 与 state 同批生成，必须一起暂存到 `pendingOfficeAceState` 供 `login.poll` 使用。
+           */
+          await pool.addAccount({
+            id,
+            provider: OFFICEACE.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let started: Awaited<ReturnType<OfficeAceAuth['startLogin']>>
+          try {
+            started = await auths.officeace.startLogin()
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 OfficeAce 登录（华为云授权状态获取失败）：${reason}`)
+          }
+          pendingOfficeAceState.set(id, {
+            state: started.state,
+            codeVerifier: started._internal.codeVerifier,
+            dpopPrivateJwk: started._internal.dpopPrivateJwk,
+            // ⚠️ **必须带上 ref**：`completeLogin` 按它分文件落盘。缺省会让
+            //    新账号的凭据写进公共 `session.json`，覆盖其他账号的凭据
+            //    （多账号共存的前提，2026-10-13 改造）。
+            credentialRef: refName,
+          })
+
+          // ⚠️ **宿主侧直接拉起无痕窗口**（2026-10-13，用户要求）：
+          //    华为 authui 会静默复用浏览器已有会话 ⇒ 带 cookie 打开授权页
+          //    看不到登录框 ⇒ 「新建账号」永远只能建出同一个号。无痕窗口是
+          //    全新 cookie jar，天然无会话，且**不碰用户日常浏览器里的
+          //    华为云控制台会话**（对比 `authui/logout`：它的作用域是整个
+          //    域，会连带登出控制台）。实测依据见 `login.ts` 的
+          //    `openIncognitoWindow` 注释。
+          //
+          // ⚠️ 客户端**无法**自己做这件事：`window.open` 不能请求无痕模式
+          //    （那是进程级启动参数），故必须由宿主 `spawn` 浏览器可执行文件。
+          //
+          // ⚠️ 打开失败（读不到默认浏览器 / spawn 失败）时返回 `false`，
+          //    客户端据此回退到自己的 `window.open` —— 保持原行为不变，
+          //    不让「换个打开方式」变成「开不了窗口」。
+          const incognitoOpened = openIncognitoWindow(started.authorizeUrl)
+
+          return {
+            ok: true,
+            value: { accountId: id, loginUrl: started.authorizeUrl, incognitoOpened },
+          }
+        } else if (provider === ACCIO.id) {
+          /**
+           * Accio（阿里）走**浏览器回调式 OAuth 2.0 + PKCE**（本地
+           * `createServer` 监听 `127.0.0.1` 的 `/api/oauth/callback`）。
+           *
+           * ⚠️ 与 codearts / lobsterai / gemini 同型：**必须先返回 URL 再等结果**
+           * —— `window.open` 只在用户手势窗口内有效，等授权完成才返回 URL 会让
+           * 弹窗被拦截（AGENTS.md 记过 CodeArts 的同类缺陷）。
+           *
+           * ## ⚠️⚠️ 本分支**刻意不调 `pool.addAccount`**（与其余十家**相反**）
+           *
+           * 既有模式是「RPC 登记占位条目、`auth.startLogin` 不碰池」（本文件
+           * 十余处；gemini 的 `startLogin()` 甚至不接收 `pool`）。而
+           * `AccioAuth.startLogin` **自己**登记占位条目（见
+           * `accio-auth.ts` 的 `startLoginFlow`：它要保证「返回 loginUrl 时占位
+           * 条目已就位」，否则前端 `login.poll` 会先看到一个不存在的账号）。
+           *
+           * ⇒ 这里再 `addAccount` 就是**同 id 的两次写入**：会被
+           * `writeAccounts` 的 dedup 兜住并打一条 warn —— 功能上无害，但那条
+           * 日志会**误导排查**（看起来像「RPC 与 auth 都登记了，谁才是对的」）。
+           * 故本分支必须把 `pool` / `accountId` **透传给 `startLogin`**，
+           * 由它登记；失败时也由它 `removePlaceholder` 清掉。
+           *
+           * ⚠️ `region` 必须过白名单（`normalizeAccioRegion`）：它来自**客户端
+           * 自报**的 RPC 载荷（无 schema 校验），且决定登录域名与凭据里的
+           * `region` —— 未登记值回落 `'cn'` 并留痕（与 zcode 的
+           * `normalizeZcodeLoginProvider` 同因，issue IKJLK3 E2）。
+           */
+          let accioStarted: StartedAccioLogin
+          try {
+            accioStarted = await accio.startLogin({
+              refName,
+              region: normalizeAccioRegion(req.accioRegion),
+              pool,
+              accountId: id,
+            })
+          } catch (error) {
+            // ⚠️ 占位条目由 `startLogin` 自己清理（`fail()` 里的
+            //    `removePlaceholder`），这里**不得**再 removeAccount ——
+            //    那是同 id 的第二次写入，且会与它自己的清理竞争。
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 Accio 登录（本地回调服务启动失败）：${reason}`)
+          }
+
+          // ⚠️ **不接收 result 的解析值**：`AccioAuth` 的 `result` 是
+          // `Promise<void>` —— 凭据落盘、账号池回填、昵称与有效期全部在
+          // `finishLogin` 里做完（与其余家「RPC 回填」的分工相反）。
+          // 这里只挂日志与失败清理。
+          accioStarted.result.catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${ACCIO.id} login failed for ${id}: ${String(error)}`)
+            /**
+             * ⚠️ **只记终态、不删条目**（与其余十二家不同）：
+             * Accio 的占位条目由 `AccioAuth.startLogin` 的 `fail()` 自己清
+             *（且它保证了「先删完再 reject」），这里再 `removeAccount` 是
+             * **同 id 的第二次写入**，会与它自己的清理竞争（见上方 Accio 分支的长注释）。
+             * 用户关掉弹窗 / 授权被拒都走这条路 ⇒ 前端 `login.poll` 得以立刻报出原因，
+             * 而不是静默转圈 5 分钟（Gitee issue IKLI7J）。
+             */
+            recordLoginFailure(id, error)
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: accioStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -2906,8 +3476,8 @@ function registerJetHubEndpoints(
            *
            * | 位置 | 形态 | 为何安全 |
            * |---|---|---|
-           * | `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态 |
-           * | `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
+           * | `login.poll` | `{done:false}`（进行中）／`{done:true, success:false, error}`（终态失败） | 有 `done` + `success` 两个判别字段，前端两者都判（2026-10-14 按 issue IKLI7J 补齐终态腿） |
+           * | `login.submitSms` | `{done:false, error}` | 验证码输错可重试；⚠️ 随包客户端**从不调用**它（备用路径，`plugin-src/` 零命中），故它的失败文案可见性**未被真实使用验证** |
            * | `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
            * | `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
            *
@@ -2946,6 +3516,25 @@ function registerJetHubEndpoints(
 
       case 'login.poll': {
         const req = payload as RpcPollLoginRequest
+        /**
+         * ⚠️⚠️ **终态失败必须先于一切「进度」判据被检查**（Gitee issue IKLI7J）。
+         *
+         * 失败侧各 provider 都会删掉占位条目，而 `if (!entry)` 原先与
+         * 「账号尚未登记（用户还没授权完）」**同形** ⇒ 前端只能干等到 5 分钟上限。
+         *
+         * 放在 `listAllAccounts()` **之前**是刻意的：`failLogin` 是「先同步写记录、
+         * 再异步删条目」，落在「记录已写、条目还在」的窗口里也必须能报出终态。
+         * 正常路径不会误命中 —— 占位条目在 `account.create` 返回**之前**就已登记
+         *（十几处分支逐一核对过，含 accio 由 `startLogin` 自己登记），故「条目在」
+         * 期间不会有本账号 id 的失败记录。
+         */
+        const failure = loginFailureOf(req.accountId)
+        if (failure !== undefined) {
+          return {
+            ok: true,
+            value: { done: true, success: false, error: failure } satisfies RpcPollLoginResponse,
+          }
+        }
         const accounts = await pool.listAllAccounts()
         const entry = accounts.find((a) => a.id === req.accountId)
         if (!entry) return { ok: true, value: { done: false } }
@@ -2957,7 +3546,40 @@ function registerJetHubEndpoints(
         //   而实际上该账号一发请求就 `凭据无效`。这里对 zcode 追加**形状校验**。
         const ref = credentialRef(entry.credentialRef)
         const resolved = await ctx.credentials.resolve(ref)
-        if (!resolved) return { ok: true, value: { done: false } }
+        if (!resolved) {
+          /**
+           * OfficeAce 的占位条目走**凭据缺失即未完成**：这里代为轮询云侧 code。
+           * 用户授权完成后云侧立即返回 `code` → 换 token → 凭据落盘 → `done`。
+           *
+           * ⚠️ `code` 是**秒级时效** —— 轮询到必须**立刻** `completeLogin`
+           *（内部一次性完成 token 交换 + modelInfo + 落盘），不能延后。
+           */
+          if (entry.provider === OFFICEACE.id) {
+            const pending = pendingOfficeAceState.get(req.accountId)
+            if (pending !== undefined) {
+              /**
+               * ⚠️ **单飞**：客户端 `setInterval` 没有 in-flight 闸门，而一次交换含多次
+               * 网络往返（通常 > 1 秒）⇒ 两拍重叠几乎必然。同一个 `code` 只能换一次，
+               * 让后一拍**复用**前一拍的 promise，而不是各自去换、后失败者把成功者删掉。
+               */
+              const shared = officeAceExchangeInFlight.get(req.accountId)
+              if (shared !== undefined) return { ok: true, value: await shared }
+              const task = exchangeOfficeAceLogin(req.accountId, entry, pending)
+              officeAceExchangeInFlight.set(req.accountId, task)
+              void (async () => {
+                try {
+                  await task
+                } catch {
+                  // 不该发生：`exchangeOfficeAceLogin` 自身吞掉全部异常并返回 value。
+                  // 这里仍要兜住，否则一次未捕获拒绝会连带跳过后面那行 `delete`。
+                }
+                officeAceExchangeInFlight.delete(req.accountId)
+              })()
+              return { ok: true, value: await task }
+            }
+          }
+          return { ok: true, value: { done: false } }
+        }
         if (entry.provider === ZCODE.id) {
           let parsed: unknown
           try {
@@ -3718,6 +4340,88 @@ function registerJetHubEndpoints(
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+
+        // ── OfficeAce（华为 ModelArts MaaS）──
+        //
+        // ⚠️ **不套查表分派**：它的余额不是「拿凭据调上游」的形状，而是
+        //    **云侧 V11 签名直读**（`GET /v1/subscription`）——凭据是 STS 三元组
+        //    且签名逻辑在 `officeace-auth.ts` 内部，没有 `fetchBalance(credential)`
+        //    这个可注入点。与 opencode / qoder 同属「形态与骨架不匹配」的特例。
+        //
+        // 返回的 `creditGroups` 含套餐桶（`skus[].quotas`）与活动桶
+        //（`bonus_skus[]`），逐桶带 `expiresAt` —— 归一化到 `deductionEndTime`
+        // 后由通用判据分成「永久 / 长期 / 临期」三档（`PERMANENT_LOCK_PROVIDERS` 同款）。
+        //
+        // ⚠️ **必须回传 `windowDays`**：客户端 `splitCreditsByExpiry` 的
+        // `normalizeWindowDays` 对 `undefined` 返回 `null` ⇒ 整个分桶行静默不渲染
+        //（真实症状：胶囊只有合计、没有「永久绿 / 长期黄 / 临期红」三行）。
+        if (req.provider === OFFICEACE.id) {
+          // ⚠️ 用可选链取 auth：本端点的多条单测用**空桩 auths**（`{}`）遍历
+          //    registry，缺 `officeace` 键时直接取属性会抛 TypeError ⇒ 整个 case
+          //    冒泡成 `ok:false`（真实症状：`officeace 应被接受` 变红）。
+          //    取不到就如实回「查询失败」，与网络失败同一条降级路径。
+          const fetchSummary = auths.officeace?.fetchSubscriptionSummary
+          // ⚠️ **逐账号查询，不共享一份结果**（2026-10-13）：
+          //    原实现只查一次就拿去填所有卡片 ⇒ N 个账号显示同一个余额，
+          //    面板合计被放大 N 倍（实测两个账号显示 13000 = 6500×2）。
+          //    每个账号按自己的 `credentialRef` 查自己那份订阅。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const subscription = fetchSummary === undefined
+              ? undefined
+              : await fetchSummary.call(
+                auths.officeace,
+                48,
+                account.credentialRef,
+                undefined,
+                ctx.credentials as never,
+              ).catch(() => undefined)
+            if (subscription === undefined) {
+              values.push({
+                accountId: account.id,
+                nickname: account.nickname,
+                balance: null,
+                error: '积分查询失败（华为云订阅接口不可达或凭据已失效）',
+              })
+              continue
+            }
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance: {
+                total: subscription.totalCredits,
+                packages: subscription.creditGroups.map((group) => ({
+                  name: group.name,
+                  unit: OFFICEACE.quotaUnit,
+                  remaining: group.remaining,
+                  total: group.total,
+                  used: group.used ?? 0,
+                  active: !group.expired,
+                  cycleStartTime: '',
+                  cycleEndTime: '',
+                  expiredTime: group.expiresAt ?? '',
+                  // 分桶判据字段：订阅套餐包无固定到期（永久桶），活动/签到包有明确到期。
+                  ...(group.expiresAt !== undefined && group.expiresAt !== null
+                    ? { deductionEndTime: new Date(group.expiresAt).getTime() }
+                    : {}),
+                })),
+                expiredTotal: subscription.creditGroups.filter((g) => g.expired).length,
+              },
+            })
+          }
+          return {
+            ok: true,
+            value: {
+              accounts: values,
+              // ⚠️ **成功/失败都要回传 `windowDays`**：该字段表达的是「本渠道
+              //    按到期时间分桶」（registry 的 `usesExpiryWindow`），与本次
+              //    读数成功与否**无关**。只在成功路径带它会让「空账号池 / 查询
+              //    失败」时形状不一致 —— 守卫用例遍历 registry 时正会红
+              //（实测症状：`officeace 必须回传 windowDays`）。
+              windowDays: buddyExpiringWindowDays(),
+            } satisfies RpcCreditsBalancesResponse,
+          }
         }
 
         // ── 查表分派 ──
@@ -5050,6 +5754,39 @@ function registerJetHubEndpoints(
         }
         const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.setEnabled(req.enabled) }
         return { ok: true, value }
+      }
+
+      case 'officeace.status': {
+        /**
+         * OfficeAce（华为 MaaS）凭据状态：**只读探测**，不抛错。
+         *
+         * ⚠️ STS 临期先**静默刷新**（refresh_token 30 天，一次性）—— 刷新失败
+         * 不阻塞状态展示，仍按旧凭据回 `ready: true`（推理可能仍可用：MaaS 的
+         * Basic 凭据与 STS 生命周期不同步），真正失效由 `stream` 的 401 兜底。
+         */
+        let credential = await auths.officeace.readOfficeAceCredential().catch(() => undefined)
+        if (credential !== undefined && auths.officeace.isExpiring(credential)) {
+          credential = (await auths.officeace.refreshStoredCredential().catch(() => undefined)) ?? credential
+        }
+        const base = { quotaUnit: OFFICEACE.quotaUnit }
+        if (credential === undefined) {
+          return {
+            ok: true,
+            value: { ...base, ready: false, user: undefined, models: [], expiresAt: undefined },
+          }
+        }
+        return {
+          ok: true,
+          value: {
+            ...base,
+            ready: true,
+            user: credential.displayName ?? (credential.accountId !== undefined && credential.accountId.length > 0
+              ? `华为云 ${credential.accountId.slice(0, 8)}`
+              : '华为云账号'),
+            models: OFFICEACE_MODELS.map((m) => ({ id: m.id, name: m.name })),
+            expiresAt: credential.expiresAt,
+          },
+        }
       }
 
       default:

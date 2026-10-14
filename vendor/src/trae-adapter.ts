@@ -45,12 +45,15 @@ import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.j
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
 import { traeCooldownFor } from './trae-cooldown-table.js'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
 import { planSessionTitleThinking } from './session-title.js'
+// ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
+import { detailFieldText } from './openai-compat.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -592,6 +595,9 @@ function errorDetail(body: string): string {
       typeof data.code === 'number' || typeof data.code === 'string' ? `code=${String(data.code)}` : undefined,
       typeof data.message === 'string' ? data.message : undefined,
       typeof data.msg === 'string' ? data.msg : undefined,
+      // ⚠️ 上游代理的 `{"error":"…","detail":"<真实原因>"}` 形态（IKLBSH A1）。
+      // 判据只留一份实现（`openai-compat.ts` 的 `detailFieldText`）；必须是最后一条腿。
+      detailFieldText(data),
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch { /* 非 JSON 错误体 */ }
@@ -1551,6 +1557,8 @@ export class TraeAdapter extends LlmAdapter {
      * 故正文守卫**只截断文本**，绝不 `reader.cancel()`、绝不改 finish reason。
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    /** DSML 标记归一化器（见 sse.ts）；**每流一实例**，待定缓冲是跨帧状态。 */
+    const dsmlFix = createDsmlMarkerNormalizer()
     let proseLoopDetected = false
     // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
     // 逐帧探测在跨帧时必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
@@ -1669,8 +1677,12 @@ export class TraeAdapter extends LlmAdapter {
                       // 跨帧必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
                       // 改为收尾无条件调用 `splitThinkTaggedContent`。
                       if (!proseLoopDetected) {
-                        block.text += delta.content as string
-                        yield { type: 'text-delta', index: block.index, text: delta.content as string }
+                        // ⚠️ **先归一化再累积**（2026-10-13，见 sse.ts 注释）。
+                        const fixedDelta = dsmlFix.push(delta.content as string)
+                        block.text += fixedDelta
+                        if (fixedDelta.length > 0) {
+                          yield { type: 'text-delta', index: block.index, text: fixedDelta }
+                        }
                       }
                     }
                     if (delta.reasoning_content !== undefined) {
@@ -1893,6 +1905,17 @@ export class TraeAdapter extends LlmAdapter {
         },
       }
     }
+    // ── DSML 归一化收尾：下发待定缓冲 ──（与 openai-compat.ts / buddy 同款）
+    {
+      const tail = dsmlFix.flush()
+      if (tail.length > 0 && !proseLoopDetected) {
+        const tailBlock = blocks.find(candidate => candidate.kind === 'text')
+        if (tailBlock !== undefined) {
+          tailBlock.text += tail
+          yield { type: 'text-delta', index: tailBlock.index, text: tail }
+        }
+      }
+    }
     if (textBlock !== undefined) {
       // ── think 标签归位（见 `splitThinkTaggedContent`）──
       // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
@@ -1939,7 +1962,8 @@ export class TraeAdapter extends LlmAdapter {
         ? textOut.slice(0, proseLoopGuard.cutAt)
         : textOut
       // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
-      const cleaned = stripCourseLeakIfEnabled(truncated)
+      // ⚠️ DSML 归一化**整串兜底**（幂等，与 openai-compat.ts 同款）。
+      const cleaned = fixDsmlMarkers(stripCourseLeakIfEnabled(truncated))
       // ⚠️ 归位后正文可能为空串 —— 空块会污染会话，且 DSH 的
       // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
       if (cleaned !== '') {

@@ -122,6 +122,20 @@ export interface ProviderExpiryContext {
   /** 该凭据所属的**账号池条目 id**（写 `modelRateLimits` 用）。 */
   readonly accountId?: string
   /**
+   * 该凭据所属账号的 **`credentialRef`**（多账号余额查询用）。
+   *
+   * ⚠️ **与 `accountId` 不是一回事**，两者都要有：
+   * `accountId` 是池内条目 id（`zcode` 写 `modelRateLimits` 用），
+   * `credentialRef` 是凭据库里的 ref 名。**officeace 需要后者** ——
+   * 它的余额入口 `fetchSubscriptionSummary(staleHours, ref, …)` 只有传了 `ref`
+   * 才走**云侧直读**；不传会回落到果办客户端的**全局单一 cookie**（只反映
+   * 「当前登录在果办里的那一个账号」）⇒ 多账号下所有账号折算成同一个余额
+   * （实测两个账号都显示 6500），而聚合候选排序是**每账号**粒度 ⇒ 会选错人。
+   *
+   * ⚠️ 其余家忽略本字段（与 `catalogIds` 同一模式：可选能力由实现自己声明）。
+   */
+  readonly credentialRef?: string
+  /**
    * 该渠道的**全部目录模型 id**（惰性求值 —— 只有真的调它才会读目录）。
    *
    * ⚠️ **必须是函数**：另外 6 家的实现**完全不碰它**，若传一个已求值的数组，
@@ -402,8 +416,8 @@ export interface ProviderRuntime {
    * ⚠️ **不要用 `accountTest` 论证「没有入口」**：本段原话是「客户端能力表
    * `accountTest` 目前**只有 `gemini`**，其余渠道根本没有入口」——**该推论是错的**。
    * 重测 / 重置按钮由 `supportsRateLimit` 门控（缺省 **true**），只有登记了
-   * `rateLimit: false` 的家（loomy / gemini）才真的没有入口 ⇒ **漏登记的家会
-   * 渲染按钮、用户一点就报错**（`opencode` 与 `minimax` 都踩过；后者是
+   * `rateLimit: false` 的家（loomy / gemini / officeace / accio，理由各不同）才真的没有入口
+   * ⇒ **漏登记的家会渲染按钮、用户一点就报错**（`opencode` 与 `minimax` 都踩过；后者是
    * issue IKJW32 接上换号后才补上的）。⇒ 本域的注册**是用户可见功能**，
    * 不是「将来才复发」的内部契约。
    */

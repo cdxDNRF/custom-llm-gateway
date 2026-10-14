@@ -90,7 +90,8 @@ export interface ProviderDescriptor {
   /** 图标容器的 CSS 类名（`jet-hub-styles.js` 里按它上样式）。 */
   readonly logoClass: string
   // ⚠️ **刻意没有 `icon` 字段**：图标是几百到几万字符的 base64 / SVG data URI
-  //    （15 条合计约 40 KB），而**宿主侧从不使用它们**。放进 registry 会让
+  //    （合计约 44 KB，条数随 provider 增删而变、不在此写死），而**宿主侧从不
+  //    使用它们**。放进 registry 会让
   //    `lib/index.js` 白白背上这份体积。图标改由客户端 `PROVIDER_ICONS` 持有
   //    （见 `plugin-src/client/provider-icons.js`），并由一条单测锁「两边 id 集合相等」——
   //    「新增 provider 忘记加图标」仍会**变红**，只是大字符串不进宿主产物。
@@ -332,6 +333,80 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    id: 'officeace',
+    label: 'OfficeAce',
+    displayName: 'OfficeAce',
+    logoClass: 'officeace',
+    // ⚠️ **有**积分余额：数据来自云侧 `GET /v1/subscription`（V11 签名直读，
+    //    与果办界面右上角同源同口径，2026-10-12 扣减实锤），**不依赖 OfficeAce 客户端**。
+    //
+    // ⚠️ `dailyCheckin: false` 但**该渠道确实有签到** —— 这里是**故意**不登记 true：
+    //    签到走的是云侧 `POST /v1/subscription/bonus/claim`，且果办客户端的实现是
+    //    「订阅页一挂载就自动领、**UI 上没有按钮**」（源码 `SubscriptionStateProvider`
+    //    用「年+月+日+时」去重，每小时最多一次）。
+    //    故本渠道的签到在**拉余额时自动完成**（见 `officeace-auth.ts` 的
+    //    `maybeClaimBonus`）—— 登记成 true 会让面板渲染一个手动签到按钮，
+    //    而它背后的 `credits.claim` RPC 对本渠道没有意义（真正的领取是自动的）。
+    //    ⚠️ 语义：该字段表达「是否存在**手动**签到入口」，不是「有没有签到收益」。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ 余额响应里每个积分包都带到期时间（订阅套餐包无固定到期 = 永久桶，
+    //    签到 / 活动包有明确到期）⇒ 可按 `deductionEndTime` 分「永久 / 长期 / 临期」三档。
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    // ⚠️ `rateLimit: false` 的**真实理由**（2026-10-13 合并审计实测订正）：
+    //    本适配器**根本不写** `modelRateLimits`（`officeace-adapter.ts` 里
+    //    `modelRateLimits` / `updateModelRateLimit` / `markLimited` **零命中**，
+    //    `provider-runtime-wiring.spec.ts` 也把它登记为空数组）⇒
+    //    账号永远没有标记可清 ⇒ 两个按钮点下去**零请求、零清除**（恒惰性）。
+    //    ⚠️ 此前这里写的是「它确实会回 429、适配器也写 `modelRateLimits`，
+    //    但限流由华为云 MaaS 侧按账号配额管理」——**那句失实**（前半个分句是错的），
+    //    真实判据与 accio 同因（「根本没有这组按钮的作用对象」），
+    //    与 loomy / gemini 的「会写但清不掉」**不是同一回事**。
+    rateLimit: false,
+    settingsNamespace: 'llm-officeace',
+    channel: true,
+  },
+  {
+    id: 'accio',
+    label: 'Accio (阿里)',
+    displayName: 'Accio (阿里)',
+    logoClass: 'accio',
+    // ⚠️ 如实登记：Accio **没有签到端点** —— 每日 200 积分由**登录**触发服务端
+    //    发放（`DAILY_REWARD`，24h 有效、不累积），没有可调用的签到 API。
+    //    故 `dailyCheckin` 显式写 false（省略与 false 行为一致，但显式写让
+    //    「想过这件事」在代码里可见）。
+    //    ⚠️ **面板里也没有「刷新每日额度」入口**（2026-10-13 修订）：早先这里写过
+    //    「面板另有一个 accio 专属入口，本质是重新登录」，那条承诺**未兑现**。
+    //    重新登录**既有**账号需要宿主侧新增 RPC —— 现有的 `account.create` 每次都用
+    //    `${provider}-${shortId()}` 现造账号 id 与凭据 ref（`src/jet-hub-rpc.ts`），
+    //    拿它当重登录用会多出一条幽灵账号、而原账号额度一点没刷新；账号的 `region`
+    //    也没下发给客户端；`login.poll` 对已登录账号第一秒就返回 `done: true`。
+    //    ⇒ **该入口尚未实现**，客户端只做诚实展示（三类积分桶 + 重置倒计时 +
+    //    「删除该账号后重新登录」这条手动路径），不渲染任何点不动的控件。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ `rateLimit: false` —— 这里的判据是 registry 自己的落地问法：
+    //    「这个按钮点下去，能不能让用户**少**受限一次？」答否即 false。
+    //    accio 两条都不满足：
+    //    ① 适配器**不写** `modelRateLimits`（`provider-runtime-wiring.spec.ts`
+    //       的 `WRITE_SITE_FILES` 把它登记为空，并由一条用例**验证**它确实无写点）
+    //       ⇒ 账号永远没有标记可清；
+    //    ② `src/index.ts` 的 `probeById` 没有它的条目（该表被守卫锁成**恰好**
+    //       「会写标记的家」）⇒ 点「重测」时 `retestAccount` 走到
+    //       `modelIds.length === 0` 处**提前返回**：零请求、零清除。
+    //    两者叠加 ⇒ 面板级的「重测所有 / 重置所有」与卡片级的两个按钮**全部恒为
+    //    惰性**。那正是本仓库记录过的报障形态（「按钮响应这么快，是不是坏了」）。
+    //    ⚠️ 与 loomy / gemini **理由不同**（它们是真会限流、只是按钮管辖不到）：
+    //    accio 是**根本没有这组按钮的作用对象**。
+    //    ⚠️ 「省略 = true 以免老用户失去按钮」那条理由**不适用于全新 provider**：
+    //    accio 没有存量用户，没有「功能回退」可言。
+    //    ⇒ 将来接上请求级换号 + 冷却（届时必须同时进 `probeById` 与
+    //    `WRITES_RATE_LIMIT_PROVIDERS`）时，**本行要一起改回 true**。
+    rateLimit: false,
+    settingsNamespace: 'llm-accio',
+    channel: true,
+  },
+  {
     id: 'aggregate',
     label: '聚合 (跨渠道)',
     displayName: '聚合 (跨渠道)',
@@ -361,8 +436,8 @@ export function creditCapabilitiesOf(): Record<string, CreditsCapability> {
   const out: Record<string, CreditsCapability> = {}
   for (const d of PROVIDER_REGISTRY) {
     // ⚠️ **每一条都要 `Object.freeze`**（2026-10-08 复审修复）：重构前
-    // `credits-capabilities.js` 的 15 条字面量各自带 `Object.freeze({…})`，
-    // 改成派生时只保住了外层的 `Object.freeze(creditCapabilitiesOf())` ——
+    // `credits-capabilities.js` 是**逐条手写的字面量**、每条各自带
+    // `Object.freeze({…})`，改成派生时只保住了外层的 `Object.freeze(creditCapabilitiesOf())` ——
     // 那只冻结**外层容器**（键不可增删），**内层条目仍可被改写**。
     // 同一文件另外两张派生表（`RATE_LIMIT_CAPABILITIES` /
     // `ACCOUNT_TEST_CAPABILITIES`）各自都留着 `Object.freeze({…})`，

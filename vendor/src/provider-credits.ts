@@ -34,6 +34,8 @@
  * - `zcode`：「企业版不下发额度数字」不是故障；
  * - `cline` / `loomy` / `raccoon`：协议原语自己带**具体**原因
  *  （含 HTTP 状态码与错误体摘要），压成笼统一句会丢掉唯一有用的线索。
+ * - `accio`：三条失败路径的**用户动作完全不同**（未登录 / 一般查询失败 /
+ *   响应里没有余额字段），而 `fetchAccioBalanceDetailed` 自己给得出这三句。
  *
  * 故这些渠道给 `fetchBalanceDetailed`，文案由实现自己负责。
  * **绝不允许把「查不到」写成 0**（0 是「已用光」的语义）。
@@ -67,6 +69,7 @@ import {
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
+import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
@@ -81,6 +84,7 @@ import {
 } from './credits.js'
 import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
+import type { AccioCredential } from './accio.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
 import type { LobsteraiCredential } from './lobsterai.js'
@@ -377,6 +381,24 @@ export function createProviderCredits(
        */
       claimUnavailableReason: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；'
         + '登录奖励请在「新手任务」中领取）',
+    },
+
+    /**
+     * Accio（阿里）：三个**只读**端点聚合出的带原因余额。
+     *
+     * ⚠️ **必须用 `fetchBalanceDetailed`**（不是 `fetchBalance`）：三类失败
+     * 的用户动作**完全不同** —— 未登录（去重新登录）/ 一般查询失败（查网络）/
+     * 响应里没有余额字段（上游形状变了）。压成共享骨架那句笼统的
+     * 「余额查询失败」会让用户按错误方向排查，而这三条文案是 Task 5 实测修来的。
+     *
+     * ⚠️ **刻意不提供 `claim`**：Accio **没有签到端点**（每日 200 积分由
+     *    **登录**触发服务端发放），故也**不给 `claimUnavailableReason`** ——
+     *    客户端按能力矩阵（`dailyCheckin: false`）根本不会渲染「一键领取积分」，
+     *    与 raccoon 同形。给它一句文案反而会让面板多出一个永远点不动的入口。
+     */
+    accio: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAccioBalanceDetailed(credential as AccioCredential),
     },
 
     /**

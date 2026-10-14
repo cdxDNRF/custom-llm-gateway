@@ -781,6 +781,30 @@ export class AggregateAdapter extends LlmAdapter {
     'gemini',
     'zcode',
     'opencode',
+    // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
+    // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
+    // ⚠️⚠️ **但它目前仍被第二道闸门挡着**（2026-10-13 合并审计实测）：
+    //    `WIRED_EXPIRY_PROVIDERS` **不含** officeace ⇒ 本文件 4 处过滤会把它
+    //    从**候选表**里剔掉（模型层归并了也没用）。
+    //    与 accio 不同，officeace **有**逐包到期口径（`jet-hub-rpc.ts` 把
+    //    `group.expiresAt` 归一化成 `deductionEndTime`，与 buddy 系同形）
+    //    ⇒ 它是**可接而未接**。接它需要：给 `provider-expiry.ts` 加一条
+    //    `officeaceExpiry`（可复用 `sharedPackageExpiry`）+ 进白名单
+    //    （`expiry-runtime-parity.spec.ts` 锁两者一致，必须同改）。
+    //    ⚠️ 本轮**刻意只接了 accio**（用户明确要求的是 accio）；officeace 的
+    //    接入**未做**，此注释如实登记这个缺口，不要读成「它已经能进聚合了」。
+    'officeace',
+    // ⚠️⚠️ accio（阿里 Accio Work，2026-10-13）—— 两件事**都要**做，缺一即静默：
+    //    ① 加进本数组（进聚合目录）；
+    //    ② 加进 `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`（进**候选表**）。
+    //
+    //    ⚠️ **只做 ① 是无效接线**（2026-10-13 合并审计实测）：决定候选可见性的
+    //    是 `WIRED_EXPIRY_PROVIDERS` —— 本文件有 4 处按它过滤（探测/候选/虚拟模型/
+    //    价格）。当时 accio 的 `PRIMARY_CHANNEL` 与 `CANONICAL_OVERRIDES` 都配对了
+    //    （`canonicalKeyFor` 返回 `via: 'patch'` ⇒ 归并到 `qwen3-8-flash`），
+    //    但候选层被那道闸门剔掉 ⇒ **用户要的「轮换列表里要有 accio」并没有实现**，
+    //    且症状静默（无报错、无日志）。现两处都补齐。
+    'accio',
   ])
 
   /**

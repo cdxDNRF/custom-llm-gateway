@@ -198,6 +198,18 @@ export interface RpcCreateAccountRequest {
    * 行为必须逐字节不变。
    */
   zcodeProvider?: 'bigmodel' | 'zai'
+  /**
+   * 登录区域（**仅 Accio 需要**）。
+   *
+   * ⚠️ **gateway 与区域无关**（`phoenix-gw.alibaba.com` 两个区域同一个），
+   * 区域只决定**登录页域名**（`'cn'` → `www.accio-ai.com`，
+   * `'global'` → `zh.accio.com`）。它会被写进凭据并随续期保留。
+   *
+   * ⚠️ 来自**客户端自报**的 RPC 载荷（无 schema 校验）⇒ 必须过
+   * `normalizeAccioRegion` 白名单，未登记值回落 `'cn'`（与 `zcodeProvider`
+   * 同因，issue IKJLK3 E2）。
+   */
+  accioRegion?: 'cn' | 'global'
 }
 export interface RpcCreateAccountResponse {
   accountId: string
@@ -238,6 +250,25 @@ export interface RpcPollLoginRequest {
   accountId: string
   provider: string
 }
+/**
+ * RPC: 轮询登录进度（`login.poll`）。
+ *
+ * ## 三态 —— ⚠️ 必须按 `done` **与** `success` 两个字段判
+ *
+ * | 形态 | 含义 |
+ * |---|---|
+ * | `{done:false}` | 进行中：用户还没完成授权（**正常**中间态） |
+ * | `{done:true, success:true}` | 成功：凭据已落盘、账号池已回填 |
+ * | `{done:true, success:false, error}` | **终态失败**：`error` 是可直接展示给用户的原因 |
+ *
+ * ⚠️⚠️ **客户端判据必须写成「先判 `success === false`，再判 `done`」**，
+ * 不要写成「在 `done:true` 分支里判 `success`」——
+ * Gitee issue IKLI7J 的根因就是前端只判 `done`：
+ * 后端早已把失败原因放进 `error`，而 `if (!pollRes?.done) return;` 把它整体丢掉，
+ * 于是**任何 provider 的登录失败都变成静默转圈 5 分钟**（5 分钟是客户端自己的
+ * 轮询上限，不是服务端超时），用户无法区分网络问题 / 账号未开通服务 / 自己关掉了
+ * 弹窗 / 插件 bug。判据对 `done` 的取值保持不敏感，也让这个契约将来能演进。
+ */
 export interface RpcPollLoginResponse {
   done: boolean
   success?: boolean

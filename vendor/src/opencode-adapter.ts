@@ -433,10 +433,31 @@ export class OpencodeAdapter extends LlmAdapter {
           this.options.warn?.(
             `opencode: 免费通道被 FreeTierError 拒绝 —— 检查 session id 形状（应为 ses_ + 12hex + 14base62）：${info.detail}`,
           )
+          // ⚠️⚠️ **错误码绝不能取 `AUTH`**（真实缺陷，Gitee issue IKLBSH 归位）。
+          //
+          // `AUTH` 会让 DSH 客户端**丢弃本条 message、换成固定文案「API 密钥无效」**
+          //（`dsh-client-ui-chat/lib/client.js` 的 `failureMessage`；判据与
+          // `buddy-adapter.ts` 的 `contentRejectionError` 注释同源）。而本条文案
+          // 恰好是**唯一**能指路的那句 —— 它说的是「根因是 session id **形状**、
+          // 换 key 或换出口都无效」。换成「API 密钥无效」后用户会去换 key / 重新登录，
+          // 全是无效动作，而**真实报文（`info.detail`）也一并消失**。
+          //
+          // 库内实测取证（866 个会话，`scripts/tmp-scan-iklbsh.mjs`）：两条真实
+          // `turn/end` 失败事件的 code 就是 `AUTH`，message 正是本函数写的那句
+          // `opencode: HTTP 403 — {"type":"error","error":{"type":"FreeTierError",…}}`
+          // —— 即本条缺陷**在真实流量上发生过**（会话
+          // `session-d7c80d34`，2026-10-02）。
+          //
+          // 取下 `PERMISSION_DENIED`：① 客户端不替换它，文案完整送达；
+          // ② `dead-model-store` 的 `IGNORED_CODES` 收它，模型**不会**被误记成
+          //    下架 30 天（`AUTH` 也在该集合里，这一条两侧等价）；
+          // ③ 它不在 `DEFAULT_RETRYABLE_CODES` 里 ⇒ 仍是「确定性、不白退避」，
+          //    与本分支「不重试也不换槽」的设计一致。
+          // 与 `buddy` 的 11140（同样从 `AUTH` 改成 `PERMISSION_DENIED`）同款裁决。
           throw new LlmError(
             `opencode: 免费通道被上游拒绝（FreeTierError）。`
             + '该错误由请求形状触发（session id 形状不对时出现），换 API key 或换出口都无效。',
-            'AUTH',
+            'PERMISSION_DENIED',
             { status: 403 },
           )
         }

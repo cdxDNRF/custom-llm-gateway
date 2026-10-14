@@ -32,18 +32,9 @@ export const GEMINI_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
 export const GEMINI_USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v2/userinfo'
 export const GEMINI_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke'
 
-/**
- * 上游 Cloud Code 客户端的 client 凭据（env 可覆盖，用于自建凭据的场景）。
- *
- * ⚠️ **本地已清空字面量**（2026-10-13）。上游在此硬编码了 Google OAuth 的
- * client id/secret，虽然是开源 CLI 自带的公开值，但会被 GitHub Push Protection
- * 判定为泄露并**拒绝整个推送**（GH013）。与 loomy 的 AccessKey 同一处理方式：
- * 清空字面量，由环境变量在运行时注入。
- *
- * 需要 Gemini 时设置：`CMDC_PAK_GOOGLE_CLIENT_ID` / `CMDC_PAK_GOOGLE_CLIENT_SECRET`
- * （覆盖逻辑见下方 `resolveClientId` / `resolveClientSecret`）。
- */
-export const GEMINI_DEFAULT_CLIENT_ID = ''
+/** 上游 Cloud Code 客户端的公开 client（env 可覆盖，用于自建凭据的场景）。 */
+export const GEMINI_DEFAULT_CLIENT_ID =
+  ''
 export const GEMINI_DEFAULT_CLIENT_SECRET = ''
 
 /** 回调路径（与 client 注册值逐字一致，改了就 redirect_uri_mismatch）。 */

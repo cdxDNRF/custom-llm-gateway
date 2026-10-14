@@ -71,8 +71,10 @@ import type { ContentBlock, FinishReason, GenerateOptions, Message, StreamChunk,
 import { DEFAULT_IMAGE_LIMITS, type AttachmentBridge, type ImageLimits } from './images.js'
 import {
   OpenAiGatewayError,
+  GATEWAY_SOURCE_KIND,
   convertTools,
   createGatewayMessage,
+  gatewayToolResultBlock,
   parseModelRoute,
   partsFromContent,
   textFromContent,
@@ -423,11 +425,15 @@ async function toMessages(
   limits: ImageLimits,
 ): Promise<Message[]> {
   const messages: Message[] = []
-  const pushAssistant = (blocks: ContentBlock[]): void => {
+  const pushAssistant = (blocks: readonly ContentBlock[]): void => {
     if (blocks.length === 0) return
     const last = messages[messages.length - 1]
     if (last !== undefined && last.role === 'assistant') {
-      last.content.push(...blocks)
+      // ⚠️ 0.2.0 起 `Message.content` 是 **readonly**，不能再 `last.content.push(...)`。
+      // 改为**整体替换**那条 assistant 消息，并**保留原 id / source** ——
+      // 语义与升级前逐字节等价（仍是「把连续 assistant 的内容块合并进同一条
+      // 消息」，位置不变），且不会引入新的消息身份。
+      messages[messages.length - 1] = { ...last, content: [...last.content, ...blocks] }
       return
     }
     messages.push(createGatewayMessage('assistant', blocks, assistantItemSource(provider, model)))
@@ -464,9 +470,7 @@ async function toMessages(
         messages.push(createGatewayMessage('system', [{
           type: 'text',
           text: rewriteTencentContentFingerprints(textFromContent(content), provider),
-        }], {
-          kind: 'plugin', plugin: 'dsh-openai-gateway',
-        }))
+        }], { kind: GATEWAY_SOURCE_KIND }))
         continue
       }
       throw new OpenAiGatewayError(`unsupported message role: ${String(raw.role)}`)
@@ -496,11 +500,9 @@ async function toMessages(
     if (type === 'function_call_output') {
       const callId = nonEmptyString(raw.call_id)
       if (callId === undefined) throw new OpenAiGatewayError('function_call_output requires call_id')
-      messages.push(createGatewayMessage('user', [{
-        type: 'tool-result',
-        toolCallId: callId as never,
-        content: await outputParts(raw.output, bridge, limits),
-      }], { kind: 'tool', callId: callId as never }))
+      messages.push(createGatewayMessage('user', [
+        gatewayToolResultBlock(callId, await outputParts(raw.output, bridge, limits)),
+      ], { kind: 'tool', callId: callId as never }))
       continue
     }
     if (type === 'reasoning') {
@@ -609,9 +611,7 @@ export async function toResponsesGenerateOptions(
     messages.push(createGatewayMessage('system', [{
       type: 'text',
       text: rewriteTencentContentFingerprints(body.instructions, provider),
-    }], {
-      kind: 'plugin', plugin: 'dsh-openai-gateway',
-    }))
+    }], { kind: GATEWAY_SOURCE_KIND }))
   }
   messages.push(...await toMessages(body.input, provider, model, images.bridge, limits))
 
