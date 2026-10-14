@@ -9,6 +9,7 @@
  *   - zcode：适配器无注入 mintCaptcha 时自建常驻浏览器（约 200MB）；需 ZCODE_CHROME_PATH
  */
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
@@ -1021,5 +1022,162 @@ export async function createOpencodeProvider(
     refreshAll: async () => {
       // 匿名通道无可续期凭据；真实 API Key 亦无续期端点。空实现。
     },
+  })
+}
+
+// ─────────────────────────── Accio（阿里） ───────────────────────────
+
+/**
+ * Accio（阿里）—— PKCE 授权码登录 + 免签名推理。
+ *
+ * ⚠️ **新接入、未充分实测**（上游 2026-10-13 才合并）。默认 `enabled: false`。
+ *
+ * 与其它家的差异：
+ *   1. OAuth PKCE：`startLogin` 返回授权页 URL，本地回调服务器接 code 换令牌；
+ *   2. 区域：`'cn'`（www.accio-ai.com）/ `'global'`（zh.accio.com），
+ *      只影响**登录页域名**，推理 gateway 两区域相同；
+ *   3. `utdid`：设备标识。上游**不校验**（实测自造值同样 200），
+ *      有 `~/.accio/utdid` 时用真值，否则用适配器的进程内兜底值。
+ */
+export async function createAccioProvider(
+  dataDir: string,
+  logLevel?: 'debug' | 'info' | 'warn' | 'error',
+): Promise<Provider> {
+  const { gateway, pool } = await makeBase('accio', dataDir, logLevel)
+  const { AccioAuth, ACCIO_CREDENTIAL_REF } = await import('../../vendor/src/accio-auth.js')
+  const { AccioAdapter } = await import('../../vendor/src/accio-adapter.js')
+  const { ACCIO } = await import('../../vendor/src/accio-product.js')
+  const { fetchAccioQuota } = await import('../../vendor/src/accio-credits.js')
+
+  const auth = new AccioAuth(gateway.ctx as never)
+
+  /** 读 `~/.accio/utdid`（有则用真值，无则由适配器用兜底值）。 */
+  const readUtdid = (): string | undefined => {
+    try {
+      const value = readFileSync(resolve(homedir(), '.accio', 'utdid'), 'utf8').trim()
+      return value.length > 0 ? value : undefined
+    } catch {
+      return undefined
+    }
+  }
+  const utdid = readUtdid()
+
+  const adapter = new AccioAdapter({
+    resolveCredential: async (modelId?: string) => {
+      const available = await pool.getAvailableAccount('accio', modelId ?? '')
+      if (available) return available.credential as never
+      const raw = gateway.credentials.get(ACCIO_CREDENTIAL_REF)
+      try { return raw === undefined ? undefined : JSON.parse(raw) } catch { return undefined }
+    },
+    refresh: async () => {
+      // ⚠️ 按**账号池里的 ref** 续期（与 qoder/trae 同一教训：默认 ref ≠ 池内 ref）。
+      const available = await pool.getAvailableAccount('accio', '')
+      if (available) {
+        await auth.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
+      } else {
+        await auth.refreshAll(pool)
+      }
+    },
+    accountPool: pool,
+    product: ACCIO,
+    ...(utdid !== undefined ? { utdid } : {}),
+  }) as LlmAdapter
+
+  return new GenericImpl({
+    id: 'accio',
+    displayName: 'Accio (阿里)',
+    capabilities: {
+      login: true, dailyCheckin: false, balance: true,
+      permanentLock: false, multiAccount: true, refresh: true,
+    },
+    adapter, pool, gateway,
+    loginImpl: async () => {
+      const id = `accio-${shortId()}`
+      const refName = `ACCIO_ACCOUNT_${shortId().toUpperCase()}`
+      await pool.addAccount({
+        id, provider: 'accio', nickname: id, enabled: true,
+        credentialRef: refName, refreshable: false, createdAt: Date.now(),
+      })
+      const started = await auth.startLogin({ pool, accountId: id, refName })
+      started.result.then(async () => {
+        await pool.updateAccount(id, { refreshable: true, nickname: `Accio ${id.slice(-6)}` })
+        gateway.logger.info(`账号 ${id} 登录成功`)
+      }).catch(async (e) => {
+        // ⚠️ 失败删占位条目，否则留下「永远登录不成的幽灵账号」。
+        await pool.removeAccount(id).catch(() => {})
+        gateway.logger.warn(`账号 ${id} 登录失败:`, e)
+      })
+      return { loginUrl: started.loginUrl, accountId: id, completed: Promise.resolve({ ok: true }) }
+    },
+    refreshAll: async () => { await auth.refreshAll(pool) },
+    // ⚠️ `AccioQuota` 只有 `usagePercent` / `refreshCountdownSeconds`，
+    //    **没有总额字段**（与其它家的积分桶不同）⇒ 本家不提供余额读数。
+  })
+}
+
+// ─────────────────────────── OfficeAce（果办） ───────────────────────────
+
+/**
+ * OfficeAce（果办）—— 华为 MaaS 云端直连。
+ *
+ * ⚠️ **新接入、未充分实测**。默认 `enabled: false`。
+ *
+ * 与其它家的差异：
+ *   1. **无独立登录 UI**：凭据从果办客户端自己的会话文件读
+ *      （`~/.dsh-officeace/session.json`，由上游 `officeace-auth.ts` 维护）。
+ *      即「先在果办客户端登录过，本 provider 才可用」；
+ *   2. **多模态**：部分模型支持图片输入（实测表在 `OFFICEACE_MODELS`）；
+ *   3. **签到**：上游 auth 模块**不导出**签到函数（签到在 DSH 插件的 RPC 层），
+ *      故本网关如实返回 `unavailable`，不假装成功。
+ */
+export async function createOfficeAceProvider(
+  dataDir: string,
+  logLevel?: 'debug' | 'info' | 'warn' | 'error',
+): Promise<Provider> {
+  const { gateway, pool } = await makeBase('officeace', dataDir, logLevel)
+  const { OfficeAceAdapter } = await import('../../vendor/src/officeace-adapter.js')
+  const { readStoredCredential, refreshStoredCredential } = await import('../../vendor/src/officeace-auth.js')
+
+  const adapter = new OfficeAceAdapter({
+    // ⚠️ 每次现读（不缓存）：用户可能刚在果办客户端登录，缓存会让新凭据迟迟不生效。
+    credentialProvider: async () => readStoredCredential(),
+    // ⚠️ 续期**必须注入**（上游注释明确）：漏接的症状是账号永不过期、
+    //    重新登录后旧凭据仍被沿用，且日志里一个字都没有。
+    refresh: async () => { await refreshStoredCredential() },
+    disabledModels: () => new Set(),
+  }) as LlmAdapter
+
+  return new GenericImpl({
+    id: 'officeace',
+    displayName: 'OfficeAce (果办)',
+    capabilities: {
+      login: true, dailyCheckin: false, balance: false,
+      permanentLock: false, multiAccount: false, refresh: true,
+    },
+    adapter, pool, gateway,
+    loginImpl: async () => {
+      // 无独立授权流程：凭据来自果办客户端会话文件。这里只登记一条账号条目。
+      const existing = readStoredCredential()
+      if (existing === undefined) {
+        throw new Error(
+          'OfficeAce 无独立登录：请先在果办客户端登录一次'
+          + '（凭据由客户端写入 ~/.dsh-officeace/session.json），然后回本页点「刷新」。',
+        )
+      }
+      const id = 'officeace-default'
+      const accounts = await pool.listAccounts('officeace')
+      if (!accounts.some((a) => a.id === id)) {
+        await pool.addAccount({
+          id, provider: 'officeace', nickname: '果办客户端会话', enabled: true,
+          credentialRef: 'OFFICEACE_DEFAULT', refreshable: true, createdAt: Date.now(),
+        })
+      }
+      return { loginUrl: '', accountId: id, completed: Promise.resolve({ ok: true }) }
+    },
+    refreshAll: async () => { await refreshStoredCredential() },
+    checkin: async () => ({
+      ok: false, status: 'unavailable',
+      message: 'OfficeAce 签到由 DSH 插件侧执行，本网关不提供',
+    } as never),
   })
 }

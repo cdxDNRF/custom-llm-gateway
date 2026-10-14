@@ -32,6 +32,8 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   { id: 'zcode',      displayName: 'ZCode (智谱)',          defaultPort: 3912, defaultEnabled: false, note: '每次请求需浏览器产 captcha；需设 ZCODE_CHROME_PATH' },
   { id: 'gemini',     displayName: 'Gemini (Google)',       defaultPort: 3913, defaultEnabled: false, note: 'OAuth 登录；需设 CMDC_PAK_GOOGLE_CLIENT_ID/SECRET' },
   { id: 'opencode',   displayName: 'OpenCode (Zen)',         defaultPort: 3914, defaultEnabled: true,  note: '匿名通道免登录；有 7 个免费模型，按账号可配代理出口' },
+  { id: 'accio',      displayName: 'Accio (阿里)',           defaultPort: 3915, defaultEnabled: false, note: 'PKCE 登录 + 免签名推理（未测试稳定性）' },
+  { id: 'officeace',  displayName: 'OfficeAce (果办)',       defaultPort: 3916, defaultEnabled: false, note: '多模态 + 自动领每日签到福利（未测试稳定性）' },
 ]
 
 export function catalogEntry(id: string): ProviderCatalogEntry | undefined {
