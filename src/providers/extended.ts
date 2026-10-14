@@ -791,6 +791,25 @@ export async function createGeminiProvider(
   logLevel?: 'debug' | 'info' | 'warn' | 'error',
 ): Promise<Provider> {
   const { gateway, pool } = await makeBase('gemini', dataDir, logLevel)
+
+  // ⚠️ **必须在任何请求之前**装好按 host 分流的路由器：Gemini 的推理请求用的是
+  //    裸全局 `fetch`（适配器里没有 fetch 注入点），只能从全局 dispatcher 下手。
+  //    真实故障（2026-10-14）：关掉 TUN 后 Gemini 全部无响应 —— Google 域名在此
+  //    网络环境不可直连，必须走代理；而其余 15 家直连更快，故只对 Google 域名分流。
+  {
+    const { installGeminiProxyRouting } = await import('../core/gemini-proxy.js')
+    const proxyUrl = installGeminiProxyRouting(dataDir)
+    if (proxyUrl === undefined) {
+      gateway.logger.warn(
+        'Gemini 未配置代理出口：若无法直连 Google（常见于国内网络），请求会超时。'
+        + `请设置环境变量 GATEWAY_GEMINI_PROXY=http://127.0.0.1:7897，`
+        + `或在 ${resolve(dataDir, 'gemini.env')} 写一行 PROXY=http://127.0.0.1:7897。`,
+      )
+    } else {
+      gateway.logger.info(`Gemini 出口已配置：仅 Google 域名经 ${proxyUrl}，其余直连`)
+    }
+  }
+
   const { GeminiAuth } = await import('../../vendor/src/gemini-auth.js')
   const { GeminiAdapter } = await import('../../vendor/src/gemini-adapter.js')
   const { GEMINI } = await import('../../vendor/src/gemini.js')
