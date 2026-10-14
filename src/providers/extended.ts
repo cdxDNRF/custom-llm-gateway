@@ -728,6 +728,63 @@ export async function createZcodeProvider(
  *   - 需要先探测 project 号（`loadCodeAssist`），适配器内部已处理并有跨请求缓存。
  *   - 无每日签到；额度查询走 `retrieveUserQuotaSummary`。
  */
+/**
+ * 把 Gemini 的 Google OAuth 凭据注入**进程环境变量**。
+ *
+ * ## 为什么需要（真实故障，2026-10-14 用户报障）
+ *
+ * 上游 `gemini-oauth.ts` 原本硬编码了 `GEMINI_DEFAULT_CLIENT_ID/SECRET`，但那是
+ * **GitHub Push Protection 会拦下的密钥**（GH013：Google OAuth Client ID +
+ * Secret），会让整个仓库推不上去。故本仓库同步 vendor 时把它清成了空串
+ * （见 `scripts/sync-vendor.sh` 的 ④c 步）。
+ *
+ * 清空的后果：授权 URL 拼出 `client_id=`（空），Google 直接回
+ * **`Missing required parameter: client_id`** —— 登录页打不开。
+ * 而 DSH 插件侧用的是未清空的版本，所以插件能登录、网关不能（现象即用户截图）。
+ *
+ * ## 做法：注入环境变量，而不是改 vendor
+ *
+ * `geminiClientId()` / `geminiClientSecret()` 本来就是**env 优先**的设计
+ * （`process.env.CMDC_PAK_GOOGLE_CLIENT_ID` → 兜底常量）。所以我们只需在
+ * 构造 Auth 之前把值写进 `process.env`，**vendor 一行都不用改** ——
+ * 与 loomy 的 AccessKey 同一套「凭据不进仓库」的思路。
+ *
+ * 取值顺序（先到先用）：
+ *  1. 已存在的环境变量（用户自己设的，不动它）
+ *  2. `<数据目录>/gemini.env`（`KEY=VALUE` 行，未跟踪）
+ *
+ * 两处都没有时**不报错**：保持未配置状态，登录时 Google 会回一个明确错误；
+ * 而 provider 的其它能力（模型目录等）不受影响。
+ */
+async function loadGeminiOAuthCredentials(dataDir: string): Promise<{ configured: boolean }> {
+  if ((process.env.CMDC_PAK_GOOGLE_CLIENT_ID ?? '').trim().length > 0) {
+    return { configured: true }
+  }
+  const envPath = resolve(dataDir, 'gemini.env')
+  try {
+    const values = new Map<string, string>()
+    for (const line of readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed.length === 0 || trimmed.startsWith('#')) continue
+      const eq = trimmed.indexOf('=')
+      if (eq <= 0) continue
+      const key = trimmed.slice(0, eq).trim()
+      const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+      if (key.length > 0) values.set(key, value)
+    }
+    const id = values.get('CMDC_PAK_GOOGLE_CLIENT_ID') ?? ''
+    const secret = values.get('CMDC_PAK_GOOGLE_CLIENT_SECRET') ?? ''
+    if (id.length === 0 || secret.length === 0) return { configured: false }
+    // ⚠️ 写进 process.env 而不是传参：`geminiClientId()` 只认环境变量（vendor 设计）。
+    process.env.CMDC_PAK_GOOGLE_CLIENT_ID = id
+    process.env.CMDC_PAK_GOOGLE_CLIENT_SECRET = secret
+    return { configured: true }
+  } catch {
+    // 文件不存在 / 不可读：视为未配置（不阻断 provider 初始化）。
+    return { configured: false }
+  }
+}
+
 export async function createGeminiProvider(
   dataDir: string,
   logLevel?: 'debug' | 'info' | 'warn' | 'error',
@@ -736,6 +793,15 @@ export async function createGeminiProvider(
   const { GeminiAuth } = await import('../../vendor/src/gemini-auth.js')
   const { GeminiAdapter } = await import('../../vendor/src/gemini-adapter.js')
   const { GEMINI } = await import('../../vendor/src/gemini.js')
+  // ⚠️ 必须在构造 Auth **之前**注入：`geminiClientId()` 只认环境变量。
+  const { configured: geminiConfigured } = await loadGeminiOAuthCredentials(dataDir)
+  if (!geminiConfigured) {
+    gateway.logger.warn(
+      'Gemini 未配置 Google OAuth 凭据：登录会失败（Google 报 Missing required parameter: client_id）。'
+      + `请在 ${resolve(dataDir, 'gemini.env')} 写入 CMDC_PAK_GOOGLE_CLIENT_ID / CMDC_PAK_GOOGLE_CLIENT_SECRET 两行，`
+      + '或设置同名环境变量。',
+    )
+  }
   const auth = new GeminiAuth(gateway.ctx as never, { product: GEMINI })
 
   /**
@@ -782,6 +848,17 @@ export async function createGeminiProvider(
         credentialRef: refName, refreshable: false, createdAt: Date.now(),
       })
       try {
+        // ⚠️ 未配置 OAuth 凭据时**提前给出可行动的报错**。
+        //    否则会走完整个流程、由 Google 回一个 `Missing required parameter:
+        //    client_id` 页面，用户完全不知道要去改哪里（真实报障 2026-10-14）。
+        if (!geminiConfigured) {
+          await pool.removeAccount(id).catch(() => {})
+          throw new Error(
+            'Gemini 未配置 Google OAuth 凭据，无法发起授权。'
+            + `请在网关数据目录的 gemini.env 写入 CMDC_PAK_GOOGLE_CLIENT_ID 与 `
+            + 'CMDC_PAK_GOOGLE_CLIENT_SECRET 两行（可参考 DSH 插件的取值），然后重启网关。',
+          )
+        }
         // gemini.startLogin 不带 pool：result 是凭据本体，要自己 persist（同 raccoon）。
         const started = await auth.startLogin()
         started.result.then(async (credential) => {
