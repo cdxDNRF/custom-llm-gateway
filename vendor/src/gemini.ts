@@ -534,19 +534,46 @@ export function geminiCanonicalModelId(modelId: string): string {
  * **加第二个模型时必须先用 `modelId` 选 upstream** —— 否则表里两个模型会撞车
  * （用户选 A、实际跑 B），症状与上述宽容完全相同。
  */
-export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSpec {
-  if (geminiCanonicalModelId(modelId) !== GEMINI_UPSTREAM_FLASH) {
+export function geminiModelSpec(
+  modelId: string,
+  effort?: string,
+  /**
+   * **本仓库扩展（2026-10-15）**：允许的模型 id 集合。
+   *
+   * 缺省时退化为「只允许 `gemini-3.8-flash`」—— 与改动前逐字节一致，
+   * 故既有调用方零行为变化。
+   *
+   * 接线侧把远端目录（`fetchAvailableModels`）的 id 集合传进来，即可支持
+   * 账号真正可用的全部模型（实测 15 个，含 Claude 系列）。
+   */
+  allowedModels?: readonly { id: string; needsEffortSuffix?: boolean }[],
+): GeminiModelSpec {
+  const canonical = geminiCanonicalModelId(modelId)
+  const allowed = allowedModels === undefined || allowedModels.length === 0
+    ? [{ id: GEMINI_UPSTREAM_FLASH, needsEffortSuffix: true }]
+    : allowedModels
+  const allowedIds = allowed.map((m) => m.id)
+  if (!allowedIds.includes(canonical)) {
     throw new LlmError(
-      `gemini: 模型 "${modelId}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
+      `gemini: 模型 "${modelId}" 不在本 provider 目录中（当前可用：${allowedIds.join(', ')}）`,
       'INVALID_REQUEST',
       // ⚠️ `status` 只落在 `LlmError.failure`（不是顶层属性），且网关的
-      // `failureToOpenAiError` 两处都要读 —— 见 `openai-gateway/stream.ts`。
+      // `failureToOpenAiError` 两处都读 —— 见 `openai-gateway/stream.ts`。
       { status: 404 },
     )
   }
   const tier = geminiEffortToTier(effort)
+  // ⚠️ **upstream 必须用本模型的裸名**（不是恒为 GEMINI_UPSTREAM_FLASH）——
+  //    否则表里多个模型会撞车：用户选 A、实际跑 B，且没有任何征兆。
+  //
+  // ⚠️⚠️ **档位后缀按模型族决定，不能统一拼**（实测对照表见
+  //    `GeminiCatalogModel.needsEffortSuffix` 的注释）：
+  //    `gemini-3.8-flash` / `gpt-oss-120b` **必须**带后缀；
+  //    `claude-sonnet-4-6` / `gemini-3-flash` / `gemini-2.5-flash` 用**裸名**。
+  //    统一拼接会让后者全部 404（实测把 11 个可用模型误判成不可用）。
+  const needsSuffix = allowed.find((m) => m.id === canonical)?.needsEffortSuffix !== false
   return {
-    upstream: `${GEMINI_UPSTREAM_FLASH}-${tier}`,
+    upstream: needsSuffix ? `${canonical}-${tier}` : canonical,
     tier,
     thinkingBudget: geminiThinkingBudget(tier),
     includeThoughts: true,

@@ -363,11 +363,28 @@ function buildGenerationConfig(
   maxTokens: number | undefined,
   temperature: number | undefined,
 ): Record<string, unknown> {
-  const config: Record<string, unknown> = { maxOutputTokens: maxTokens ?? 64_000 }
+  // ⚠️⚠️ **`maxOutputTokens` 必须大于 `thinkingBudget`**（真实缺陷，2026-10-15）。
+  //
+  // 上游对**思考型**模型硬要求这一点：
+  //   · Claude 系直接 400：`` `max_tokens` must be greater than
+  //     `thinking.budget_tokens` ``（实测 `claude-sonnet-4-6` + max_tokens=2048
+  //     + budget=4000 → 400）；
+  //   · Gemini 系宽容（给小于预算的值也能跑），故旧代码一直没暴露这个约束
+  //     —— 那时表里只有 Gemini 3.8。
+  //
+  // 修法：客户端给的 `maxTokens` **小于等于**预算时，抬到「预算 + 余量」。
+  // 余量取 1024：够放正文，又不会把客户端刻意的小额度放大太多。
+  //
+  // ⚠️ 只有**思考型**（`thinkingBudget >= 0`）才需要抬；tiered 档不发预算，
+  //    保持客户端原值。
+  const budget = spec.thinkingBudget
+  const needsHeadroom = budget >= 0 && (maxTokens ?? 64_000) <= budget
+  const effectiveMax = needsHeadroom ? budget + 1024 : (maxTokens ?? 64_000)
+  const config: Record<string, unknown> = { maxOutputTokens: effectiveMax }
   // ⚠️ `includeThoughts` **恒 true**（「关闭思考」是假关：关掉照样思考照样计费）。
   const thinkingConfig: Record<string, unknown> = { includeThoughts: spec.includeThoughts }
   // ⚠️ tiered 档**只带 includeThoughts**，不发 thinkingBudget（预算交给上游自适应）。
-  if (spec.thinkingBudget >= 0) thinkingConfig.thinkingBudget = spec.thinkingBudget
+  if (budget >= 0) thinkingConfig.thinkingBudget = budget
   config.thinkingConfig = thinkingConfig
   if (temperature !== undefined) config.temperature = temperature
   return config

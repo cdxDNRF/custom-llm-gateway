@@ -115,6 +115,29 @@ if [ -f "$GEMINI_OAUTH" ]; then
   echo "   ✓ gemini-oauth.ts 的 Google OAuth 凭据已确认为空（真值走环境变量注入）"
 fi
 
+# ④d 本地补丁（功能扩展，勿删）：
+# 上游的 Gemini 模型表**硬编码 1 个模型**（用户拍板"不拉远端目录"），
+# 而实测账号真正可用 15 个（含 claude-sonnet-4-6 / claude-opus-4-6-thinking）。
+# 我们加了两处**增量**改动让它支持动态目录：
+#   · gemini-adapter: 新增 `modelsProvider` 选项（缺省仍走静态表，零行为变化）
+#   · gemini.ts: `geminiModelSpec` 新增第三参 `allowedModelIds`
+#     （缺省退化为"只允许 gemini-3.8-flash"，与改动前逐字节一致）
+# 补丁以文件形式维护（改一处要动多行，sed 不适用）。
+PATCH_FILE="$HERE/vendor-patches/gemini-dynamic-models.patch"
+if [ -f "$PATCH_FILE" ]; then
+  if git -C "$HERE" apply --check "$PATCH_FILE" 2>/dev/null; then
+    git -C "$HERE" apply "$PATCH_FILE"
+    echo "   ✓ 已应用 Gemini 动态模型目录补丁"
+  elif git -C "$HERE" apply --check --reverse "$PATCH_FILE" 2>/dev/null; then
+    echo "   ✓ Gemini 动态模型目录补丁已在（无需重复应用）"
+  else
+    echo "   ⚠️ Gemini 补丁无法应用（上游可能已改这些文件）。" >&2
+    echo "      请手工核对 vendor/src/gemini{,-adapter}.ts 后更新：" >&2
+    echo "      vendor-patches/gemini-dynamic-models.patch" >&2
+    echo "      补丁若确实过时，用 git diff 重新生成。" >&2
+  fi
+fi
+
 echo "⑤ 类型检查（自有代码）…"
 if [ ! -x ./node_modules/.bin/tsc ]; then
   echo "   跳过（未装 typescript）"

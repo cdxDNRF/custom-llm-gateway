@@ -257,6 +257,19 @@ export interface GeminiAdapterOptions {
   logger?: { warn(message: string): void }
   /** 产品配置；默认 {@link GEMINI}。 */
   product?: GeminiProduct
+  /**
+   * **动态模型表**（本仓库扩展，2026-10-15）。
+   *
+   * 缺省时退回静态表 `geminiFallbackEntries()`（只有 1 个模型）。
+   * 接线侧传入远端拉取的结果（`fetchAvailableModels`）即可暴露账号
+   * 真正可用的全部模型（实测 15 个，含 Claude 系列）。
+   *
+   * ⚠️ **必须同步返回数组**（同 `listAllModels` 的契约）：写成 `async` 会让
+   *    `[...all]` / `all.map` 抛 `TypeError: all is not iterable`。
+   * ⚠️ 返回空数组时**退回静态表**而不是暴露空目录 —— 否则一次拉取失败
+   *    会让用户看到"一个模型都没有"。
+   */
+  modelsProvider?: () => readonly GeminiModelEntry[]
 }
 
 /** Gemini（Cloud Code Assist）模型适配器。 */
@@ -297,6 +310,9 @@ export class GeminiAdapter extends LlmAdapter {
    * 「表被改过但进程还拿着旧值」这一种故障。
    */
   private loadModels(): readonly GeminiModelEntry[] {
+    // ⚠️ 动态表优先；为空则回退静态表（拉取失败不该让目录变空）。
+    const dynamic = this.options.modelsProvider?.()
+    if (dynamic !== undefined && dynamic.length > 0) return dynamic
     return geminiFallbackEntries()
   }
 
@@ -499,7 +515,16 @@ export class GeminiAdapter extends LlmAdapter {
       && declared?.efforts.some((item) => String(item.id) === requested) === true
       ? requested
       : undefined
-    const spec = geminiModelSpec(options.model, effort)
+    // ⚠️ 传入**当前动态表的 id 集合**：缺省时 `geminiModelSpec` 会退化为
+    //    「只允许 gemini-3.8-flash」，多模型就永远通不过门控。
+    const spec = geminiModelSpec(
+      options.model,
+      effort,
+      this.loadModels().map((entry) => ({
+        id: entry.id,
+        needsEffortSuffix: entry.needsEffortSuffix,
+      })),
+    )
 
     /**
      * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。

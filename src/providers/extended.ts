@@ -11,6 +11,7 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
+import type { GeminiCatalogModel } from '../core/gemini-catalog.js'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from '../../vendor/src/account-pool.js'
@@ -135,6 +136,7 @@ class GenericImpl extends GenericProviderBase implements Provider {
   readonly gateway: GatewayContext
   readonly loginImpl: (nickname?: string) => Promise<LoginStart>
   readonly submitLoginImpl: ((input: LoginSubmit) => Promise<{ ok: boolean; error?: string }>) | undefined
+  readonly refreshModelsImpl: (() => Promise<{ count: number }>) | undefined
 
   constructor(init: {
     id: string
@@ -146,6 +148,14 @@ class GenericImpl extends GenericProviderBase implements Provider {
     loginImpl: (nickname?: string) => Promise<LoginStart>
     /** 「填文本」型登录的提交回调（见 LoginStart.input）。 */
     submitLoginImpl?: (input: LoginSubmit) => Promise<{ ok: boolean; error?: string }>
+    /**
+     * 「重拉模型目录」的专用实现。
+     *
+     * 缺省走通用 `refreshModelsCommon`（清缓存 + 重新 listModels）。
+     * 动态目录的 provider（如 Gemini —— 表来自远端拉取 + 可用性探测）
+     * 需要自己的实现，通用路径对它无事可做。
+     */
+    refreshModelsImpl?: () => Promise<{ count: number }>
     refreshAll: () => Promise<void>
     queryBalance?: () => Promise<BalanceView | undefined>
     checkin?: () => Promise<CheckinResult>
@@ -160,6 +170,13 @@ class GenericImpl extends GenericProviderBase implements Provider {
     this.gateway = init.gateway
     this.loginImpl = init.loginImpl
     this.submitLoginImpl = init.submitLoginImpl
+    this.refreshModelsImpl = init.refreshModelsImpl
+  }
+
+  /** 「重拉模型目录」：有专用实现走它，否则退回通用路径。 */
+  async refreshModels(): Promise<{ count: number }> {
+    if (this.refreshModelsImpl !== undefined) return this.refreshModelsImpl()
+    return super.refreshModels()
   }
 
   async startLogin(nickname?: string): Promise<LoginStart> {
@@ -831,8 +848,48 @@ export async function createGeminiProvider(
    */
   const projectCache = new Map<string, string>()
 
+  /**
+   * **动态模型目录**（2026-10-15）。
+   *
+   * 上游静态表只有 1 个模型（`gemini-3.8-flash`），而实测账号真正可用 15 个
+   * （含 `claude-sonnet-4-6` / `claude-opus-4-6-thinking`，经 Google 网关转发）。
+   * 这里优先用落盘缓存；缓存缺失时适配器退回静态表，等用户点「重拉模型目录」
+   * 触发联网拉取 + 可用性探测。
+   *
+   * ⚠️ 必须**同步**可读（适配器的 `loadModels()` 是同步方法）⇒ 缓存读在
+   *    构造前做一次、存进闭包变量，而不是在回调里 await。
+   */
+  let catalogModels: readonly GeminiCatalogModel[] = []
+  try {
+    const { readCatalogCache } = await import('../core/gemini-catalog.js')
+    catalogModels = readCatalogCache(dataDir) ?? []
+    if (catalogModels.length > 0) {
+      gateway.logger.info(`Gemini 动态目录：已载入 ${catalogModels.length} 个模型（本地缓存）`)
+    }
+  } catch (error) {
+    gateway.logger.warn('Gemini 目录缓存读取失败，将使用静态表:', error)
+  }
+
+  /**
+   * ⚠️⚠️ **探测期的"先有鸡还是先有蛋"**（真实缺陷，2026-10-15，写完即被实测抓住）：
+   *
+   * `loadModels()` 是**同步**方法，它既决定「暴露哪些模型」也决定
+   * 「门控放行哪些模型」（`geminiModelSpec` 的 allowed 来自它）。
+   * 若只在拉取成功后才把新目录写进去，那么**探测阶段**门控拿到的还是旧表
+   * （首次运行时只有静态表的 1 个），于是 14 个候选**全部被自己的门控拒绝**：
+   *
+   *     Gemini 模型 claude-sonnet-4-6 探测失败，已剔除:
+   *       gemini: 模型 "claude-sonnet-4-6" 不在本 provider 目录中（仅支持 gemini-3.8-flash）
+   *     → Gemini 目录已更新：1 个可用模型（候选 14 个）
+   *
+   * 修法：把目录做成**可变引用**，探测前先写入候选全集（放行门控），
+   * 探测后再收窄为实测可用的集合。
+   */
   const adapter = new GeminiAdapter({
     credentialRef: credentialRef(GEMINI.defaultCredentialRef),
+    // ⚠️ 始终注入（即使是空数组也没关系）：探测期需要它作为可变的放行名单。
+    //    为空时 `geminiModelSpec` 会退回「只允许静态表模型」的旧行为。
+    modelsProvider: () => catalogModels,
     resolveCredential: async (modelId?: string) => {
       const available = await pool.getAvailableAccount('gemini', modelId ?? '')
       if (available) return available.credential as never
@@ -911,6 +968,143 @@ export async function createGeminiProvider(
     },
     refreshAll: async () => {
       await auth.refreshAll(pool)
+    },
+
+    /**
+     * 「重拉模型目录」：从上游 `fetchAvailableModels` 拉取 + **逐个探测可用性**。
+     *
+     * ⚠️ 为什么必须探测：上游对**已下线的模型**返回 **HTTP 200**，正文是一句
+     *    `"… is no longer available …"`。只看状态码会把 3 个废弃模型
+     *    （实测 `gemini-3-flash-agent` / `gemini-3.5-flash-low` /
+     *     `gemini-3.5-flash-extra-low`）当可用暴露出去，用户选中才发现拿不到答案。
+     *
+     * ⚠️ 探测成本：每个候选一次真实推理（约 1–3s），19 个候选约 20–60s。
+     *    故结果**落盘缓存**，只在用户显式点「重拉」时才跑。
+     */
+    refreshModelsImpl: async () => {
+      const [{ fetchAvailableModels, writeCatalogCache, looksDeprecated }, { GEMINI_ENDPOINTS }] =
+        await Promise.all([
+          import('../core/gemini-catalog.js'),
+          import('../../vendor/src/gemini.js') as Promise<{ GEMINI_ENDPOINTS: readonly string[] }>,
+        ])
+      // 取一条可用凭据（第一个启用的账号）。
+      const accounts = (await pool.listAccounts('gemini')).filter((a) => a.enabled)
+      const account = accounts[0]
+      if (account === undefined) throw new Error('Gemini 没有已启用的账号，无法拉取目录')
+      const raw = gateway.credentials.get(account.credentialRef)
+      if (raw === undefined) throw new Error('Gemini 凭据缺失，请重新登录')
+      const credential = JSON.parse(raw) as { access_token?: string; cloudaicompanionProject?: string }
+      const accessToken = credential.access_token ?? ''
+      if (accessToken.length === 0) throw new Error('Gemini 凭据无 access_token，请重新登录')
+
+      let candidates: readonly GeminiCatalogModel[] = []
+      for (const endpoint of GEMINI_ENDPOINTS) {
+        candidates = await fetchAvailableModels({ accessToken, project: credential.cloudaicompanionProject, endpoint })
+        if (candidates.length > 0) break
+      }
+      if (candidates.length === 0) throw new Error('上游未返回可用模型列表（端点或凭据可能已变）')
+
+      // ⚠️ **先把候选全集写进目录**，否则下面的探测会被自己的门控拒绝
+      //    （见 adapter 构造处那段"先有鸡还是先有蛋"的注释）。
+      catalogModels = candidates
+
+      /**
+       * 逐个探测可用性。
+       *
+       * ⚠️⚠️ **必须直连上游，不能走 `adapter.stream()`**（真实缺陷，2026-10-15，
+       * 实测抓到）：`stream()` 会经 `resolveCredential` → `getAvailableAccount`，
+       * 而后者在**每次都失败**时会**把该模型写进账号的限流标记**。
+       * 于是探测本身把账号打上 12 个模型的限流标记，后续候选全部被自己的
+       * 限流机制拒绝 —— 日志里表现为连 `claude-sonnet-4-6` 这种**明明可用**的
+       * 模型也报"所有账号均不可用（限流或额度耗尽）"，最终只剩 2 个。
+       *
+       * 探测只是问"这个模型名上游认不认"，与账号池选号无关 ⇒ 直接用凭据打
+       * 上游，**不碰账号池**（自然也不产生任何标记）。
+       */
+      const { translateGeminiRequest, consumeGeminiSse } = await import('../../vendor/src/gemini-messages.js')
+      const { geminiHeaders, newGeminiRequestId } = await import('../../vendor/src/gemini.js')
+      const project = credential.cloudaicompanionProject ?? 'aicode-consumers'
+      const usable: GeminiCatalogModel[] = []
+      for (const model of candidates) {
+        try {
+          /**
+           * ⚠️⚠️ **档位后缀是"按模型族"决定的，不能统一加**（真实缺陷，2026-10-15，
+           * 实测把 11 个可用模型误判成 404）。
+           *
+           * 逐名实测的对照表：
+           *
+           * | 模型 | 裸名 | 加 `-medium` |
+           * |---|---|---|
+           * | `gemini-3.8-flash` | ❌ 404 | ✅ **必须带后缀** |
+           * | `gpt-oss-120b` | ❌ 404 | ✅ **必须带后缀** |
+           * | `claude-sonnet-4-6` | ✅ **裸名可用** | ❌ 404 |
+           * | `claude-opus-4-6-thinking` | ✅ **裸名可用** | — |
+           * | `gemini-3-flash` | ✅ **裸名可用** | ❌ 404 |
+           * | `gemini-2.5-flash` | ✅ **裸名可用** | ❌ 404 |
+           *
+           * 故策略：**先裸名、失败再试 `-medium`**（两个都不行才剔除）。
+           * 每条探测最多两次请求，但正确性远比省一次请求重要。
+           */
+          const candidateNames = [model.id, `${model.id}-medium`]
+          let text = ''
+          let probed = false
+          /** 实测哪个名字成功 ⇒ 据此决定"是否要档位后缀"（见 needsEffortSuffix）。 */
+          let usedSuffix: boolean | undefined
+          for (const upstream of candidateNames) {
+            // ⚠️ `thinkingBudget` 必须**小于** `maxTokens`（上游硬要求，Antigravity
+            //    API 文档明示 "maxOutputTokens must be GREATER than thinkingBudget"）。
+            const envelope = translateGeminiRequest({
+              modelId: model.id,
+              spec: { upstream, tier: 'medium', thinkingBudget: 2000, includeThoughts: true },
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'Reply exactly: OK' }] }],
+              project,
+              sessionLane: 'probe',
+              requestId: newGeminiRequestId(),
+              maxTokens: 8192,
+            } as never)
+            const response = await fetch(`${GEMINI_ENDPOINTS[0]}/v1internal:streamGenerateContent?alt=sse`, {
+              method: 'POST',
+              headers: geminiHeaders(credential as never),
+              body: JSON.stringify(envelope),
+              signal: AbortSignal.timeout(30_000),
+            })
+            if (!response.ok) {
+              await response.text().catch(() => '')
+              continue
+            }
+            const body = response.body
+            if (body === null) continue
+            probed = true
+            for await (const chunk of consumeGeminiSse({ body }) as AsyncIterable<{ type?: string; text?: string }>) {
+              if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+              if (text.length > 200) break
+            }
+            if (!looksDeprecated(text)) {
+              // 记下成功的形式：裸名成功 ⇒ 不需要后缀；`-medium` 成功 ⇒ 需要。
+              usedSuffix = upstream !== model.id
+              break
+            }
+            // 命中"已下线"文案：换下一个名字也没用，直接标记不可用。
+            probed = false
+            break
+          }
+          if (!probed) {
+            gateway.logger.info(`Gemini 模型 ${model.id} 不可用（裸名与档位名均失败或已下线），已剔除`)
+            continue
+          }
+          // ⚠️ 把实测出的"是否需要后缀"写回目录条目 —— 适配器拼 upstream 时按它决定，
+          //    否则 claude / gemini-2.5 系会被拼上后缀而 404。
+          usable.push({ ...model, needsEffortSuffix: usedSuffix ?? true })
+        } catch (error) {
+          gateway.logger.warn(`Gemini 模型 ${model.id} 探测失败，已剔除:`, error)
+        }
+      }
+
+      if (usable.length === 0) throw new Error('全部候选模型都探测失败，保留原目录')
+      catalogModels = usable
+      writeCatalogCache(dataDir, usable)
+      gateway.logger.info(`Gemini 目录已更新：${usable.length} 个可用模型（候选 ${candidates.length} 个）`)
+      return { count: usable.length }
     },
 
     /**
