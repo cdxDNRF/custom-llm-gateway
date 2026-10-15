@@ -167,10 +167,22 @@ export function toDshMessages(messages: OpenAiMessage[]): {
     }
 
     if (message.role === 'tool') {
+      // ⚠️⚠️ **必须是块数组，不能是裸字符串**（真实缺陷，2026-10-15，用户报障的
+      //    第二轮工具调用）。与上面 user 分支同一类问题（那次只修了 user）：
+      //
+      // `gemini-messages.ts` 的 `toolResultText(blocks)` 只遍历**块数组**：
+      //     ```ts
+      //     function toolResultText(blocks: readonly ContentBlock[]): string {
+      //       for (const block of blocks) { if (block.type === 'text') out.push(block.text) … }
+      //     }
+      //     ```
+      // 故字符串会被**静默丢成空串** —— 上游收到 `functionResponse` 但内容是空的，
+      // 模型于是回答「工具未返回信息」（症状极具误导性：看起来像上游没给数据，
+      // 实际是我们没把数据发出去）。
       out.push({
         role: 'tool',
         toolCallId: message.tool_call_id ?? '',
-        content: text,
+        content: [{ type: 'text', text }],
       } as unknown as RequestMessage)
     }
   }

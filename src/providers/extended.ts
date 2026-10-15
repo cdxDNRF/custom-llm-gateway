@@ -885,8 +885,37 @@ export async function createGeminiProvider(
    * 修法：把目录做成**可变引用**，探测前先写入候选全集（放行门控），
    * 探测后再收窄为实测可用的集合。
    */
+  /**
+   * ⚠️⚠️ **`thoughtSignature` 缓存必须提供**（真实缺陷，2026-10-15，用户报障）。
+   *
+   * **症状**：带工具的会话第二轮起必然 400 ——
+   * ```
+   * Function call is missing a thought_signature in functionCall parts.
+   * This is required for tools to work correctly …
+   * Additional data, function call `default_api:skill`, position 6.
+   * ```
+   *
+   * **根因**：适配器的注释写明「未提供 `sigStore` 则**每轮都不带签名**」，
+   * 而我们的接线**从来没传过它**（上游插件用 `createGeminiSigStore(ctx)` 建，
+   * 我们的网关没有 DSH 的 `ctx.jetHubHome`，故直接 `new` 即可）。
+   *
+   * 上游对思考型模型校验 `functionCall` 上的签名：响应里带的签名要按
+   * 「工具名 + 规范化参数」记下来，下一轮回传历史时按同一个键回填。
+   * 没有缓存 ⇒ 第二轮的历史 functionCall 缺签名 ⇒ 400。
+   *
+   * ⚠️ 落盘路径用**网关自己的数据目录**（`<dataDir>/gemini-sigs.json`），
+   *    不用 `resolveJetHubHome`（那是 DSH home，网关没有）。
+   *    落盘的意义：进程重启后签名不丢，否则长任务跨重启仍会 400。
+   */
+  const geminiSigStore = new (await import('../../vendor/src/gemini-sigstore.js')).GeminiSigStore(
+    resolve(dataDir, 'gemini-sigs.json'),
+    { warn: (message: string) => gateway.logger.warn(message) },
+  )
+
   const adapter = new GeminiAdapter({
     credentialRef: credentialRef(GEMINI.defaultCredentialRef),
+    // ⚠️ 工具调用的签名缓存（缺它 = 带工具的第二轮必然 400，见上）。
+    sigStore: geminiSigStore as never,
     // ⚠️ 始终注入（即使是空数组也没关系）：探测期需要它作为可变的放行名单。
     //    为空时 `geminiModelSpec` 会退回「只允许静态表模型」的旧行为。
     modelsProvider: () => catalogModels,
