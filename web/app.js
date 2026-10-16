@@ -36,6 +36,16 @@ function readToken() {
 
 let accessToken = readToken()
 
+/**
+ * 后端返回的访问令牌（来自 `/api/overview` 的 `lan.accessToken`）。
+ *
+ * ⚠️ 为什么需要它：本机 127.0.0.1 访问时服务端**豁免令牌校验**，所以前端
+ * 从不设置 `accessToken`，它是空串。但 Build 渠道的 App 是**外部客户端**
+ * （从浏览器页面连过来，虽然也是 127.0.0.1 但走的是 WebSocket 独立校验），
+ * 必须带真令牌。故从后端取一份用于展示/复制。
+ */
+let lanTokenCache = ''
+
 function setToken(value) {
   accessToken = String(value || '').trim()
   try {
@@ -697,6 +707,8 @@ async function startLogin(provider) {
 async function load() {
   try {
     const { providers, lan } = await api('/api/overview')
+    // 缓存后端令牌，供 Build 页拼 WebSocket 地址用（见 lanTokenCache 注释）。
+    if (lan && typeof lan.accessToken === 'string') lanTokenCache = lan.accessToken
     const box = $('#providers')
     box.innerHTML = ''
     for (const provider of providers) box.appendChild(renderProvider(provider))
@@ -1359,12 +1371,110 @@ $('#usage-clear')?.addEventListener('click', async () => {
   }
 })
 
+// ── Build 渠道页 ──
+//
+// 这个渠道与其它 17 家的形态不同：上游是跑在 Google Cloud Run 上的 AI Studio App，
+// 由**用户浏览器里的页面**主动连回本网关。故本页是「连接控制台」而非配置表单。
+async function loadBuild() {
+  const box = $('#build-status')
+  if (box === null) return
+  try {
+    const [status, modelsResp] = await Promise.all([
+      api('/api/build/status'),
+      api('/api/p/build/models').catch(() => ({ models: [] })),
+    ])
+    const enabled = status.enabled !== false
+    const accepting = status.accepting === true
+    const connected = status.connected === true
+    const dot = connected ? '🟢' : accepting ? '🟡' : '⚫'
+    const label = connected ? '已连接' : accepting ? '等待 App 连接' : '已断开'
+    const lastPing = status.lastPingAt
+      ? new Date(status.lastPingAt).toLocaleTimeString('zh-CN')
+      : '—'
+
+    box.innerHTML = `
+      <div class="usage-summary" style="margin-bottom:0">
+        <div class="usage-card">
+          <div class="usage-num">${dot} ${label}</div>
+          <div class="usage-label">连接状态</div>
+        </div>
+        <div class="usage-card">
+          <div class="usage-num">${status.relays ?? 0}</div>
+          <div class="usage-label">成功转发</div>
+        </div>
+        <div class="usage-card${(status.failures ?? 0) > 0 ? ' usage-card-warn' : ''}">
+          <div class="usage-num">${status.failures ?? 0}</div>
+          <div class="usage-label">失败次数</div>
+        </div>
+        <div class="usage-card">
+          <div class="usage-num" style="font-size:15px">${lastPing}</div>
+          <div class="usage-label">最后心跳</div>
+        </div>
+      </div>
+      ${status.lastError ? `<p class="hint" style="margin:10px 0 0">最近错误：${escapeHtml(status.lastError)}</p>` : ''}
+      ${!enabled ? '<p class="hint" style="margin:10px 0 0">⚠️ 该供应商未启用，请到「供应商」页启用它。</p>' : ''}`
+
+    // WebSocket 地址：用当前页面 host + 令牌（令牌从我们自己的 token 逻辑取）。
+    // 令牌来源：优先前端 accessToken（用户手动设过）；本机访问时它是空的
+    // （回环豁免，前端从不设置），故回落到后端返回的 `lan.accessToken`。
+    // ⚠️ App 是**外部客户端**，不受回环豁免 —— 必须带真令牌，否则握手 401。
+    const token = accessToken.length > 0 ? accessToken : (lanTokenCache ?? '')
+    const wsUrl = token.length > 0
+      ? `ws://${location.hostname}:${location.port}/v1/ws?auth_token=${token}`
+      : `ws://${location.hostname}:${location.port}/v1/ws?auth_token=<访问令牌>`
+    const code = $('#build-ws-url')
+    if (code !== null) {
+      code.textContent = wsUrl
+      code.onclick = () => { void navigator.clipboard.writeText(wsUrl).then(() => toast('已复制 WebSocket 地址', 'ok')) }
+    }
+
+    // 模型清单
+    const models = modelsResp.models ?? []
+    const list = $('#build-models')
+    const note = $('#build-models-note')
+    if (note !== null) note.textContent = `${models.filter((m) => m.enabled).length} / ${models.length} 已启用`
+    if (list !== null) {
+      list.innerHTML = models.length === 0
+        ? '<div class="empty">没有模型（供应商可能未启用）</div>'
+        : models.map((m) => `
+            <label class="model-row ${m.enabled ? '' : 'is-off'}">
+              <span class="model-main">
+                <span class="model-name">${escapeHtml(m.name || m.id)}</span>
+                <span class="model-id">${escapeHtml(m.id)}</span>
+              </span>
+              <span class="tag ${m.enabled ? 'tag-ok' : ''}">${m.enabled ? '可用' : '停用'}</span>
+            </label>`).join('')
+    }
+
+    const stamp = $('#build-updated')
+    if (stamp !== null) stamp.textContent = `更新于 ${new Date().toLocaleTimeString()}`
+  } catch (error) {
+    box.innerHTML = `<div class="empty log-error">${escapeHtml(String(error.message || error))}</div>`
+  }
+}
+
+$('#build-connect')?.addEventListener('click', async () => {
+  try {
+    await api('/api/build/connect', { method: 'POST', body: JSON.stringify({ connected: true }) })
+    toast('已开启：等待 App 连接（请在浏览器里点 App 的 Connect）', 'ok')
+    await loadBuild()
+  } catch (error) { toast(String(error.message || error), 'err') }
+})
+$('#build-disconnect')?.addEventListener('click', async () => {
+  try {
+    await api('/api/build/connect', { method: 'POST', body: JSON.stringify({ connected: false }) })
+    toast('已断开：App 现在连不上（再点「连接」即可恢复）', 'ok')
+    await loadBuild()
+  } catch (error) { toast(String(error.message || error), 'err') }
+})
+$('#build-refresh')?.addEventListener('click', () => { void loadBuild() })
+
 // ── 分页切换 ──
 //
 // 三页：供应商 / 网关 / 数据。用 `hidden` 属性切换（CSS 里已确保 [hidden] 生效）。
 // 选择记在 localStorage，刷新后停在原页；URL hash 也同步，便于分享直链。
 function showPage(name) {
-  const target = ['providers', 'gateway', 'data'].includes(name) ? name : 'providers'
+  const target = ['providers', 'gateway', 'data', 'build'].includes(name) ? name : 'providers'
   for (const section of document.querySelectorAll('.page')) {
     section.hidden = section.dataset.page !== target
   }
@@ -1375,6 +1485,8 @@ function showPage(name) {
   if (location.hash.slice(1) !== target) location.hash = target
   // 切到数据页时刷新一次（否则可能显示的是很久前的数据）。
   if (target === 'data') void loadUsage()
+  // 切到 Build 页同理：连接状态变化很快，进来就该拉最新的。
+  if (target === 'build') void loadBuild()
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
@@ -1398,4 +1510,13 @@ setInterval(() => {
   // 只在数据页可见时轮询，避免后台页白刷（也省 CPU）。
   const dataPage = document.querySelector('.page[data-page="data"]')
   if (dataPage !== null && dataPage.hidden === false) void loadUsage()
+  // Build 页：连接状态变化快，5 秒一次（同样只在可见时）。
+  const buildPage = document.querySelector('.page[data-page="build"]')
+  if (buildPage !== null && buildPage.hidden === false) void loadBuild()
 }, 30000)
+
+// Build 页专用快轮询（30 秒太慢，连接状态需要更实时）
+setInterval(() => {
+  const buildPage = document.querySelector('.page[data-page="build"]')
+  if (buildPage !== null && buildPage.hidden === false) void loadBuild()
+}, 5000)
