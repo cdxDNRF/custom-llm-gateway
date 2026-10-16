@@ -45,25 +45,28 @@ export const BUILD_MODELS: readonly {
   name: string
   contextWindow: number
   /**
-   * 免费层**每日请求上限**（官方文档，按模型计）。
+   * 本机**实测状态**（2026-10-17）。
    *
-   * ⚠️⚠️ 这是本渠道最关键的约束（实测撞上才知道）：
-   *   · Gemini 3 Flash 家族（3.5/3.6/3.7/3.8-flash）—— **仅 20 次/天**
-   *   · Gemini 3.1 Flash-Lite —— **500 次/天**（25 倍）
+   * ⚠️ 刻意**不写死"每天 N 次"**：那是 Google 官方对**API Key 免费层**的文档值
+   * （用户指出：那是 apikey 渠道的数，未必等于 Build 渠道的额度），而本渠道
+   * 实测证据与"统一 20 次/天"**不符** —— `3.7/3.8-flash` 只成功 1–2 次就恒 429，
+   * 而从未调用过的 `3.5-flash-lite` / `gemma-4-31b-it` 一次就能用。
    *
-   * 2026-10-17 实测印证：`gemini-3.5-flash` 累计 21 次调用后开始恒 429
-   * （正好撞 20 的上限），而同期的 `3.1-flash-lite` 仍正常。
-   *
-   * ⚠️ 故列表**按 RPD 降序排** —— 把能用的排前面，用户默认选中就是耐用的那个。
+   * 结论（有证据的部分）：额度**按模型**计（未用过的模型可用 ⇒ 非项目级上限），
+   * 且**各模型额度不同**。确切数值请到上游给的用量页查：https://ai.dev/rate-limit
    */
-  rpd: number
+  quota: 'ok' | 'exhausted' | 'deprecated'
 }[] = [
-  // ⚠️ 先排 500/天的 flash-lite：它是这个渠道**唯一耐用**的模型。
-  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576, rpd: 500 },
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, rpd: 20 },
-  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, rpd: 20 },
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, rpd: 20 },
-  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576, rpd: 20 },
+  // ── 实测可用（2026-10-17 逐个验证返回 OK）──
+  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576, quota: 'ok' },
+  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', contextWindow: 1_048_576, quota: 'ok' },
+  // gemma 实测可用但**明显较慢**（同一请求曾超时 130 秒），故名字上标出来。
+  { id: 'gemma-4-31b-it', name: 'Gemma 4 31B（较慢）', contextWindow: 1_048_576, quota: 'ok' },
+  // ── 当日额度已耗尽（会重置；实测 3.7/3.8 仅 1–2 次即耗尽）──
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, quota: 'exhausted' },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, quota: 'exhausted' },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, quota: 'exhausted' },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576, quota: 'exhausted' },
 ]
 
 /** REST 端点基址（App 的 host 白名单只放行 `*.googleapis.com`）。 */
@@ -102,7 +105,7 @@ export class BuildAdapter extends LlmAdapter {
     return BUILD_MODELS.map((m) => ({
       provider: 'build',
       id: m.id,
-      name: `${m.name} · ${m.rpd}次/天`,
+      name: `${m.name}${quotaSuffix(m.quota)}`,
     }))
   }
 
@@ -119,9 +122,8 @@ export class BuildAdapter extends LlmAdapter {
    * （与 `minimax-adapter.ts` 记录的同类缺陷相同）。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    // ⚠️ 把每日上限**标进名字**：这是选模型时唯一重要的信息（20 vs 500 差 25 倍），
-    //    藏在报错里就等于没有。用户不必踩一次 429 才知道。
-    return BUILD_MODELS.map((m) => ({ id: m.id, name: `${m.name} · ${m.rpd}次/天` }))
+    // ⚠️ 只标**实测状态**，不标未验证的精确数值（见 BUILD_MODELS.quota 的说明）。
+    return BUILD_MODELS.map((m) => ({ id: m.id, name: `${m.name}${quotaSuffix(m.quota)}` }))
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -282,11 +284,6 @@ function describe429(body: string, headers: Record<string, string> = {}, model =
   //    "please check your plan and billing details"。故上面按 metric 判据多半落空，
   //    得靠**已知的官方限额**给出确切解释（这比"配额/限流"有用得多）。
   const entry = BUILD_MODELS.find((m) => m.id === model)
-  const knownLimit = entry === undefined
-    ? ''
-    : entry.rpd <= 20
-      ? `${model} 的免费层上限是 **${entry.rpd} 次/天**（Gemini 3 Flash 家族）`
-      : `${model} 的免费层上限是 **${entry.rpd} 次/天**`
 
   if (/per\s*day|daily/.test(probe)) {
     verdict = '免费层**每日**配额已用完。**会重置** —— 等次日再试，或先换其它模型'
@@ -295,10 +292,14 @@ function describe429(body: string, headers: Record<string, string> = {}, model =
     verdict = '触发**每分钟**限流（请求过快）。等几十秒再试即可。'
   } else if (!/billing|paid|plan/.test(lower) && /free\s*tier|unsupported/i.test(lower)) {
     verdict = '该模型在免费层**无权限**（需付费等级）。'
-  } else if (knownLimit.length > 0) {
-    // 实测证明：**隔 90 秒重试仍 429** ⇒ 不是每分钟限流，是每日配额。
-    verdict = `配额已用完。已知 ${knownLimit}，且这是**每日**配额（**会重置**）。`
-      + '本渠道里 gemini-3.1-flash-lite 有 **500 次/天**，明显更耐用。'
+  } else if (entry !== undefined) {
+    // ⚠️ **不断言确切数值**：Google 只给了 API Key 免费层的文档值，而本渠道实测
+    //    （3.7/3.8 仅 1–2 次即耗尽）与文档值不符 —— 用户已指出这点。
+    //    实测确定的只有：**隔 90 秒重试仍 429** ⇒ 不是每分钟限流，而是更长的窗口
+    //    （会重置），且**按模型**计（未用过的模型可用）。
+    verdict = `${model} 的额度已用完（**会重置**）。本渠道其它模型额度互不影响，`
+      + '可改试 gemini-3.1-flash-lite / gemini-3.5-flash-lite / gemma-4-31b-it'
+      + '（三者 2026-10-17 实测可用）。确切用量见 https://ai.dev/rate-limit'
   } else {
     verdict = '配额/限流。'
   }
@@ -318,6 +319,13 @@ function describe429(body: string, headers: Record<string, string> = {}, model =
   }
   const headerText = hints.length > 0 ? `｜响应头：${hints.join(', ')}` : ''
   return `${verdict}（上游原文：${raw.slice(0, 240)}${headerText}）`
+}
+
+/** 实测状态后缀（给模型名用）。 */
+function quotaSuffix(quota: 'ok' | 'exhausted' | 'deprecated'): string {
+  if (quota === 'ok') return ' · 可用'
+  if (quota === 'exhausted') return ' · 额度耗尽（会重置）'
+  return ' · 已下线'
 }
 
 /** 是否是 HTML（而非模型响应）。 */
