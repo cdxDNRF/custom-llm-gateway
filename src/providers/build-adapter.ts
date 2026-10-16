@@ -152,38 +152,38 @@ export class BuildAdapter extends LlmAdapter {
      * 会拿到一个 **HTTP 200 + HTML 启动页**（`<title>Starting Server...</title>`），
      * 而不是 SSE —— 症状是「模型未返回任何内容块」，看起来像模型不回复。
      *
-     * 实测（探测阶段与真实调用各遇到一次）：等容器起来后同样的请求就正常了。
-     * 故这里**识别启动页**（而不是把 HTML 硬喂给 SSE 解析器），明确报错并提示重试。
+     * ⚠️⚠️ **任何 HTML 都重试**（不区分是哪一页）—— 实测教训：
+     *    起初只对**启动页**（`<title>Starting Server...</title>`）重试，结果撞到
+     *    另一种 HTML 时直接报错。抓到 title 后真相大白：
      *
-     * ⚠️ 不能靠"等一会儿再试"自动重试：冷启动可能十几秒到一分钟，
-     *    而这个错误对用户是**可行动**的（"再发一次就行"），比静默等待好。
+     *      `title=「Gemini WebSocket Relay Bridge」` ← **App 自己的页面**
+     *
+     *    即返回的是 **SPA 兜底页**（App 的前端路由接管了 `/api/relay`），
+     *    而不是冷启动页。两者都意味着"App 的服务端此刻没给出 API 响应"，
+     *    且**都是暂时的**（实测重试后即恢复，随后连续 4 次调用全部成功）。
+     *
+     * 重试间隔 2s→25s 递增，累计约 90 秒。**静默重试**而不是让用户"稍后重发"——
+     * 后者要求用户理解 Cloud Run 的缩容行为。
      */
     let final = response
-    if (final.body.trimStart().startsWith('<')) {
-      const isStarting = /Starting Server|Please wait while your application starts/i.test(final.body)
-      if (isStarting) {
-        // ⚠️ 冷启动是**暂时的**（容器起来后同一请求即正常），故**静默重试一次**
-        //    而不是把"请稍后重发"抛给用户 —— 后者要求用户理解 Cloud Run 的缩容行为。
-        //    实测：冷启动通常 5–20 秒。给 3 次机会（间隔递增）覆盖大多数情况。
-        this.warn?.('[build] App 容器冷启动中，等待重试…')
-        for (const wait of [2000, 3000, 5000, 8000, 12000, 15000, 20000, 25000]) {
-          await new Promise((r) => setTimeout(r, wait))
-          const retry = await this.relay.fetch({
-            url, method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-          })
-          if (!retry.body.trimStart().startsWith('<')) { final = retry; break }
-        }
-        if (final.body.trimStart().startsWith('<')) {
-          throw new LlmError(
-            'build: App 容器冷启动超时（等了约 90 秒仍未就绪）。请在浏览器里打开 App 页面确认它能正常加载，然后重试。',
-            'SERVER',
-          )
-        }
-      } else {
+    if (isHtml(final.body)) {
+      this.warn?.(`[build] 收到 HTML 而非模型响应（title=${htmlTitle(final.body) || '无'}），等待重试…`)
+      for (const wait of [2000, 3000, 5000, 8000, 12000, 15000, 20000, 25000]) {
+        await new Promise((r) => setTimeout(r, wait))
+        const retry = await this.relay.fetch({
+          url, method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        if (!isHtml(retry.body)) { final = retry; break }
+      }
+      if (isHtml(final.body)) {
+        // ⚠️ 错误信息带 **title** 与可见文本 —— 只给前 120 字 HTML 源码时
+        //    `<html><head><meta…` 全是噪音，看不出是哪一页（实测踩到）。
         throw new LlmError(
-          `build: 上游返回了 HTML 而非模型响应（前 120 字：${final.body.slice(0, 120).replace(/\s+/g, ' ')}）`,
+          'build: App 服务端持续返回 HTML 而非模型响应（已重试约 90 秒）。'
+          + `title=「${htmlTitle(final.body) || '无'}」，`
+          + `文本：${htmlText(final.body) || '(无)'}`,
           'SERVER',
         )
       }
@@ -208,6 +208,34 @@ export class BuildAdapter extends LlmAdapter {
     if (stream === null) throw new LlmError('build: 响应体为空', 'SERVER')
     yield* consumeGeminiSse({ body: stream }) as AsyncIterable<StreamChunk>
   }
+}
+
+/** 是否是 HTML（而非模型响应）。 */
+function isHtml(text: string): boolean {
+  return text.trimStart().startsWith('<')
+}
+
+/**
+ * 取 HTML 的 `<title>`（诊断用）。
+ *
+ * ⚠️ 只给前 N 字 HTML 源码时 `<!doctype html><html lang="en"><head><meta…`
+ * 全是噪音 —— title 才是"这是哪一页"的唯一有效线索。
+ */
+function htmlTitle(html: string): string {
+  const m = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)
+  return m?.[1]?.trim().slice(0, 80) ?? ''
+}
+
+/** 取 HTML 的可见文本片段（跳过标签/script/style，诊断用）。 */
+function htmlText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100)
 }
 
 /**
