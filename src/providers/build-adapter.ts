@@ -40,12 +40,30 @@ import type { BuildRelay } from '../core/build-relay.js'
  * ⚠️ 刻意**只放实测 200 的**：429（需付费）与 404（已下线）的不列，
  * 否则用户选中必然失败，且错误信息（"quota exceeded"）会让人以为是限流。
  */
-export const BUILD_MODELS: readonly { id: string; name: string; contextWindow: number }[] = [
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576 },
-  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576 },
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576 },
-  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576 },
-  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576 },
+export const BUILD_MODELS: readonly {
+  id: string
+  name: string
+  contextWindow: number
+  /**
+   * 免费层**每日请求上限**（官方文档，按模型计）。
+   *
+   * ⚠️⚠️ 这是本渠道最关键的约束（实测撞上才知道）：
+   *   · Gemini 3 Flash 家族（3.5/3.6/3.7/3.8-flash）—— **仅 20 次/天**
+   *   · Gemini 3.1 Flash-Lite —— **500 次/天**（25 倍）
+   *
+   * 2026-10-17 实测印证：`gemini-3.5-flash` 累计 21 次调用后开始恒 429
+   * （正好撞 20 的上限），而同期的 `3.1-flash-lite` 仍正常。
+   *
+   * ⚠️ 故列表**按 RPD 降序排** —— 把能用的排前面，用户默认选中就是耐用的那个。
+   */
+  rpd: number
+}[] = [
+  // ⚠️ 先排 500/天的 flash-lite：它是这个渠道**唯一耐用**的模型。
+  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576, rpd: 500 },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, rpd: 20 },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, rpd: 20 },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, rpd: 20 },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576, rpd: 20 },
 ]
 
 /** REST 端点基址（App 的 host 白名单只放行 `*.googleapis.com`）。 */
@@ -84,7 +102,7 @@ export class BuildAdapter extends LlmAdapter {
     return BUILD_MODELS.map((m) => ({
       provider: 'build',
       id: m.id,
-      name: m.name,
+      name: `${m.name} · ${m.rpd}次/天`,
     }))
   }
 
@@ -101,7 +119,9 @@ export class BuildAdapter extends LlmAdapter {
    * （与 `minimax-adapter.ts` 记录的同类缺陷相同）。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    return BUILD_MODELS.map((m) => ({ id: m.id, name: m.name }))
+    // ⚠️ 把每日上限**标进名字**：这是选模型时唯一重要的信息（20 vs 500 差 25 倍），
+    //    藏在报错里就等于没有。用户不必踩一次 429 才知道。
+    return BUILD_MODELS.map((m) => ({ id: m.id, name: `${m.name} · ${m.rpd}次/天` }))
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -192,13 +212,25 @@ export class BuildAdapter extends LlmAdapter {
     const response2 = final
 
     if (response2.status !== 200) {
-      // 429 单独给出可行动的文案（实测那几个 pro/argon 就是这个）。
-      const hint = response2.status === 429
-        ? '（该模型需要付费等级；本渠道免费层只有 flash 系列）'
-        : ''
+      // ⚠️ 429 有**多种含义**，不能一律说"需要付费等级"（初版就是这么写的，
+      //    属于误导）：上游原文会区分，且**每日配额是会重置的** —— 说成
+      //    "需要付费"会让用户以为永久不可用而放弃。
+      //
+      // 实测（2026-10-17）三种 429：
+      //   · 每日/项目配额用尽 → `* Quota exceeded for quota metric 'Generate
+      //     requests per day …'` ⇒ **明天重置**，等即可
+      //   · 每分钟限流 → `Generate requests per minute` ⇒ 稍后重试
+      //   · 模型需付费等级 → 免费层无权限
+      if (response2.status === 429) {
+        throw new LlmError(
+          `build: 429 ${describe429(response2.body, response2.headers, model)}`,
+          'QUOTA_EXCEEDED',
+          { status: 429 },
+        )
+      }
       throw new LlmError(
-        `build: HTTP ${response2.status} — ${response2.body.slice(0, 300)}${hint}`,
-        response2.status === 429 ? 'QUOTA_EXCEEDED' : 'SERVER',
+        `build: HTTP ${response2.status} — ${upstreamMessage(response2.body)}`,
+        'SERVER',
         { status: response2.status },
       )
     }
@@ -209,6 +241,83 @@ export class BuildAdapter extends LlmAdapter {
     if (stream === null) throw new LlmError('build: 响应体为空', 'SERVER')
     yield* consumeGeminiSse({ body: stream }) as AsyncIterable<StreamChunk>
   }
+}
+
+/**
+ * 从上游错误体里取 `error.message`（取不到就回退原文）。
+ *
+ * ⚠️ 不要直接 `body.slice(0, 300)`：那会在 JSON 中间截断，把最关键的一句
+ * （通常是 `* Quota exceeded for …`）切掉 —— 实测踩到，只剩 `* Quota ex`。
+ */
+function upstreamMessage(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: unknown } }
+    const message = parsed.error?.message
+    if (typeof message === 'string' && message.length > 0) return message.replace(/\s+/g, ' ').trim()
+  } catch {
+    // 非 JSON：回退原文。
+  }
+  return body.replace(/\s+/g, ' ').trim().slice(0, 300)
+}
+
+/**
+ * 把 429 的原文翻译成**可行动**的中文提示。
+ *
+ * ⚠️ 关键区分：**每日配额会重置**（等到次日即可），而"需付费等级"是永久的。
+ *    初版一律标成后者，会让用户误以为这个渠道废了。
+ */
+function describe429(body: string, headers: Record<string, string> = {}, model = ''): string {
+  const raw = upstreamMessage(body)
+  const lower = raw.toLowerCase()
+  // ⚠️ 判据必须**具体**：`please check your plan and billing details` 是**所有**
+  //    配额错误的通用句（实测踩到 —— 用它判"需付费等级"会把每日配额也说成
+  //    永久不可用）。故只认上游的**配额明细行** `* Quota exceeded for quota metric
+  //    '…'`，它才区分 per day / per minute。
+  const metric = /quota exceeded for quota metric '([^']+)'|quota metric '([^']+)'/i.exec(raw)
+  const metricName = (metric?.[1] ?? metric?.[2] ?? '').toLowerCase()
+  const probe = metricName.length > 0 ? metricName : lower
+
+  let verdict: string
+  // ⚠️ 实测（2026-10-17）：这条 429 的原文**没有**配额明细行 —— 只有通用句
+  //    "please check your plan and billing details"。故上面按 metric 判据多半落空，
+  //    得靠**已知的官方限额**给出确切解释（这比"配额/限流"有用得多）。
+  const entry = BUILD_MODELS.find((m) => m.id === model)
+  const knownLimit = entry === undefined
+    ? ''
+    : entry.rpd <= 20
+      ? `${model} 的免费层上限是 **${entry.rpd} 次/天**（Gemini 3 Flash 家族）`
+      : `${model} 的免费层上限是 **${entry.rpd} 次/天**`
+
+  if (/per\s*day|daily/.test(probe)) {
+    verdict = '免费层**每日**配额已用完。**会重置** —— 等次日再试，或先换其它模型'
+      + '（如 gemini-3.1-flash-lite，500 次/天）。'
+  } else if (/per\s*minute|per\s*second|per\s*minute\s*per\s*user/.test(probe)) {
+    verdict = '触发**每分钟**限流（请求过快）。等几十秒再试即可。'
+  } else if (!/billing|paid|plan/.test(lower) && /free\s*tier|unsupported/i.test(lower)) {
+    verdict = '该模型在免费层**无权限**（需付费等级）。'
+  } else if (knownLimit.length > 0) {
+    // 实测证明：**隔 90 秒重试仍 429** ⇒ 不是每分钟限流，是每日配额。
+    verdict = `配额已用完。已知 ${knownLimit}，且这是**每日**配额（**会重置**）。`
+      + '本渠道里 gemini-3.1-flash-lite 有 **500 次/天**，明显更耐用。'
+  } else {
+    verdict = '配额/限流。'
+  }
+  // ⚠️ **始终附带原文** —— 判据总会遇到没覆盖的形态，原文是唯一可靠依据
+  //    （加这条之前，我因为误判把每日配额说成了"需付费"，用户会以为渠道废了）。
+  // ⚠️ 实测：这条 429 的原文**没有配额明细行**（只有通用句 "please check your
+  //    plan and billing details"），故单靠文案**无法**区分是每日配额还是每分钟
+  //    限流。此时响应头是更可靠的线索 —— Google 会带 `retry-after` / 配额相关头。
+  const hints: string[] = []
+  for (const key of ['retry-after', 'x-ratelimit-*', 'x-goog-*']) {
+    for (const [k, v] of Object.entries(headers)) {
+      const lk = k.toLowerCase()
+      if (key === 'x-ratelimit-*' ? lk.startsWith('x-ratelimit') : key === 'x-goog-*' ? lk.startsWith('x-goog') : lk === key) {
+        hints.push(`${k}=${String(v).slice(0, 40)}`)
+      }
+    }
+  }
+  const headerText = hints.length > 0 ? `｜响应头：${hints.join(', ')}` : ''
+  return `${verdict}（上游原文：${raw.slice(0, 240)}${headerText}）`
 }
 
 /** 是否是 HTML（而非模型响应）。 */
