@@ -31,6 +31,7 @@
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk, GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { consumeGeminiSse } from '../../vendor/src/gemini-messages.js'
+import { sanitizeGeminiSchema } from '../../vendor/src/gemini.js'
 import type { BuildRelay } from '../core/build-relay.js'
 
 /**
@@ -277,7 +278,18 @@ function toRestBody(options: GenerateOptions, model: string): Record<string, unk
       functionDeclarations: options.tools.map((tool) => ({
         name: tool.name,
         ...(tool.description === undefined ? {} : { description: tool.description }),
-        ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
+        // ⚠️⚠️ **必须清洗**（真实缺陷，2026-10-17 用户报障）：DSH 给的是完整
+        //    JSON Schema，而 Gemini 的 `functionDeclarations[].parameters` 只接受
+        //    **OpenAPI 子集**。直接透传会 400：
+        //      Invalid JSON payload received. Unknown name "$schema" at
+        //      'tools[0].function_declarations[0].parameters'
+        //      Unknown name "exclusiveMinimum" …
+        //    复用 vendor 的 `sanitizeGeminiSchema`（反重力渠道走的就是它）：
+        //    白名单删键 + 递归 properties/items/anyOf + 数组 type 收敛 + 非字符串
+        //    枚举整删。⚠️ 不自己写一份 —— 那份已经处理了这些边角，重写必然漏。
+        ...(tool.parameters === undefined
+          ? {}
+          : { parameters: sanitizeGeminiSchema(tool.parameters as Record<string, unknown>) }),
       })),
     }]
   }
