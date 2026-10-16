@@ -28,6 +28,7 @@ import {
   createOpencodeProvider,
 } from './extended.js'
 import { createAccioProvider, createOfficeAceProvider } from './extended.js'
+import { createBuildProvider } from './build.js'
 import { CodeArtsProvider } from './codearts.js'
 import { PROVIDER_CATALOG, catalogEntry } from './catalog.js'
 import type { Provider } from '../core/provider.js'
@@ -208,7 +209,13 @@ export function readProviderEnabled(dataDir: string, id: string): boolean | unde
 }
 
 /** 单个供应商的创建工厂（按目录 id）。 */
-function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): (() => Promise<Provider>) | undefined {
+function factoryFor(
+  id: string,
+  dir: string,
+  level: GatewayConfig['logLevel'],
+  /** ⚠️ build 渠道需要它：App 连的是**网关端口**、带的是**网关令牌**。 */
+  rest?: { webPort: number; accessToken?: string },
+): (() => Promise<Provider>) | undefined {
   const table: Record<string, () => Promise<Provider>> = {
     buddy: () => createBuddyProvider({ product: CODEBUDDY, dataDir: dir, logLevel: level }),
     workbuddy: () => createBuddyProvider({ product: WORKBUDDY, dataDir: dir, logLevel: level }),
@@ -226,6 +233,12 @@ function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): 
     opencode: () => createOpencodeProvider(dir, level),
     accio: () => createAccioProvider(dir, level),
     officeace: () => createOfficeAceProvider(dir, level),
+    build: () => createBuildProvider(
+      dir,
+      level,
+      rest?.webPort ?? 8790,
+      rest?.accessToken ?? '',
+    ),
   }
   return table[id]
 }
@@ -236,9 +249,22 @@ function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): 
  */
 export async function createProviderById(config: GatewayConfig, id: string): Promise<Provider> {
   if (catalogEntry(id) === undefined) throw new Error(`未知供应商 ${id}`)
-  const factory = factoryFor(id, config.dataDir, config.logLevel)
+  const factory = factoryFor(id, config.dataDir, config.logLevel, {
+    webPort: config.webPort,
+    ...(config.accessToken === undefined ? {} : { accessToken: config.accessToken }),
+  })
   if (factory === undefined) throw new Error(`供应商 ${id} 没有创建工厂`)
   return factory()
+}
+
+/** Build 渠道的 jobs 包装（它需要 webPort/token，与其它家的签名不同）。 */
+function createBuildProviderBuild(config: GatewayConfig): Promise<Provider> {
+  return createBuildProvider(
+    config.dataDir,
+    config.logLevel,
+    config.webPort,
+    config.accessToken ?? '',
+  )
 }
 
 /** 创建全部已启用的供应商。 */
@@ -266,6 +292,7 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createOpencodeProvider(dir, level),
     () => createAccioProvider(dir, level),
     () => createOfficeAceProvider(dir, level),
+    () => createBuildProviderBuild(config),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)
 
