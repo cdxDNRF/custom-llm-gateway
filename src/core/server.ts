@@ -415,9 +415,23 @@ export class OverviewServer {
     //    断开时 App 会收到 403、显示 Disconnected（符合用户预期）。
     if (path === '/api/build/status' && request.method === 'GET') {
       const relay = this.buildRelay
+      const { readBuildAppUrl } = await import('../providers/registry.js')
       sendJson(response, 200, relay === undefined
-        ? { enabled: false }
-        : { enabled: true, ...relay.status() })
+        ? { enabled: false, appUrl: readBuildAppUrl(this.dataDir) }
+        : { enabled: true, appUrl: readBuildAppUrl(this.dataDir), ...relay.status() })
+      return
+    }
+    // 保存/清空 App 链接（Build 页的输入框）。
+    if (path === '/api/build/app-url' && request.method === 'POST') {
+      let body: { url?: unknown } = {}
+      try { body = JSON.parse(await readBody(request)) as typeof body } catch { body = {} }
+      const url = typeof body.url === 'string' ? body.url : ''
+      const { setBuildAppUrl } = await import('../providers/registry.js')
+      const result = setBuildAppUrl(this.dataDir, url)
+      // ⚠️ 错误用 `{ error: '...' }` 形状（与其它接口一致）——前端 `api()`
+      //    读的是 `body.error`，用 `reason` 会退化成显示 "HTTP 400"（实测踩到）。
+      sendJson(response, result.ok ? 200 : 400,
+        result.ok ? { ok: true, url } : { error: result.reason })
       return
     }
     if (path === '/api/build/connect' && request.method === 'POST') {

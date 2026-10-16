@@ -525,3 +525,15 @@ main { max-width: 1500px; margin: 0 auto; padding: 22px 24px 60px; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   vertical-align: bottom;
 }
+
+/* Build 页：App 链接输入区 */
+.build-appurl {
+  margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+.build-appurl > label {
+  display: block; font-size: 13px; margin-bottom: 7px; color: var(--text-dim);
+}
+.build-appurl-row { display: flex; gap: 8px; align-items: center; }
+.build-appurl-row .model-search { flex: 1; }
+#build-appurl-hint { margin: 6px 0 0; }

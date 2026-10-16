@@ -1414,6 +1414,12 @@ async function loadBuild() {
       ${status.lastError ? `<p class="hint" style="margin:10px 0 0">最近错误：${escapeHtml(status.lastError)}</p>` : ''}
       ${!enabled ? '<p class="hint" style="margin:10px 0 0">⚠️ 该供应商未启用，请到「供应商」页启用它。</p>' : ''}`
 
+    // App 链接输入框（只填一次，之后自动跳转）。
+    const appInput = $('#build-app-url')
+    if (appInput !== null && appInput.value !== (status.appUrl ?? '') && document.activeElement !== appInput) {
+      appInput.value = status.appUrl ?? ''
+    }
+
     // WebSocket 地址：用当前页面 host + 令牌（令牌从我们自己的 token 逻辑取）。
     // 令牌来源：优先前端 accessToken（用户手动设过）；本机访问时它是空的
     // （回环豁免，前端从不设置），故回落到后端返回的 `lan.accessToken`。
@@ -1455,10 +1461,53 @@ async function loadBuild() {
 
 $('#build-connect')?.addEventListener('click', async () => {
   try {
+    const status = await api('/api/build/status').catch(() => ({}))
+    const appUrl = (status.appUrl ?? '').trim()
     await api('/api/build/connect', { method: 'POST', body: JSON.stringify({ connected: true }) })
-    toast('已开启：等待 App 连接（请在浏览器里点 App 的 Connect）', 'ok')
+    if (appUrl.length === 0) {
+      // 没配链接：明确告诉用户去填，而不是静默什么也没发生。
+      toast('已开启服务端。请先在上面填入你的 App 链接，之后点这里会自动打开它。', 'err')
+      $('#build-app-url')?.focus()
+      await loadBuild()
+      return
+    }
+    // ⚠️ 必须在**点击的同步上下文**里调用 window.open，否则浏览器按
+    //    "非用户手势"拦截弹窗。上面的 await 之后仍算用户手势（Chrome 容忍
+    //    短异步），但为稳妥起见先开窗口再导航。
+    const opened = window.open(appUrl, '_blank', 'noopener')
+    if (opened === null) {
+      toast('弹窗被浏览器拦截了。请允许本站弹窗，或手动打开你的 App 链接。', 'err')
+    } else {
+      toast('已打开 App 页面 —— 请在那边点 Connect 完成握手', 'ok')
+    }
     await loadBuild()
   } catch (error) { toast(String(error.message || error), 'err') }
+})
+
+// 保存 App 链接
+$('#build-save-url')?.addEventListener('click', async () => {
+  const input = $('#build-app-url')
+  const hint = $('#build-appurl-hint')
+  if (input === null) return
+  try {
+    await api('/api/build/app-url', {
+      method: 'POST',
+      body: JSON.stringify({ url: input.value }),
+    })
+    if (hint !== null) hint.textContent = input.value.trim().length > 0 ? '✓ 已保存（点「连接并打开 App」即自动跳转）' : '已清空'
+    toast('App 链接已保存', 'ok')
+    await loadBuild()
+  } catch (error) {
+    // ⚠️ `api()` 对非 2xx **抛错**，所以校验失败走这里（而不是判返回值）——
+    //    最初写成判 `r.ok === false`，那条分支永远不会命中（实测：后端返回
+    //    400 + reason，但前端 hint 一直是空的）。
+    //
+    // ⚠️ 且**不调 loadBuild()**：那会用服务端的旧值覆盖用户刚输入的非法值，
+    //    用户就看不到自己填了什么、也不知道错在哪。
+    const reason = String(error.message || error)
+    if (hint !== null) hint.innerHTML = `<span class="log-error">✗ ${escapeHtml(reason)}</span>`
+    toast(reason, 'err')
+  }
 })
 $('#build-disconnect')?.addEventListener('click', async () => {
   try {
