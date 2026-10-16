@@ -205,12 +205,21 @@ function renderProvider(provider) {
     </div>
     <div class="tags">${tags}</div>
     <div class="card-actions">
+      ${/* ⚠️ Build 渠道没有「账号」概念：它不登录、无凭据、无积分、无限流标记。
+             故只给两个真正有意义的动作：模型管理 + 去「Build 渠道」页连接。
+             照搬其它家的按钮会让用户看到一堆点了没用的东西
+             （用户报障：'供应商这里加个模块好像没什么用吧'）。 */''}
+      ${provider.id === 'build' ? `
+        <button class="btn btn-sm btn-primary" data-act="gotoBuild">连接 / 管理</button>
+        <button class="btn btn-sm" data-act="models">模型管理</button>
+      ` : `
       <button class="btn btn-sm btn-primary" data-act="login">＋ 新建账号</button>
       ${caps.balance ? '<button class="btn btn-sm" data-act="balance">查积分</button>' : ''}
       ${caps.dailyCheckin ? '<button class="btn btn-sm" data-act="checkin">一键签到</button>' : ''}
       <button class="btn btn-sm" data-act="models">模型管理</button>
       <button class="btn btn-sm" data-act="refresh">续期</button>
       <button class="btn btn-sm" data-act="more">更多 ▾</button>
+      `}
     </div>
     <div class="more" data-role="more" hidden>
       <button class="btn btn-sm" data-act="refreshModels">重拉模型目录</button>
@@ -227,7 +236,14 @@ function renderProvider(provider) {
   const extraBox = card.querySelector('[data-role="extra"]')
   const moreBox = card.querySelector('[data-role="more"]')
 
-  if (!provider.accounts || provider.accounts.length === 0) {
+  // ⚠️ Build 渠道没有账号列表 —— 说「尚未登录任何账号」是**误导**
+  //    （它不需要登录，连接状态在「Build 渠道」页看）。
+  if (provider.id === 'build') {
+    const box = card.querySelector('[data-role="accounts"]')
+    if (box !== null) {
+      box.innerHTML = '<div class="empty">无需账号 —— 在「Build 渠道」页连接你的 AI Studio App</div>'
+    }
+  } else if (!provider.accounts || provider.accounts.length === 0) {
     accountsBox.innerHTML = '<div class="empty">尚未登录任何账号</div>'
   } else {
     for (const [index, account] of provider.accounts.entries()) {
@@ -337,6 +353,10 @@ function renderProvider(provider) {
           await load()
           break
         }
+        // Build 渠道：跳到「Build 渠道」页（连接控制台在那儿）。
+        case 'gotoBuild':
+          showPage('build')
+          break
         case 'reset': {
           const { result } = await api(`/api/p/${provider.id}/accounts/reset`, { method: 'POST', body: '{}' })
           const cleared = result.clearedCount ?? 0
