@@ -213,6 +213,9 @@ export class ProviderServer {
       provider: adapterProvider,
       model,
       sessionId: `gw-${this.provider.id}-${Date.now().toString(36)}`,
+      // ⚠️ Build 渠道默认「假流式」（上游流式审核严、易截断）；
+      //    客户端显式 stream:true 时才走真流式。其它适配器忽略此字段。
+      useNonStream: openAiBody.stream !== true,
     })
     const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 
@@ -276,6 +279,7 @@ export class ProviderServer {
       provider: adapterProvider,
       model,
       sessionId: `gw-${this.provider.id}-${Date.now().toString(36)}`,
+      useNonStream: body.stream !== true,
     })
 
     const id = `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`

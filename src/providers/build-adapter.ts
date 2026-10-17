@@ -31,6 +31,8 @@
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk, GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { consumeGeminiSse } from '../../vendor/src/gemini-messages.js'
+import { translateGeminiResponse } from '../../vendor/src/gemini-messages.js'
+import type { GeminiResponse } from '../../vendor/src/gemini-messages.js'
 import { sanitizeGeminiSchema } from '../../vendor/src/gemini.js'
 import type { BuildRelay } from '../core/build-relay.js'
 
@@ -188,20 +190,43 @@ export class BuildAdapter extends LlmAdapter {
    * App 转发到 `generativelanguage.googleapis.com` → 把返回的 SSE 文本喂给
    * `consumeGeminiSse` → 得到 DSH 的 chunk 流。
    */
-  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  async *stream(rawOptions: GenerateOptions): AsyncIterable<StreamChunk> {
+    // ⚠️ `useNonStream` 是本渠道的**自定义开关**（不属 DSH 的 GenerateOptions）——
+    //    默认 true（假流式），因为上游流式审核严格、易截断。想用真流式可传
+    //    `{useNonStream:false}`（经聚合层的 OpenAI `stream` 参数映射，见 server.ts）。
+    const options = rawOptions as GenerateOptions & { useNonStream?: boolean }
     const model = String(options.model)
     if (!BUILD_MODELS.some((m) => m.id === model)) {
       throw new LlmError(`build: 模型 "${model}" 不在本渠道目录中`, 'INVALID_REQUEST', { status: 404 })
     }
 
     const body = toRestBody(options, model)
-    const url = `${REST_BASE}/models/${model}:streamGenerateContent?alt=sse`
+
+    // ── 预填充（请求以 model turn 结尾）──────────────────────────────
+    // ⚠️ 实测：**不是所有模型都支持**（情报核对，2026-10-17）——
+    //      gemini-3.8-flash      → 400 `Requests ending with a model turn are
+    //                              not supported.`   ← **明确拒绝**
+    //      gemini-3.1-flash-lite → 接受
+    // 故构造请求时**剥离**末条 model turn，而不是把 400 抛给用户（后者在酒馆里
+    // 表现为莫名报错，且要换预设才能绕过）。
+    // 判据按**请求形态**而非模型名黑名单 —— 上游行为可能变，形态判断更稳。
+    const prefillStripped = endsWithModelTurn(body)
+    if (prefillStripped !== undefined) {
+      this.warn?.(`[build] ${model} 请求以 model turn 结尾 —— 已剥离预填充以兼容上游`)
+    }
+
+    // ── 假流式（非流式）────────────────────────────────────────────
+    // 情报：**build 的流式审核非常严格**，常被截断（"build易截断，尽量使用假流式"）。
+    // 假流式 = 走 `:generateContent`（一次性返回），再由我们分片推给客户端。
+    // ⚠️ 设为**默认**：截断表现为"回答说到一半停住"，比"稍等整段出来"糟得多。
+    const useNonStream = options.useNonStream !== false
+    const url = `${REST_BASE}/models/${model}:${useNonStream ? 'generateContent' : 'streamGenerateContent?alt=sse'}`
 
     const response = await this.relay.fetch({
       url,
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(prefillStripped ?? body),
     })
 
     /**
@@ -250,6 +275,17 @@ export class BuildAdapter extends LlmAdapter {
     const response2 = final
 
     if (response2.status !== 200) {
+      // 403（情报"问题二"实测复现）：上游偶发 permission denied —— 按经验多为
+      // 代理问题或账号需重新登录，给出可行动提示而非裸报文。
+      if (response2.status === 403) {
+        throw new LlmError(
+          'build: 403 permission denied（上游偶发）。按经验多为**代理问题**或'
+          + '**Google 账号需重新登录** —— 刷新 App 页面重登后重试；也可换模型试。'
+          + `\n上游原文：${upstreamMessage(response2.body).slice(0, 200)}`,
+          'FORBIDDEN',
+          { status: 403 },
+        )
+      }
       // ⚠️ 429 有**多种含义**，不能一律说"需要付费等级"（初版就是这么写的，
       //    属于误导）：上游原文会区分，且**每日配额是会重置的** —— 说成
       //    "需要付费"会让用户以为永久不可用而放弃。
@@ -284,8 +320,55 @@ export class BuildAdapter extends LlmAdapter {
       )
     }
 
-    // ⚠️ 复用 vendor 的 SSE 消费器：它已兼容"信封"与"裸 Response"两种形态
-    //    （源码注释：「先试信封形态，再试裸 Response」），而 build 渠道正是裸形态。
+    // ── 非流式（假流式）：解析 JSON 后分片 ──
+    if (useNonStream) {
+      let parsed: GeminiResponse
+      try {
+        const json = JSON.parse(response2.body) as { response?: GeminiResponse }
+        // 上游可能回信封 `{response:{…}}` 或裸 `{candidates:[…]}`，两种都接。
+        parsed = (json.response ?? json) as GeminiResponse
+      } catch {
+        throw new LlmError(
+          `build: 非流式响应不是 JSON —— ${response2.body.slice(0, 160).replace(/\s+/g, ' ')}`,
+          'SERVER',
+        )
+      }
+      // ⚠️ 复用 vendor 的翻译器：它一并处理文本块、functionCall、thoughtSignature
+      //    与 usage —— 不自己解 candidates（那份已覆盖这些边角）。
+      const translated = translateGeminiResponse({ response: parsed })
+      // ⚠️ 必须按 DSH 的**帧协议**产出（block-start → *-delta → block-end → finish），
+      //    而不是自造 `{type:'text'}` 这类形状 —— 那会被下游当成未知帧。
+      //    "假流式"的含义就是：上游一次性返回，我们**复现**成规范的流式帧序列。
+      for (let index = 0; index < translated.blocks.length; index++) {
+        const block = translated.blocks[index]!
+        if (block.type === 'text') {
+          yield { type: 'block-start', index, blockType: 'text' } as StreamChunk
+          yield { type: 'text-delta', index, text: block.text } as StreamChunk
+          yield { type: 'block-end', index, block } as StreamChunk
+        } else if (block.type === 'reasoning') {
+          yield { type: 'block-start', index, blockType: 'reasoning' } as StreamChunk
+          yield { type: 'reasoning-delta', index, text: block.text } as StreamChunk
+          yield { type: 'block-end', index, block } as StreamChunk
+        } else if (block.type === 'tool-call') {
+          // 一次性给出完整参数（argumentsDelta 即全量 JSON 字符串）。
+          yield { type: 'block-start', index, blockType: 'tool-call' } as StreamChunk
+          yield {
+            type: 'tool-call-delta', index, id: block.id, name: block.name,
+            argumentsDelta: block.arguments,
+          } as StreamChunk
+          yield { type: 'block-end', index, block } as StreamChunk
+        }
+      }
+      if (translated.usage !== undefined) {
+        yield { type: 'usage', usage: translated.usage } as StreamChunk
+      }
+      yield { type: 'finish', reason: translated.reason } as StreamChunk
+      return
+    }
+
+    // ── 流式：复用 vendor 的 SSE 消费器 ──
+    //    ⚠️ 它已兼容"信封"与"裸 Response"两种形态（源码注释：「先试信封形态，
+    //    再试裸 Response」），而 build 渠道正是裸形态。
     const stream = new Response(response2.body).body
     if (stream === null) throw new LlmError('build: 响应体为空', 'SERVER')
     yield* consumeGeminiSse({ body: stream }) as AsyncIterable<StreamChunk>
@@ -368,6 +451,26 @@ function describe429(body: string, headers: Record<string, string> = {}, model =
 }
 
 /** 是否是 HTML（而非模型响应）。 */
+/**
+ * 请求是否以 model turn 结尾（即"预填充"）。
+ *
+ * ⚠️ 实测（2026-10-17，情报核对）：**不是所有模型都支持** ——
+ *      gemini-3.8-flash      → 400 `Requests ending with a model turn are
+ *                              not supported.`   ← **明确拒绝**
+ *      gemini-3.1-flash-lite → 接受
+ * 故统一**剥离**末条 model turn（比把 400 抛给用户友好：后者在酒馆里表现为
+ * 莫名报错，且要换预设才能绕过）。
+ *
+ * @returns 剥离后的 body 副本；末条不是 model turn 时返回 `undefined`。
+ */
+function endsWithModelTurn(body: Record<string, unknown>): Record<string, unknown> | undefined {
+  const contents = body.contents
+  if (!Array.isArray(contents) || contents.length === 0) return undefined
+  const last = contents[contents.length - 1] as { role?: unknown } | undefined
+  if (last?.role !== 'model') return undefined
+  return { ...body, contents: contents.slice(0, -1) }
+}
+
 function isHtml(text: string): boolean {
   return text.trimStart().startsWith('<')
 }

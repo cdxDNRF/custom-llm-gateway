@@ -209,6 +209,13 @@ export interface ToGenerateOptionsContext {
   provider: string
   model: string
   sessionId: string
+  /**
+   * Build 渠道**专用**：是否改用「假流式」（非流式上游 + 我们分片）。
+   *
+   * ⚠️ 由 OpenAI 的 `stream` 参数取反而来（`stream:true` → 真流式）。
+   *    默认**假流式**，因为 Build 的流式审核严格、易截断（见 build-adapter.ts）。
+   */
+  useNonStream?: boolean
 }
 
 /** OpenAI 请求 → DSH GenerateOptions。 */
@@ -233,6 +240,11 @@ export function toGenerateOptions(
   if (Array.isArray(stop) && stop.length > 0) options.stop = stop
   if (typeof request.reasoning_effort === 'string' && request.reasoning_effort.length > 0) {
     options.reasoningEffort = request.reasoning_effort as GenerateOptions['reasoningEffort']
+  }
+  // ⚠️ 这个字段**不属于** DSH 的 `GenerateOptions`（是本网关给 Build 渠道的扩展），
+  //    故用断言挂上去；其它适配器忽略它即可。
+  if (context.useNonStream !== undefined) {
+    (options as GenerateOptions & { useNonStream?: boolean }).useNonStream = context.useNonStream
   }
   return options
 }

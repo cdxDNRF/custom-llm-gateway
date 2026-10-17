@@ -842,6 +842,11 @@ export class OverviewServer {
       provider: providerId,
       model: modelId,
       sessionId: `gw-agg-${providerId}-${Date.now().toString(36)}`,
+      // ⚠️ **必须传**：Build 渠道默认走「假流式」（上游流式审核严、易截断），
+      //    只有客户端显式 stream:true 时才用真流式。
+      //    漏传会让这个开关对经聚合端点的调用**完全失效**（实测踩到：
+      //    打 8790 时 raw=undefined、始终走假流式，而打 3917 才生效）。
+      useNonStream: body.stream !== true,
     })
     const id = `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     const created = Math.floor(Date.now() / 1000)
@@ -997,6 +1002,8 @@ export class OverviewServer {
       provider: providerId,
       model: modelId,
       sessionId: `gw-msg-${providerId}-${Date.now().toString(36)}`,
+      // 同聚合 Chat：Build 渠道默认假流式，需显式传开关。
+      useNonStream: openAiBody.stream !== true,
     })
     // Anthropic 的消息 id 惯例是 `msg_` 前缀。
     const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
