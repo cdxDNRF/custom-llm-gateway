@@ -35,46 +35,55 @@ import { sanitizeGeminiSchema } from '../../vendor/src/gemini.js'
 import type { BuildRelay } from '../core/build-relay.js'
 
 /**
- * Build 渠道可用的模型（实测确认可推理的 flash 系列）。
+ * Build 渠道实测可用的模型，附**免费层速率上限**。
  *
- * ⚠️ 刻意**只放实测 200 的**：429（需付费）与 404（已下线）的不列，
- * 否则用户选中必然失败，且错误信息（"quota exceeded"）会让人以为是限流。
+ * ## 数据来源与已证实的结论
+ *
+ * 上限取自用户账号的 https://ai.dev/rate-limit 页面（2026-10-17）。该页也
+ * **证实了一件关键事实**：
+ *
+ *   ⚠️ **Build 反代用的就是这把免费层 API Key 的额度** —— 不是独立额度。
+ *
+ * 证据（对照两次页面截图，我做了一轮 6 模型调用）：被我调用的 6 个模型
+ * RPD **全部 +1**，而唯一没调用的 `Gemini 3 Flash` **纹丝不动**（1/20）。
+ * 这是同一配额池的直接证据，不是相关推测。
+ *
+ * ## 实测到的两种限制都在起作用
+ *
+ * | 模型族 | RPM | RPD | 实测 |
+ * |---|---|---|---|
+ * | Gemini 3.x Flash（3.5/3.6/3.7/3.8） | 5 | **20** | 快速连打 4 次 → 后 3 次 429；**等 60 秒仍 429** ⇒ 每日额度 |
+ * | Gemini 3.x Flash-Lite | 15 | 500 | 快速连打 4 次 → **全部成功** |
+ * | Gemma 4 31B | 30 | 14.4K | 可用（明显较慢） |
+ *
+ * 故：**Flash 系极易撞限**（20/天，正常聊天几轮就用完），日常请用
+ * Flash-Lite 或 Gemma。
+ *
+ * ## 另外两条实测结论
+ *
+ * · **额度按模型独立**：从未调用过的模型可立即使用 ⇒ 不是项目级总上限
+ * · **每日重置**：当晚 429 的四个 Flash 模型，次日实测全部恢复
+ *
+ * ⚠️ **不标"当前是否耗尽"** —— 那随当天用量变化，写死必然过期
+ *    （实测教训：昨天标的「额度耗尽」今天全部恢复，成了假信息）。
  */
 export const BUILD_MODELS: readonly {
   id: string
   name: string
   contextWindow: number
-  /**
-   * 免费层**每日请求上限（RPD）**。
-   *
-   * ⚠️ 数据来源：**用户账号的 rate-limit 页面**（https://ai.dev/rate-limit，
-   *    2026-10-17 截图），**不是**我从文档推断的 —— 那正是先前被用户纠正的
-   *    错误：我把 API Key 渠道的文档值当成本渠道的实测值断言了出去。
-   *
-   *    页面「上限」列实测值：
-   *      Gemini 3.x Flash（3.5/3.6/3.7/3.8）…… **20 RPD**
-   *      Gemini 3.1 / 3.5 Flash-Lite …………… **500 RPD**
-   *      Gemma 4 31B ……………………………………… **14.4K RPD**
-   *
-   * ⚠️ 这解释了本渠道的全部实测行为：
-   *    · 撞到 20 的四个 Flash 模型 → 429；500/14.4K 的三个 → 一直可用
-   *      （2026-10-17 实测吻合）
-   *    · **配额按模型独立**（从未调用过的模型可用 ⇒ 非项目级上限）
-   *    · **每天重置**（当晚 429 的四个模型，次日全部恢复）
-   *
-   * ⚠️ **列表按 RPD 降序**：默认选中的就是最耐用的那个。
-   *    但**不标"当前是否耗尽"** —— 那随当天用量变化，写死必然过期
-   *    （实测教训：昨天标的「额度耗尽」今天全部恢复，成了假信息）。
-   */
+  /** 每分钟请求上限（RPM）。 */
+  rpm: number
+  /** 每日请求上限（RPD）。 */
   rpd: number
 }[] = [
-  { id: 'gemma-4-31b-it', name: 'Gemma 4 31B（较慢）', contextWindow: 1_048_576, rpd: 14_400 },
-  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576, rpd: 500 },
-  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', contextWindow: 1_048_576, rpd: 500 },
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, rpd: 20 },
-  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, rpd: 20 },
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, rpd: 20 },
-  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576, rpd: 20 },
+  // ⚠️ 按"耐用度"降序（RPD 优先）—— 默认选中的就是最不容易撞限的。
+  { id: 'gemma-4-31b-it', name: 'Gemma 4 31B（较慢）', contextWindow: 1_048_576, rpm: 30, rpd: 14_400 },
+  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576, rpm: 15, rpd: 500 },
+  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', contextWindow: 1_048_576, rpm: 15, rpd: 500 },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
 ]
 
 /** REST 端点基址（App 的 host 白名单只放行 `*.googleapis.com`）。 */
@@ -113,7 +122,7 @@ export class BuildAdapter extends LlmAdapter {
     return BUILD_MODELS.map((m) => ({
       provider: 'build',
       id: m.id,
-      name: `${m.name} · ${m.rpd}/天`,
+      name: `${m.name} · ${m.rpd}/天 ${m.rpm}/分`,
     }))
   }
 
@@ -131,7 +140,7 @@ export class BuildAdapter extends LlmAdapter {
    */
   listAllModels(): readonly { id: string; name: string }[] {
     // 标出官方 RPD 上限（数据来源见 BUILD_MODELS.rpd 注释）。
-    return BUILD_MODELS.map((m) => ({ id: m.id, name: `${m.name} · ${m.rpd}/天` }))
+    return BUILD_MODELS.map((m) => ({ id: m.id, name: `${m.name} · ${m.rpd}/天 ${m.rpm}/分` }))
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -304,7 +313,7 @@ function describe429(body: string, headers: Record<string, string> = {}, model =
     // ⚠️ RPD 上限取自用户账号的 rate-limit 页面（见 BUILD_MODELS.rpd 注释）。
     //    **实测确认：配额按模型计**（从未用过的模型可用 ⇒ 非项目级上限），
     //    且**每天会重置**（2026-10-17 晚 429 的四个模型，次日全部恢复）。
-    verdict = `${model} 的当日额度已用完（上限 **${entry.rpd} 次/天**，**次日重置**）。`
+    verdict = `${model} 的额度已用完（上限 **${entry.rpd} 次/天 · ${entry.rpm} 次/分**，**每日重置**）。`
       + '额度按模型独立计算 —— 其它模型不受影响，'
       + '最耐用的是 gemma-4-31b-it（14.4K/天）与两个 Flash-Lite（500/天）。'
       + `用量明细见 https://ai.dev/rate-limit`
