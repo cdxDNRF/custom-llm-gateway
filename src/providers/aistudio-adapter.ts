@@ -260,7 +260,15 @@ function describeError(status: number, raw: string): string {
     const parsed = JSON.parse(raw) as { error?: { message?: string } }
     if (typeof parsed.error?.message === 'string') message = parsed.error.message
   } catch { /* 非 JSON：用原文 */ }
-  const brief = message.replace(/\s+/g, ' ').slice(0, 300)
+  // ⚠️⚠️ **不截断原文**（真实缺陷，2026-10-18 用户报障）：
+  //    先前截到 300 字，而 Google 的 429 原文**末尾**才是额度明细
+  //    （`* Quota exceeded for metric: generativelanguage.googleapis.com/…`），
+  //    截断后用户只能看到 `generativelanguage.googleapis.c` —— 正好把
+  //    "哪个指标超了"这个唯一有用的信息切掉。
+  //
+  //    额度明细是**多行**的（含 `metric` / `limit` / `quotaId`），故这里
+  //    保留完整文本，仅在 UI 层做换行处理。
+  const brief = message.replace(/\s+/g, ' ').trim()
 
   if (status === 400 && /API key not valid|API_KEY_INVALID/i.test(message)) {
     // ⚠️ **不要断言前缀**：`AQ.` 开头的**授权 Key**（2026-05 起 AI Studio 默认）
@@ -278,17 +286,44 @@ function describeError(status: number, raw: string): string {
     //    故 429 的 `QuotaFailure` 元数据是**唯一**能知道"哪个指标、上限多少、
     //    何时重置"的来源。参考实现 AIStudio2API 的 docs/development.md 亦按
     //    `quota_unit` / `quota_limit` / `quota_metric` + `RetryInfo` 判定。
+    // 先把**完整**原文给出去（含 `* Quota exceeded for metric: …` 明细）——
+    // 先前截断到 300 字，正好把 metric 名切断，用户无法判断是哪种限流。
     const quota = parseQuotaFailure(raw)
+    // ⚠️ 区分「每分钟」与「每日」：用户实测"额度没耗完"却报 429，多半是
+    //    **每分钟/每项目**的短窗口限流，等几十秒就好，不必等到次日。
+    //    上游原文里 `quotaId`/`metric` 会带 PerMinute / PerDay 字样。
+    const perMinute = /PerMinute|per.?minute|RPM/i.test(raw)
+    const perDay = /PerDay|per.?day|daily|RPD/i.test(raw)
     if (quota !== undefined) {
-      return `额度用尽：${quota}（**会重置**）。等重置后重试或换模型。`
+      const hint = perMinute ? '（是**每分钟**限流，等几十秒即可，不用等次日）'
+        : perDay ? '（是**每日**配额，次日重置）'
+          : '（会重置；若额度没耗完，多半是短窗口限流，等一会再试）'
+      return `额度/限流：${quota}${hint}`
     }
-    return `额度/限流用尽（免费层按模型计，每日重置）。等次日或换模型。原文：${brief}`
+    if (perMinute) return '触发**每分钟**限流（请求过快）—— 等几十秒再试即可，不用等次日。'
+    return '额度/限流用尽。若确认额度没耗完，多半是**短窗口限流**（每分钟/每项目），'
+      + '等几十秒重试；也可能该 Key 所在项目有并发限制。完整原文：' + brief
   }
   if (status === 403) {
     return `无权限（403）—— 该 Key 可能未启用此模型，或所在地区受限。原文：${brief}`
   }
   if (status === 404) {
     return `模型不存在（404）—— 该模型可能已下线。原文：${brief}`
+  }
+  // ⚠️ 503 / 500 分两种（实测区分，2026-10-18）：
+  //    · 503 `This model is currently experiencing high demand` —— **模型过载**，
+  //      换时间或换模型即可，**不是额度问题**
+  //    · 500 `Internal error encountered` —— 同为上游不稳定，与过载常伴生
+  //      （实测 gemma-4-31b-it 8 次里 5 次 500）
+  //    先前一律当"服务器错误"抛出，用户会误以为是自己的配置问题。
+  if (status === 503 || /high demand|overloaded|UNAVAILABLE/i.test(message)) {
+    return '该模型**当前过载**（上游临时性，非额度问题）—— 换时间或换模型重试。'
+      + `原文：${brief}`
+  }
+  if (status === 500 && /internal error/i.test(message)) {
+    return '上游**内部错误**（多为模型不稳定/过载的伴生现象，非你的配置问题）'
+      + ' —— 重试或换模型（实测 gemini-flash-lite-latest 最稳）。'
+      + `原文：${brief}`
   }
   return brief
 }
