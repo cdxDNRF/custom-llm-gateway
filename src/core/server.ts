@@ -804,8 +804,22 @@ export class OverviewServer {
             owned_by: provider.id,
           })
         }
-      } catch {
-        // 单个供应商不可用不影响整体列表。
+      } catch (error) {
+        // ⚠️⚠️ **必须记日志**（真实缺陷，2026-10-18 用户报障"buddy 没了"）：
+        //    原先这里是一个**完全静默**的 `catch {}` —— 某家供应商的
+        //    `listModels` 一旦抛错，它的模型就会从聚合列表里**无声消失**，
+        //    而 UI 上供应商卡片显示 `running: True`、自己的端口也列得出模型。
+        //
+        //    症状极具误导性：用户以为"供应商没开"，实际是聚合时抛错被吞了。
+        //    故这里至少要把 `provider.id` 与错误原因写进日志。
+        // 通过供应商自己的 logger 记（它会进 Web UI 的日志面板）。
+        try {
+          provider.gateway.logger.warn(
+            `聚合模型列表：本家 listModels 抛错，模型已被跳过 —— ${String(error)}`,
+          )
+        } catch {
+          console.warn(`[aggregateModels] ${provider.id} listModels 失败：${String(error)}`)
+        }
       }
     }
     sendJson(response, 200, { object: 'list', data })
