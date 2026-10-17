@@ -292,17 +292,44 @@ function describeError(status: number, raw: string): string {
     // ⚠️ 区分「每分钟」与「每日」：用户实测"额度没耗完"却报 429，多半是
     //    **每分钟/每项目**的短窗口限流，等几十秒就好，不必等到次日。
     //    上游原文里 `quotaId`/`metric` 会带 PerMinute / PerDay 字样。
-    const perMinute = /PerMinute|per.?minute|RPM/i.test(raw)
-    const perDay = /PerDay|per.?day|daily|RPD/i.test(raw)
+    // ⚠️⚠️ **必须按真实格式判据**（2026-10-18 用户拿到上游完整原文后纠正）：
+    //
+    //    我原先猜 `/PerMinute|RPM/`、`/PerDay|RPD/` —— **全部匹配不到**。
+    //    上游真实形态是：
+    //
+    //      * Quota exceeded for metric:
+    //        generativelanguage.googleapis.com/generate_content_free_tier_input_token_count,
+    //        limit: 16000, model: gemma-4-26b
+    //        Please retry in 26.191541171s.
+    //
+    //    可用的**可靠**信号：
+    //      · `_token_count` 指标 + `limit: N`  → **TPM（每分钟 token）**
+    //      · `Please retry in Ns`              → 秒级窗口 ⇒ **短窗口**，非每日
+    //      · 无 `retry in` 且提到 daily        → 每日
+    const tokenMetric = /_token_count|token_count/i.test(raw)
+    const limitMatch = /limit:\s*(\d+)/i.exec(raw)
+    const retryMatch = /retry in\s*([\d.]+)\s*s/i.exec(raw)
+    const retrySeconds = retryMatch === null ? undefined : Number(retryMatch[1])
+    const perDay = /PerDay|per.?day|daily|RPD|generate_requests_per_day/i.test(raw)
+
     if (quota !== undefined) {
-      const hint = perMinute ? '（是**每分钟**限流，等几十秒即可，不用等次日）'
-        : perDay ? '（是**每日**配额，次日重置）'
-          : '（会重置；若额度没耗完，多半是短窗口限流，等一会再试）'
+      const hint = perDay
+        ? '（**每日**配额，次日重置）'
+        : retrySeconds !== undefined
+          ? `（**短窗口**限流，约 ${Math.ceil(retrySeconds)} 秒后自动恢复）`
+          : '（会重置）'
       return `额度/限流：${quota}${hint}`
     }
-    if (perMinute) return '触发**每分钟**限流（请求过快）—— 等几十秒再试即可，不用等次日。'
-    return '额度/限流用尽。若确认额度没耗完，多半是**短窗口限流**（每分钟/每项目），'
-      + '等几十秒重试；也可能该 Key 所在项目有并发限制。完整原文：' + brief
+
+    // 秒级重试 ⇒ 一定是短窗口（TPM/RPM），不是每日配额 —— 这是判断
+    // "额度没耗完却 429" 的关键：等它给的时间即可。
+    if (retrySeconds !== undefined) {
+      const unit = tokenMetric ? '每分钟 **token** 数（TPM）' : '每分钟请求数（RPM）'
+      return `触发${unit}限流 —— 额度本身没耗完，**约 ${Math.ceil(retrySeconds)} 秒后自动恢复**。`
+        + `（上限 ${limitMatch?.[1] ?? '未知'}，原文：${brief}）`
+    }
+    return '额度/限流用尽。若确认额度没耗完，多半是**短窗口限流**（每分钟），'
+      + '等几十秒重试。完整原文：' + brief
   }
   if (status === 403) {
     return `无权限（403）—— 该 Key 可能未启用此模型，或所在地区受限。原文：${brief}`
