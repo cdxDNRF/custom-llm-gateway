@@ -86,7 +86,15 @@ import type { BuildRelay } from '../core/build-relay.js'
  * ⚠️ **不标"当前是否耗尽"** —— 那随当天用量变化，写死必然过期
  *    （实测教训：曾标的「额度耗尽」次日全部恢复，成了假信息）。
  */
-export const BUILD_MODELS: readonly {
+/**
+ * 上游模型的**基础表**（不含流式变体）。
+ *
+ * ⚠️ 这些是上游真实存在的模型 id。展示时会给每个模型派生出**两个条目**
+ *    （见 {@link BUILD_MODELS}）—— 真流式与「-假流式」，因为这两条路在上游
+ *    的**审核严格程度完全不同**（情报：build 流式审核非常严格、易截断），
+ *    把它们合成一个模型会让用户无法自主选择。
+ */
+export const BUILD_BASE_MODELS: readonly {
   id: string
   name: string
   contextWindow: number
@@ -101,6 +109,79 @@ export const BUILD_MODELS: readonly {
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576 },
   { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576 },
 ]
+
+/**
+ * 「假流式」模型 id 的后缀。
+ *
+ * ⚠️ 选 `-假流式`（而非 `-pseudo` / `-nostream`）：用户在酒馆的模型列表里挑，
+ *    中文后缀一眼能懂；且它只出现在**本网关暴露的 id** 上，不参与上游请求。
+ */
+export const PSEUDO_SUFFIX = '-假流式'
+
+/** 一个暴露给客户端的模型条目（基础模型 × 流式模式）。 */
+export interface BuildModelEntry {
+  /** 客户端使用的 id（基础模型 id，或带 {@link PSEUDO_SUFFIX}）。 */
+  id: string
+  name: string
+  contextWindow: number
+  /** 上游真实模型 id（去掉后缀）。 */
+  upstreamId: string
+  /**
+   * 是否强制「假流式」。
+   *
+   * ⚠️ `undefined` 表示**跟随请求的 `stream` 参数**（真流式模型的行为）；
+   *    `true`/`false` 表示客户端用 `-假流式` 后缀时**锁定**对应模式。
+   */
+  pseudo?: boolean
+  slow?: boolean
+}
+
+/**
+ * 暴露给客户端的模型清单：每个基础模型派生**两个条目**。
+ *
+ * ## 为什么要拆开（用户要求）
+ *
+ * 两条路的差别是**上游行为**层面的，不是同一个模型的开关：
+ *   · **真流式** —— 体验好（逐字出），但 Build 的流式审核严格，**易截断**
+ *   · **`-假流式`** —— 上游一次性返回、我们分片，**不截断**，但首字延迟高
+ *
+ * 合成一个模型时用户无法自主选择；拆开后可在酒馆里直接切。
+ *
+ * ⚠️ **额度按基础模型统一计算**（用户明确要求）：`gemini-3.8-flash` 与
+ *    `gemini-3.8-flash-假流式` 在上游是**同一个模型**，共用同一份配额 ——
+ *    拆开只影响客户端选择，不影响额度归属。本地计数也按**基础 id** 归并
+ *    （见 build-relay.ts 的 `bumpCounter`）。
+ */
+export const BUILD_MODELS: readonly BuildModelEntry[] = BUILD_BASE_MODELS.flatMap((base) => {
+  const suffix = base.slow === true ? '（较慢）' : ''
+  return [
+    {
+      id: base.id,
+      name: `${base.name}${suffix} · 真流式`,
+      contextWindow: base.contextWindow,
+      upstreamId: base.id,
+      ...(base.slow === true ? { slow: true } : {}),
+    },
+    {
+      id: `${base.id}${PSEUDO_SUFFIX}`,
+      name: `${base.name}${suffix} · 假流式`,
+      contextWindow: base.contextWindow,
+      upstreamId: base.id,
+      pseudo: true,
+      ...(base.slow === true ? { slow: true } : {}),
+    },
+  ]
+})
+
+/** 按客户端 id 找条目（含流式变体）。 */
+export function findBuildModel(id: string): BuildModelEntry | undefined {
+  return BUILD_MODELS.find((m) => m.id === id)
+}
+
+/** 客户端 id → 上游 id（去掉 `-假流式` 后缀）。 */
+export function upstreamModelId(id: string): string {
+  return id.endsWith(PSEUDO_SUFFIX) ? id.slice(0, -PSEUDO_SUFFIX.length) : id
+}
 
 /** REST 端点基址（App 的 host 白名单只放行 `*.googleapis.com`）。 */
 const REST_BASE = 'https://generativelanguage.googleapis.com/v1beta'
@@ -165,7 +246,7 @@ export class BuildAdapter extends LlmAdapter {
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    const entry = BUILD_MODELS.find((m) => m.id === model)
+    const entry = findBuildModel(model)
     if (entry === undefined) {
       throw new LlmError(
         `build: 模型 "${model}" 不在本渠道目录中（当前可用：${BUILD_MODELS.map((m) => m.id).join(', ')}）`,
@@ -195,10 +276,13 @@ export class BuildAdapter extends LlmAdapter {
     //    默认 true（假流式），因为上游流式审核严格、易截断。想用真流式可传
     //    `{useNonStream:false}`（经聚合层的 OpenAI `stream` 参数映射，见 server.ts）。
     const options = rawOptions as GenerateOptions & { useNonStream?: boolean }
-    const model = String(options.model)
-    if (!BUILD_MODELS.some((m) => m.id === model)) {
-      throw new LlmError(`build: 模型 "${model}" 不在本渠道目录中`, 'INVALID_REQUEST', { status: 404 })
+    const requested = String(options.model)
+    const entry = findBuildModel(requested)
+    if (entry === undefined) {
+      throw new LlmError(`build: 模型 "${requested}" 不在本渠道目录中`, 'INVALID_REQUEST', { status: 404 })
     }
+    // ⚠️ `-假流式` 后缀**不上游** —— 上游只认基础模型 id。
+    const model = entry.upstreamId
 
     const body = toRestBody(options, model)
 
@@ -211,15 +295,16 @@ export class BuildAdapter extends LlmAdapter {
     // 表现为莫名报错，且要换预设才能绕过）。
     // 判据按**请求形态**而非模型名黑名单 —— 上游行为可能变，形态判断更稳。
     const prefillStripped = endsWithModelTurn(body)
-    if (prefillStripped !== undefined) {
-      this.warn?.(`[build] ${model} 请求以 model turn 结尾 —— 已剥离预填充以兼容上游`)
-    }
 
     // ── 假流式（非流式）────────────────────────────────────────────
     // 情报：**build 的流式审核非常严格**，常被截断（"build易截断，尽量使用假流式"）。
     // 假流式 = 走 `:generateContent`（一次性返回），再由我们分片推给客户端。
     // ⚠️ 设为**默认**：截断表现为"回答说到一半停住"，比"稍等整段出来"糟得多。
-    const useNonStream = options.useNonStream !== false
+    // ⚠️ 条目锁定时（`-假流式` 后缀）**忽略**请求的 stream 参数 —— 用户选了这个
+    //    条目就是要假流式，不该因为酒馆传了 stream:true 而变成真流式。
+    const useNonStream = entry.pseudo === true
+      ? true
+      : options.useNonStream !== false
     const url = `${REST_BASE}/models/${model}:${useNonStream ? 'generateContent' : 'streamGenerateContent?alt=sse'}`
 
     const response = await this.relay.fetch({

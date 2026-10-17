@@ -299,6 +299,7 @@ rsync -a --delete --exclude .git --exclude lib --exclude node_modules \
 | `docs/how-to-run.md` | 运行方式、常驻机制、踩坑记录 |
 | `docs/architecture.md` | 架构：为什么 vendor 能零改动、协议转换、端口布局、请求路径 |
 | `docs/model-updates.md` | **模型更新机制**：远端目录 vs 静态表、两个「重拉」入口、`sync-vendor.sh` |
+| `docs/build-channel.md` | **Build 渠道**（AI Studio App 反代）：独立额度机制、用户激活前提、真假流式、额度与重置、常见问题 |
 | `LICENSE` | MIT（含第三方代码声明） |
 | `scripts/sync-vendor.sh` | 从上游同步 `vendor/`（自动备份 + 类型检查 + 重启） |
 

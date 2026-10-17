@@ -479,6 +479,12 @@ export class BuildRelay {
         pending.headers = (payload.headers ?? {}) as Record<string, string>
         // ⚠️ 在这里计数（而非发起时）：只有上游真的开始回应了才算消耗额度，
         //    "挂起/超时"多数没打到上游，不该计入。
+        //
+        // ⚠️ **额度按基础模型统一计**（用户明确要求）：`gemini-3.8-flash` 与
+        //    `gemini-3.8-flash-假流式` 在上游是**同一个模型**、共用同一份配额。
+        //    这里取 URL 里的 id —— 适配器发的**已经是去掉 `-假流式` 后缀的
+        //    upstreamId**（见 build-adapter.ts 的 `upstreamModelId`），
+        //    故两条目天然归并到同一个 key，无需额外归一化。
         this.bumpCounter(modelOf(pending.url))
         break
       case 'stream_chunk':
@@ -524,7 +530,22 @@ function modelOf(url: string): string {
  * ⚠️ 刻意与 usage 用同一个时区口径：日界不一致会出现"两处用量对不上"。
  */
 function dayKeyUtc8(): string {
-  const shifted = new Date(Date.now() + 8 * 3600_000)
+  // ⚠️ **日界不是自然日，而是北京时间 15:00**（用户给的情报，且实测吻合：
+  //    2026-10-17 15:00 前 3.7/3.5-flash 恒 429，当日 15:43 复测即恢复）。
+  //
+  //    "当日" = 「上一个北京时间 15:00 到现在」。
+  //
+  //    推导：把北京时间（UTC+8）看作可加的时间轴，减去 15 小时即得
+  //    "以上一个 15:00 为起点"的时刻；编码回 UTC 后取日期。
+  //    即 `now + 8h - 15h = now - 7h`，取其 UTC 日期。
+  //
+  //    校验（北京时间 → 键）：
+  //      10-17 14:59 → 10-16   （15:00 未到，仍算前一天）
+  //      10-17 15:01 → 10-17   （已过 15:00，进入新一天）
+  //      10-17 23:00 → 10-17
+  //      10-18 10:00 → 10-17   （次日 15:00 前仍算 10-17）
+  //      10-18 15:01 → 10-18
+  const shifted = new Date(Date.now() - 7 * 3600_000)
   return shifted.toISOString().slice(0, 10)
 }
 
