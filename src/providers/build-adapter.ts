@@ -37,35 +37,52 @@ import type { BuildRelay } from '../core/build-relay.js'
 /**
  * Build 渠道实测可用的模型，附**免费层速率上限**。
  *
- * ## 数据来源与已证实的结论
+ * ## ⚠️ 核心事实：Build 与 API Key 是**两套独立额度**（已实测证实）
  *
- * 上限取自用户账号的 https://ai.dev/rate-limit 页面（2026-10-17）。该页也
- * **证实了一件关键事实**：
+ * 最初我的实现让 App 的**服务端**用注入的 API Key 直连
+ * `generativelanguage.googleapis.com` —— 那条路烧的是 **API Key 额度**，
+ * 所以当时实测"调用后 rate-limit 页面 +1"，并据此错误地断言过"同池、无独立价值"，
+ * 甚至一度把这个渠道整个移除。
  *
- *   ⚠️ **Build 反代用的就是这把免费层 API Key 的额度** —— 不是独立额度。
+ * 真相来自对 [AIStudio2API](https://github.com/Mag1cFall/AIStudio2API) 的调研
+ * （`docs/build.md`）：Build 应用经 AI Studio **宿主页**调用 **MakerSuite 代理 RPC**
+ * 访问 Gemini API，**这部分额度与 Playground（= API Key）分开计算**。
  *
- * 证据（对照两次页面截图，我做了一轮 6 模型调用）：被我调用的 6 个模型
- * RPD **全部 +1**，而唯一没调用的 `Gemini 3 Flash` **纹丝不动**（1/20）。
- * 这是同一配额池的直接证据，不是相关推测。
+ * 关键在于**谁执行 fetch**：
  *
- * ## 实测到的两种限制都在起作用
+ * ```
+ * ❌ 服务端 fetch（带 API Key）→ generativelanguage 直连 → API Key 额度
+ * ✅ 浏览器端 fetch（不带 key）→ 宿主页 shim 拦截 → MakerSuite 代理 → Build 额度
+ * ```
+ *
+ * 宿主页 shim 会接管 iframe 内匹配 `generativelanguage.googleapis.com` 的 `fetch`，
+ * 经 MessagePort 转发给宿主页，由它完成 BotGuard/WAA proof 后走代理 RPC。
+ * **故我们无需自己实现 WAA** —— 用户的浏览器本来就在 AI Studio 页面里。
+ *
+ * ### 决定性实验（2026-10-17 15:00）
+ *
+ * 经网关对 `gemini-3.1-flash-lite` 连发 **6 次**（relay 计数 3→9，精确 +6），
+ * 随后刷新 https://ai.dev/rate-limit：该模型 RPD **仍是 35/500，纹丝不动**。
+ * 而 App 界面显示 `Intercepted by MakerSuite Host Proxy`。
+ * ⇒ 客户端 fetch 路径**不计入 API Key 额度**。
+ *
+ * ⚠️ 一个必要前提（来自宿主页的交互门控）：宿主页只在**用户激活后**才转发，
+ *    要求 `navigator.userActivation.hasBeenActive` 且累计约 30 次可信 mousemove
+ *    与 5 次 keydown。故**用户必须在 App 页面上动一动鼠标/敲几下键**，
+ *    否则 iframe 的 fetch 会一直挂起（症状是请求超时而非报错）。
+ *
+ * ## 速率上限（取自用户账页面，2026-10-17）
  *
  * | 模型族 | RPM | RPD | 实测 |
  * |---|---|---|---|
- * | Gemini 3.x Flash（3.5/3.6/3.7/3.8） | 5 | **20** | 快速连打 4 次 → 后 3 次 429；**等 60 秒仍 429** ⇒ 每日额度 |
+ * | Gemini 3.x Flash（3.5/3.6/3.7/3.8） | 5 | **20** | 快速连打 4 次 → 后 3 次 429；**等 60 秒仍 429** ⇒ 撞每日额度 |
  * | Gemini 3.x Flash-Lite | 15 | 500 | 快速连打 4 次 → **全部成功** |
  * | Gemma 4 31B | 30 | 14.4K | 可用（明显较慢） |
  *
- * 故：**Flash 系极易撞限**（20/天，正常聊天几轮就用完），日常请用
- * Flash-Lite 或 Gemma。
- *
- * ## 另外两条实测结论
- *
- * · **额度按模型独立**：从未调用过的模型可立即使用 ⇒ 不是项目级总上限
- * · **每日重置**：当晚 429 的四个 Flash 模型，次日实测全部恢复
+ * ⚠️ 这些是 **Build 通道自己的**上限（页面上的 RPD 列）。
  *
  * ⚠️ **不标"当前是否耗尽"** —— 那随当天用量变化，写死必然过期
- *    （实测教训：昨天标的「额度耗尽」今天全部恢复，成了假信息）。
+ *    （实测教训：曾标的「额度耗尽」次日全部恢复，成了假信息）。
  */
 export const BUILD_MODELS: readonly {
   id: string

@@ -17,15 +17,27 @@
  * （实测：HTTPS 页面连 `ws://127.0.0.1` **不受混合内容限制** ——
  *  Chrome 对 localhost 有豁免。故无需 HTTPS、无需公网 IP、无需隧道。）
  *
- * ## 与社区方案的关键区别
+ * ## 与社区方案的关键区别：把难的部分留给 AI Studio 宿主页
  *
- * 社区（CLIProxyAPI / AIStudioBuildWS 等）要跑**无头浏览器 + Cookie**，
- * 因为它们追求"服务端全自动"。而实测发现 **Build App 用的是服务端自动
- * 注入的密钥**（页面上的 `Server Key: Configured`），**根本不需要 Cookie**：
+ * 社区（AIStudio2API / CLIProxyAPI / AIStudioBuildWS）要跑**无头浏览器 +
+ * Cookie**，甚至**重实现 BotGuard/WAA proof**，因为它们追求"服务端全自动"。
  *
- *   · 不需要无头浏览器（用你日常 Chrome 开一个标签页即可）
+ * 我们不需要，因为**用户的浏览器本来就在 AI Studio 页面里** ——
+ * 宿主页会给 iframe 装上 shim，接管匹配 `generativelanguage.googleapis.com`
+ * 的 `fetch`，由它完成 WAA proof 并走 **MakerSuite 代理 RPC**（Build 独立额度）：
+ *
+ *   · 不需要无头浏览器（用日常 Chrome 开一个标签页即可）
  *   · 不需要提取/解密 Cookie（Chrome 的 Cookie 是 DPAPI 加密且运行时锁定）
+ *   · **不需要实现 WAA**（宿主页代劳）—— 这是本方案最大的省力点
  *   · 不需要公网入口
+ *
+ * ⚠️ **前提是请求必须由浏览器端 fetch 发出**（不带 API Key）。
+ *    若改由 App 服务端带 key 直连，就退回 API Key 额度了 —— 详见
+ *    `build-adapter.ts` 模块头的决定性实验。
+ *
+ * ⚠️ 另一个前提：宿主页只在**用户激活后**转发（约 30 次 mousemove + 5 次
+ *    keydown，且 `navigator.userActivation.hasBeenActive`）。故用户需在
+ *    App 页面上动一动鼠标/敲几下键。
  *
  * 代价是**用户要开着那个标签页** —— 这正是「手动连接」设计的由来。
  *

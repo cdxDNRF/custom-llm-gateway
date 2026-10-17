@@ -129,7 +129,10 @@ class BuildProvider extends GenericProviderBase implements Provider {
   }
 
   async queryBalance(): Promise<undefined> {
-    // 额度归 App owner 的 Google 账号，本网关无从查询（那是网页侧的数据）。
+    // ⚠️ 额度**不是**归"App owner 的 API Key"—— 实测证实走的是 Build 通道自己的
+    //    独立额度（见 build-adapter.ts 模块头的决定性实验）。
+    //    但这份额度只在 AI Studio 网页侧可见，网关无从查询：
+    //    想知道用量请看 https://ai.dev/rate-limit。
     return undefined
   }
 }
