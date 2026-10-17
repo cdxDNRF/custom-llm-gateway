@@ -143,15 +143,36 @@ export class AiStudioAdapter extends LlmAdapter {
     //    本渠道的 `fetch` 是全局裸 fetch —— 由 `gemini-proxy.ts` 的
     //    host 路由拦截器自动接管（`*.googleapis.com` 已在其匹配列表中），
     //    故这里**不需要**自行挂 proxy（provider 侧已安装该拦截器）。
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        // 🔑 AI Studio 的认证头（不要泄漏到 URL —— 会被日志/Referer 记录）。
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify(payload),
-    })
+    // ⚠️ 加超时：实测 `gemini-flash-latest` 偶发**挂起不响应**（直连上游 85 秒
+    //    HTTP 000），无超时会让客户端一直等。120 秒足够覆盖正常的慢推理
+    //    （thought 模型首字可能较晚），又不会无限挂起。
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 120_000)
+    timer.unref?.()
+    let response: Response
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          // 🔑 AI Studio 的认证头（不要泄漏到 URL —— 会被日志/Referer 记录）。
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      })
+    } catch (error) {
+      clearTimeout(timer)
+      const aborted = (error as { name?: string }).name === 'AbortError'
+      throw new LlmError(
+        aborted
+          ? `aistudio: 上游 120 秒无响应 —— ${model} 可能正忙/额度耗尽后挂起。`
+            + '可换模型重试（实测 gemini-flash-lite-latest / gemma-4-31b-it 更稳）。'
+          : `aistudio: 请求失败 —— ${String(error)}`,
+        'SERVER',
+      )
+    }
+    clearTimeout(timer)
 
     if (response.status !== 200) {
       const text = await response.text().catch(() => '')
@@ -186,6 +207,52 @@ export class AiStudioAdapter extends LlmAdapter {
   }
 }
 
+/**
+ * 从 429 错误体里解析 `QuotaFailure` 元数据。
+ *
+ * ⚠️ 这是本渠道**唯一**能拿到额度明细的来源（没有额度查询 API）。
+ *
+ * 上游结构（Google RPC 标准）：
+ * ```json
+ * { "error": {
+ *     "details": [
+ *       { "@type": ".../google.rpc.QuotaFailure",
+ *         "violations": [{ "quotaMetric": "...", "quotaId": "...",
+ *                          "quotaValue": "20", "quotaDimensions": {...} }] },
+ *       { "@type": ".../google.rpc.RetryInfo", "retryDelay": "37s" }
+ *     ] } }
+ * ```
+ *
+ * @returns 一句人类可读的摘要；解析不出时返回 `undefined`（由调用方回退通用文案）。
+ */
+function parseQuotaFailure(raw: string): string | undefined {
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { return undefined }
+  const details = (parsed as { error?: { details?: unknown } }).error?.details
+  if (!Array.isArray(details)) return undefined
+
+  const parts: string[] = []
+  for (const detail of details as { '@type'?: string; violations?: unknown; retryDelay?: unknown }[]) {
+    const type = String(detail['@type'] ?? '')
+    if (type.endsWith('QuotaFailure') && Array.isArray(detail.violations)) {
+      for (const v of detail.violations as { quotaMetric?: unknown; quotaId?: unknown; quotaValue?: unknown }[]) {
+        // quotaId 形如 `GenerateRequestsPerDayPerProjectPerModel-FreeTier`
+        const id = String(v.quotaId ?? v.quotaMetric ?? '')
+        const value = v.quotaValue === undefined ? '' : ` 上限 ${String(v.quotaValue)}`
+        // 把 snake/长 id 换成简短中文
+        const what = /PerDay/i.test(id) ? '每日请求数'
+          : /PerMinute/i.test(id) ? '每分钟请求数'
+            : /Token/i.test(id) ? 'token 数'
+              : id
+        if (what.length > 0) parts.push(`${what}${value}`)
+      }
+    } else if (type.endsWith('RetryInfo') && typeof detail.retryDelay === 'string') {
+      parts.push(`${detail.retryDelay} 后可重试`)
+    }
+  }
+  return parts.length > 0 ? parts.join('、') : undefined
+}
+
 /** 把上游错误翻译成可行动的提示。 */
 function describeError(status: number, raw: string): string {
   let message = raw
@@ -204,6 +271,17 @@ function describeError(status: number, raw: string): string {
       + '重新确认（AIza… 标准 Key 与 AQ.… 授权 Key 都支持）。原文：' + brief
   }
   if (status === 429) {
+    // ⚠️ **额度信息只在这里能拿到**（实测确认：Gemini API 没有独立的额度查询
+    //    端点 —— `/v1beta/quota` 等全部 404；ListModels 只回 token 上下文上限；
+    //    正常响应的头也不带 x-ratelimit-*）。
+    //
+    //    故 429 的 `QuotaFailure` 元数据是**唯一**能知道"哪个指标、上限多少、
+    //    何时重置"的来源。参考实现 AIStudio2API 的 docs/development.md 亦按
+    //    `quota_unit` / `quota_limit` / `quota_metric` + `RetryInfo` 判定。
+    const quota = parseQuotaFailure(raw)
+    if (quota !== undefined) {
+      return `额度用尽：${quota}（**会重置**）。等重置后重试或换模型。`
+    }
     return `额度/限流用尽（免费层按模型计，每日重置）。等次日或换模型。原文：${brief}`
   }
   if (status === 403) {
