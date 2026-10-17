@@ -33,7 +33,6 @@ import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk, GenerateOptions }
 import { consumeGeminiSse } from '../../vendor/src/gemini-messages.js'
 import { translateGeminiResponse } from '../../vendor/src/gemini-messages.js'
 import type { GeminiResponse } from '../../vendor/src/gemini-messages.js'
-import { sanitizeGeminiSchema } from '../../vendor/src/gemini.js'
 import type { BuildRelay } from '../core/build-relay.js'
 
 /**
@@ -622,18 +621,27 @@ function toRestBody(options: GenerateOptions, model: string): Record<string, unk
       functionDeclarations: options.tools.map((tool) => ({
         name: tool.name,
         ...(tool.description === undefined ? {} : { description: tool.description }),
-        // ⚠️⚠️ **必须清洗**（真实缺陷，2026-10-17 用户报障）：DSH 给的是完整
-        //    JSON Schema，而 Gemini 的 `functionDeclarations[].parameters` 只接受
-        //    **OpenAPI 子集**。直接透传会 400：
-        //      Invalid JSON payload received. Unknown name "$schema" at
-        //      'tools[0].function_declarations[0].parameters'
-        //      Unknown name "exclusiveMinimum" …
-        //    复用 vendor 的 `sanitizeGeminiSchema`（反重力渠道走的就是它）：
-        //    白名单删键 + 递归 properties/items/anyOf + 数组 type 收敛 + 非字符串
-        //    枚举整删。⚠️ 不自己写一份 —— 那份已经处理了这些边角，重写必然漏。
+        // ⚠️⚠️ 字段名必须是 **`parametersJsonSchema`**，不是 `parameters`
+        //    （真实缺陷，2026-10-17 用户报障：opencode agent 场景恒 400
+        //    `Request contains an invalid argument.`）。
+        //
+        //    背景：Gemini 有**两套**工具参数字段，语义不同：
+        //      · `parameters`            —— 只接受 **OpenAPI 子集**（白名单键，
+        //        多一个 `$schema`/`exclusiveMinimum` 就报
+        //        `Unknown name "$schema" at …`）
+        //      · `parametersJsonSchema`  —— 接受**完整 JSON Schema，原样发送**
+        //
+        //    先前用 `parameters` + `sanitizeGeminiSchema` 清洗，在**普通对话**里
+        //    可用；但 Build 通道（MakerSuite 代理）上**任何 `parameters` 都 400**
+        //    （实测：连无参数的极简 tool 也 400），而 `parametersJsonSchema`
+        //    正常。参考实现 AIStudio2API 的 `docs/build.md` 亦写明：
+        //      `{"functionDeclarations":[{"name","description?","parametersJsonSchema?"}]}`
+        //      「JSON Schema 原样发送」
+        //
+        //    ⚠️ 故这里**不需要再清洗** —— `parametersJsonSchema` 就是原样接收。
         ...(tool.parameters === undefined
           ? {}
-          : { parameters: sanitizeGeminiSchema(tool.parameters as Record<string, unknown>) }),
+          : { parametersJsonSchema: tool.parameters }),
       })),
     }]
   }
