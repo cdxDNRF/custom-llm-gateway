@@ -1412,11 +1412,24 @@ async function loadBuild() {
       ? new Date(status.lastPingAt).toLocaleTimeString('zh-CN')
       : '—'
 
+    // 用户激活状态（本渠道最易误判的失败前提）。
+    // ⚠️ App 未上报时显示"未上报"，**不假装 false** —— 那会误导用户去乱动鼠标。
+    const act = status.activation
+    const actText = act === undefined
+      ? { dot: '⚪', text: '未上报', cls: '' }
+      : act.active
+        ? { dot: '🟢', text: `已激活 (${act.moves} 移动 / ${act.keys} 按键)`, cls: '' }
+        : { dot: '🔴', text: `未激活 (${act.moves}/30 移动 · ${act.keys}/5 按键)`, cls: ' usage-card-warn' }
+
     box.innerHTML = `
       <div class="usage-summary" style="margin-bottom:0">
         <div class="usage-card">
           <div class="usage-num">${dot} ${label}</div>
           <div class="usage-label">连接状态</div>
+        </div>
+        <div class="usage-card${actText.cls}">
+          <div class="usage-num" style="font-size:15px">${actText.dot} ${escapeHtml(actText.text)}</div>
+          <div class="usage-label">用户激活（转发前提）</div>
         </div>
         <div class="usage-card">
           <div class="usage-num">${status.relays ?? 0}</div>
@@ -1431,6 +1444,17 @@ async function loadBuild() {
           <div class="usage-label">最后心跳</div>
         </div>
       </div>
+      ${status.hungRequest ? `
+        <p class="build-alert">
+          ⏳ 有请求已等待 ${Math.round((status.hungRequest.waitedMs || 0) / 1000)} 秒未回应，
+          疑似被宿主页挂起。<b>请到 App 页面移动鼠标 / 按几下键</b>（宿主页只在用户激活后
+          才转发浏览器端 fetch；未满足时 fetch 会一直挂起，表现为超时而非报错）。
+        </p>` : ''}
+      ${act !== undefined && act.active === false && !status.hungRequest ? `
+        <p class="build-alert">
+          ⚠️ 用户激活**尚未满足** —— 转发会被挂起。请到 App 页面移动鼠标（约 30 次）
+          并按几下键（约 5 次），或改用手机/触屏设备。
+        </p>` : ''}
       ${status.lastError ? `<p class="hint" style="margin:10px 0 0">最近错误：${escapeHtml(status.lastError)}</p>` : ''}
       ${!enabled ? '<p class="hint" style="margin:10px 0 0">⚠️ 该供应商未启用，请到「供应商」页启用它。</p>' : ''}`
 
@@ -1452,6 +1476,19 @@ async function loadBuild() {
     if (code !== null) {
       code.textContent = wsUrl
       code.onclick = () => { void navigator.clipboard.writeText(wsUrl).then(() => toast('已复制 WebSocket 地址', 'ok')) }
+    }
+
+    // **当日用量**（本地记账；上游查不到 Build 的额度 —— 见 build-relay.ts 注释）
+    const usageArr = Array.isArray(status.usage) ? status.usage : []
+    const usageBox = $('#build-usage')
+    if (usageBox !== null) {
+      usageBox.innerHTML = usageArr.length === 0
+        ? '<div class="empty">今日尚无调用记录</div>'
+        : usageArr.map((u) => `
+            <div class="build-usage-row">
+              <span class="model-id">${escapeHtml(u.model)}</span>
+              <span class="tag">今日 ${u.count} 次</span>
+            </div>`).join('')
     }
 
     // 模型清单

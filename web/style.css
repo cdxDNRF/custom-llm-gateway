@@ -537,3 +537,25 @@ main { max-width: 1500px; margin: 0 auto; padding: 22px 24px 60px; }
 .build-appurl-row { display: flex; gap: 8px; align-items: center; }
 .build-appurl-row .model-search { flex: 1; }
 #build-appurl-hint { margin: 6px 0 0; }
+
+/* Build 页：需要用户行动时的告警条（激活未满足 / 请求挂起） */
+.build-alert {
+  margin: 10px 0 0;
+  padding: 9px 12px;
+  border-radius: 8px;
+  font-size: 12.8px;
+  line-height: 1.7;
+  color: var(--warn-text, #f0c674);
+  background: color-mix(in srgb, #f0c674 12%, transparent);
+  border: 1px solid color-mix(in srgb, #f0c674 32%, transparent);
+}
+.build-alert b { color: var(--text); }
+
+/* Build 页：今日用量行 */
+.build-usage { display: flex; flex-direction: column; gap: 4px; }
+.build-usage-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; border-radius: 7px;
+  background: var(--surface-2, rgba(255,255,255,.03));
+  font-size: 12.6px;
+}

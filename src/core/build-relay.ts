@@ -63,6 +63,8 @@ import type { Duplex } from 'node:stream'
 
 /** 一次待完成的转发请求。 */
 interface PendingRequest {
+  /** 请求的 URL（用于按模型分桶计数）。 */
+  url: string
   /** 收到的响应头（`stream_start` 时填）。 */
   status?: number
   headers?: Record<string, string>
@@ -89,6 +91,41 @@ export interface BuildRelayStatus {
   listening: boolean
   /** 是否接受 App 连接（Web UI 的开关）。 */
   accepting: boolean
+  /**
+   * App 页面是否已具备**宿主页转发所需的用户激活**。
+   *
+   * ⚠️ 这是本渠道最易误判的失败前提：AI Studio 宿主页只在用户激活后才转发
+   *    浏览器端 fetch（需 `navigator.userActivation.hasBeenActive` 且累计约
+   *    30 次可信 mousemove、5 次 keydown）。未满足时 iframe 的 fetch
+   *    **保持挂起**，症状是**请求超时而非报错** —— 没有这个标志就只能靠猜。
+   *
+   * 由 App 在 `pong` 帧里上报（`payload.activation`），故 `undefined` 表示
+   * **App 还没上报过**（旧版 App 或刚连上）。
+   */
+  activation?: { active: boolean; moves: number; keys: number }
+  /**
+   * **按模型的当日调用计数**（本地记账）。
+   *
+   * ⚠️ 为什么只能本地记：Build 通道的额度**上游查不到** ——
+   *    · 它的上游是 MakerSuite 代理 RPC，没有公开的额度查询端点
+   *    · https://ai.dev/rate-limit 只显示 **API Key（Playground）** 的用量，
+   *      **不含 Build**（实测确认：6 次 Build 调用后该页面纹丝不动）
+   *    · 宿主页内部有 `get_model_quota` 消息，但那是 iframe↔宿主页的私有通道，
+   *      我们作为外部 WS 服务端看不到
+   *    故退而求其次：**自己记**，让用户至少能看到"今天用了多少次"，
+   *    而不是在撞上未知上限时一无所知。
+   *
+   * ⚠️ 计数**只统计真正发出并被回应的请求**（`stream_start` 到达才计），
+   *    避免把"挂起/超时"也算成消耗（那些多半没真的打到上游）。
+   */
+  usage: { model: string; count: number }[]
+  /**
+   * 是否有请求**疑似被宿主页挂起**（超过 {@link HANG_HINT_MS} 未回任何帧）。
+   *
+   * ⚠️ 用于把"超时"翻译成可行动的"请去 App 页面动一下鼠标"，而不是让用户
+   *    对着一个 timeout 干瞪眼。
+   */
+  hungRequest?: { url: string; waitedMs: number }
   /** 已连接（App 已握手）的次数/是否存在活跃连接。 */
   connected: boolean
   /** 累计完成的转发请求数。 */
@@ -115,6 +152,14 @@ export interface BuildRelayOptions {
 /** 转发默认超时：LLM 推理可能较慢，给足 5 分钟。 */
 const DEFAULT_TIMEOUT_MS = 5 * 60_000
 
+/**
+ * 超过这个时长未收到**任何**帧 ⇒ 视为疑似被宿主页挂起。
+ *
+ * ⚠️ 取值权衡：正常推理首帧（含 HTML 冷启动重试）可能几秒到十几秒，
+ *    故取 15 秒 —— 足够避开正常慢启动，又能让用户尽早看到可行动的提示。
+ */
+const HANG_HINT_MS = 15_000
+
 /** WebSocket 握手用的固定 GUID（RFC 6455）。 */
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
@@ -134,6 +179,14 @@ export class BuildRelay {
   private failures = 0
   private lastPingAt: number | undefined
   private lastError: string | undefined
+  /** App 上报的激活状态（见 BuildRelayStatus.activation）。 */
+  private activation: { active: boolean; moves: number; keys: number } | undefined
+  /** 当前 in-flight 请求的起始信息（用于挂起检测）。 */
+  private inflight: { url: string; at: number } | undefined
+  /** 按模型分桶的当日计数（`dayKey` 变化时清零）。 */
+  private counters = new Map<string, number>()
+  /** 计数器所属的日期（UTC+8，与 usage.ts 的日界一致）。 */
+  private counterDay = ''
   /** 收到的 WS 帧缓冲（TCP 分片可能把一个帧切开）。 */
   private frameBuffer = Buffer.alloc(0)
 
@@ -158,6 +211,13 @@ export class BuildRelay {
       failures: this.failures,
       ...(this.lastPingAt !== undefined ? { lastPingAt: this.lastPingAt } : {}),
       ...(this.lastError !== undefined ? { lastError: this.lastError } : {}),
+      ...(this.activation !== undefined ? { activation: this.activation } : {}),
+      usage: [...this.counters.entries()]
+        .map(([model, count]) => ({ model, count }))
+        .sort((a, b) => b.count - a.count),
+      ...(this.inflight !== undefined && Date.now() - this.inflight.at >= HANG_HINT_MS
+        ? { hungRequest: { url: this.inflight.url, waitedMs: Date.now() - this.inflight.at } }
+        : {}),
     }
   }
 
@@ -238,12 +298,19 @@ export class BuildRelay {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         this.failures++
-        reject(new Error(`Build 渠道转发超时（${timeoutMs}ms）：${input.url}`))
+        reject(new Error(
+          `Build 渠道转发超时（${timeoutMs}ms）：${input.url}`
+          + (this.activation?.active === false
+            ? '\n⚠️ App 页面的**用户激活**尚未满足 —— 请到 App 页面移动鼠标 / 按几下键'
+              + '（宿主页只在激活后才转发浏览器端 fetch，未满足时 fetch 会一直挂起）。'
+            : ''),
+        ))
       }, timeoutMs)
       // ⚠️ 不让这个定时器拖住进程退出。
       timer.unref?.()
 
-      this.pending.set(id, { chunks: [], resolve, reject, timer })
+      this.pending.set(id, { url: input.url, chunks: [], resolve, reject, timer })
+      this.inflight = { url: input.url, at: Date.now() }
       const frame = encodeFrame(JSON.stringify({
         id,
         type: 'http_request',
@@ -322,6 +389,37 @@ export class BuildRelay {
   }
 
   /**
+   * 当日计数 +1（`dayKey` 变化时先清零，保证跨日自动重置）。
+   *
+   * ⚠️ 用 UTC+8 与 `usage.ts` 的 `dayKey` 保持一致 —— 两处日界不同会让
+   *    "用量页显示 3 次、模型页显示 5 次"这类对不上账的问题。
+   */
+  private bumpCounter(model: string): void {
+    const today = dayKeyUtc8()
+    if (today !== this.counterDay) {
+      this.counters.clear()
+      this.counterDay = today
+    }
+    if (model.length === 0) return
+    this.counters.set(model, (this.counters.get(model) ?? 0) + 1)
+  }
+
+  /** 读取 App 上报的激活状态（宽容解析：字段缺失/类型不对就忽略）。 */
+  private readActivation(source: unknown): void {
+    if (typeof source !== 'object' || source === null) return
+    const raw = (source as { activation?: unknown }).activation
+      ?? (source as { payload?: { activation?: unknown } }).payload?.activation
+    if (typeof raw !== 'object' || raw === null) return
+    const rec = raw as { active?: unknown; moves?: unknown; keys?: unknown }
+    if (typeof rec.active !== 'boolean') return
+    this.activation = {
+      active: rec.active,
+      moves: typeof rec.moves === 'number' ? rec.moves : 0,
+      keys: typeof rec.keys === 'number' ? rec.keys : 0,
+    }
+  }
+
+  /**
    * 解析 WebSocket 帧。
    *
    * ⚠️ 必须处理**分片与粘包**：TCP 不保证一个 `data` 事件对应一个完整帧。
@@ -354,7 +452,16 @@ export class BuildRelay {
     }
     if (message.type === 'ping') {
       this.lastPingAt = Date.now()
-      try { this.socket?.write(encodeFrame(JSON.stringify({ type: 'pong', id: message.id }), 0x1)) } catch { /* 忽略 */ }
+      // ⚠️ App 在 ping 的 payload 里上报激活状态（可选字段 —— 旧版 App 不发，
+      //    此时保持 undefined，UI 显示"未上报"而不是假装 false）。
+      this.readActivation(message.payload)
+      let reply: Record<string, unknown> = { type: 'pong', id: message.id }
+      try { this.socket?.write(encodeFrame(JSON.stringify(reply), 0x1)) } catch { /* 忽略 */ }
+      return
+    }
+    // 也接受独立的上报帧（App 状态变化时可主动发）。
+    if (message.type === 'activation') {
+      this.readActivation(message as unknown as Record<string, unknown>)
       return
     }
     const id = typeof message.id === 'string' ? message.id : ''
@@ -366,6 +473,9 @@ export class BuildRelay {
       case 'stream_start':
         pending.status = typeof payload.status === 'number' ? payload.status : 200
         pending.headers = (payload.headers ?? {}) as Record<string, string>
+        // ⚠️ 在这里计数（而非发起时）：只有上游真的开始回应了才算消耗额度，
+        //    "挂起/超时"多数没打到上游，不该计入。
+        this.bumpCounter(modelOf(pending.url))
         break
       case 'stream_chunk':
         if (typeof payload.data === 'string') pending.chunks.push(payload.data)
@@ -373,6 +483,7 @@ export class BuildRelay {
       case 'stream_end': {
         this.pending.delete(id)
         clearTimeout(pending.timer)
+        this.inflight = undefined
         this.relays++
         pending.resolve({
           status: pending.status ?? 200,
@@ -384,6 +495,7 @@ export class BuildRelay {
       case 'error': {
         this.pending.delete(id)
         clearTimeout(pending.timer)
+        this.inflight = undefined
         this.failures++
         const messageText = typeof payload.message === 'string' ? payload.message : '未知错误'
         this.lastError = messageText
@@ -394,6 +506,22 @@ export class BuildRelay {
         break
     }
   }
+}
+
+/** 从请求 URL 里取模型 id（`/models/<id>:streamGenerateContent`）。 */
+function modelOf(url: string): string {
+  const m = /\/models\/([^:?/]+)/.exec(url)
+  return m?.[1] ?? ''
+}
+
+/**
+ * 当日键（UTC+8），与 `usage.ts` 的 `dayKey` 同源。
+ *
+ * ⚠️ 刻意与 usage 用同一个时区口径：日界不一致会出现"两处用量对不上"。
+ */
+function dayKeyUtc8(): string {
+  const shifted = new Date(Date.now() + 8 * 3600_000)
+  return shifted.toISOString().slice(0, 10)
 }
 
 /** 编码一个 WebSocket 帧（服务端 → 客户端，**不掩码**）。 */

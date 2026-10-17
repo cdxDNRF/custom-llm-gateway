@@ -88,19 +88,16 @@ export const BUILD_MODELS: readonly {
   id: string
   name: string
   contextWindow: number
-  /** 每分钟请求上限（RPM）。 */
-  rpm: number
-  /** 每日请求上限（RPD）。 */
-  rpd: number
+  /** 实测偏慢（同一请求曾超时 130 秒），名字上标出来。 */
+  slow?: boolean
 }[] = [
-  // ⚠️ 按"耐用度"降序（RPD 优先）—— 默认选中的就是最不容易撞限的。
-  { id: 'gemma-4-31b-it', name: 'Gemma 4 31B（较慢）', contextWindow: 1_048_576, rpm: 30, rpd: 14_400 },
-  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576, rpm: 15, rpd: 500 },
-  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', contextWindow: 1_048_576, rpm: 15, rpd: 500 },
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
-  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
-  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576, rpm: 5, rpd: 20 },
+  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', contextWindow: 1_048_576 },
+  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', contextWindow: 1_048_576 },
+  { id: 'gemma-4-31b-it', name: 'Gemma 4 31B', contextWindow: 1_048_576, slow: true },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576 },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576 },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576 },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', contextWindow: 1_048_576 },
 ]
 
 /** REST 端点基址（App 的 host 白名单只放行 `*.googleapis.com`）。 */
@@ -136,10 +133,11 @@ export class BuildAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // 限额数字的来源问题见 listAllModels 的注释（那是 API Key 的数，不是 Build 的）。
     return BUILD_MODELS.map((m) => ({
       provider: 'build',
       id: m.id,
-      name: `${m.name} · ${m.rpd}/天 ${m.rpm}/分`,
+      name: m.name,
     }))
   }
 
@@ -156,8 +154,12 @@ export class BuildAdapter extends LlmAdapter {
    * （与 `minimax-adapter.ts` 记录的同类缺陷相同）。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    // 标出官方 RPD 上限（数据来源见 BUILD_MODELS.rpd 注释）。
-    return BUILD_MODELS.map((m) => ({ id: m.id, name: `${m.name} · ${m.rpd}/天 ${m.rpm}/分` }))
+    // ⚠️ **不标限额数字** —— 先前标的"500/天 15/分"是 **API Key（Playground）** 的
+    //    限额（取自 rate-limit 页面），而实测证明 Build 走**独立额度**、且那个页面
+    //    **不显示 Build 的用量** ⇒ 把 API Key 的数字标在 Build 模型上属于误导
+    //    （用户已指出："供应商页面的模型名称还是 apikey 的"）。
+    //    真实上限未公开；能确定的是**按模型独立**且**会重置**。
+    return BUILD_MODELS.map((m) => ({ id: m.id, name: m.name }))
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -264,6 +266,17 @@ export class BuildAdapter extends LlmAdapter {
           { status: 429 },
         )
       }
+      if (response2.status === 400 && /has not been activated|user activation/i.test(response2.body)) {
+        // ⚠️ 宿主页的交互门控：未满足时 iframe 的 fetch **保持等待**（不是报错），
+        //    表现是超时。少数情况下上游会明确回 activation 相关文案，此时给出
+        //    可行动的提示 —— 这是本渠道最易误判的失败方式。
+        throw new LlmError(
+          'build: 宿主页尚未放行转发 —— 请在 App 页面上**移动鼠标 / 按几下键**'
+          + '（约 30 次 mousemove + 5 次 keydown，且需 navigator.userActivation.hasBeenActive）。',
+          'INVALID_REQUEST',
+          { status: 400 },
+        )
+      }
       throw new LlmError(
         `build: HTTP ${response2.status} — ${upstreamMessage(response2.body)}`,
         'SERVER',
@@ -327,13 +340,12 @@ function describe429(body: string, headers: Record<string, string> = {}, model =
   } else if (!/billing|paid|plan/.test(lower) && /free\s*tier|unsupported/i.test(lower)) {
     verdict = '该模型在免费层**无权限**（需付费等级）。'
   } else if (entry !== undefined) {
-    // ⚠️ RPD 上限取自用户账号的 rate-limit 页面（见 BUILD_MODELS.rpd 注释）。
-    //    **实测确认：配额按模型计**（从未用过的模型可用 ⇒ 非项目级上限），
-    //    且**每天会重置**（2026-10-17 晚 429 的四个模型，次日全部恢复）。
-    verdict = `${model} 的额度已用完（上限 **${entry.rpd} 次/天 · ${entry.rpm} 次/分**，**每日重置**）。`
-      + '额度按模型独立计算 —— 其它模型不受影响，'
-      + '最耐用的是 gemma-4-31b-it（14.4K/天）与两个 Flash-Lite（500/天）。'
-      + `用量明细见 https://ai.dev/rate-limit`
+    // ⚠️ **不报具体数字**：Build 通道自己的限额未公开（rate-limit 页面只显示
+    //    API Key/Playground 的用量，**不含 Build**，故那里看不到本渠道的额度）。
+    //    实测确定的事实只有：按模型计、会重置、隔 90 秒重试仍 429（⇒ 非每分钟限流）。
+    verdict = `${entry.name} 的额度已用完（**会重置**）。`
+      + '额度**按模型独立**计算 —— 其它模型不受影响，可换一个再试。'
+      + 'Build 通道的用量不在 api 密钥的 rate-limit 页面显示。'
   } else {
     verdict = '配额/限流。'
   }
