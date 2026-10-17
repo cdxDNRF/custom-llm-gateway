@@ -17,6 +17,7 @@ import { recentLogs } from './logger.js'
 import { lanAddresses } from './net.js'
 import { corsHeaders } from './cors.js'
 import { tapUsage, type StreamUsage, type UsageStore } from './usage.js'
+import type { BuildRelay } from './build-relay.js'
 import {
   anthropicToOpenAiRequest,
   streamChunksToAnthropicSse,
@@ -45,6 +46,13 @@ export interface OverviewServerOptions {
   runtime?: ProviderRuntime
   /** 用量统计（记录每次调用的模型/token/耗时）。 */
   usage?: UsageStore
+  /**
+   * Build 渠道的 WebSocket 中继。
+   *
+   * ⚠️ 与 provider 侧是**同一个实例**（进程级单例，见 `build.ts`）——
+   * 否则 server 收到连接 A、provider 往 B 发请求，症状是"已连接但请求超时"。
+   */
+  buildRelay?: BuildRelay
 }
 
 import type { ProviderRuntime } from './provider-runtime.js'
@@ -102,6 +110,8 @@ export class OverviewServer {
   private readonly dataDir: string
   private readonly runtime: ProviderRuntime | undefined
   private readonly usage: UsageStore | undefined
+  /** Build 渠道的 WebSocket 中继（可选；未启用时为 undefined）。 */
+  private buildRelay: BuildRelay | undefined
 
   constructor(options: OverviewServerOptions) {
     this.providers = options.providers
@@ -112,6 +122,7 @@ export class OverviewServer {
     this.dataDir = options.dataDir
     this.runtime = options.runtime
     this.usage = options.usage
+    this.buildRelay = options.buildRelay
   }
 
   get baseUrl(): string {
@@ -184,6 +195,20 @@ export class OverviewServer {
       })
     })
     this.server = server
+
+    // ── Build 渠道：把 WebSocket upgrade 挂到同一个 server 上 ──
+    //
+    // ⚠️ 必须**复用网关端口**（不另开一个）：App 页面里的 URL 由用户在
+    //    Web UI 上复制，多一个端口就多一处配错的地方。WebSocket 走 `upgrade`
+    //    事件、普通请求走 `request` 事件，两者在同一端口天然共存。
+    //
+    // ⚠️ relay 实例是**进程级单例**（见 build.ts 的 `buildRelayFor`）——
+    //    server 挂的监听与 provider 发请求必须是同一个对象，否则
+    //    "页面显示 Connected 但请求永远超时"。
+    if (this.buildRelay !== undefined) {
+      this.buildRelay.attach(server)
+    }
+
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
       server.listen(this.port, this.host, () => {
@@ -381,6 +406,44 @@ export class OverviewServer {
 
     if (path === '/api/logs' && request.method === 'GET') {
       sendJson(response, 200, { logs: recentLogs(300) })
+      return
+    }
+
+    // ── Build 渠道：连接控制（Web UI 的「连接 / 断开」）──
+    //
+    // ⚠️ 语义是「是否接受 App 连接」，不是"开关端口"（端口与网关共用）。
+    //    断开时 App 会收到 403、显示 Disconnected（符合用户预期）。
+    if (path === '/api/build/status' && request.method === 'GET') {
+      const relay = this.buildRelay
+      const { readBuildAppUrl } = await import('../providers/registry.js')
+      sendJson(response, 200, relay === undefined
+        ? { enabled: false, appUrl: readBuildAppUrl(this.dataDir) }
+        : { enabled: true, appUrl: readBuildAppUrl(this.dataDir), ...relay.status() })
+      return
+    }
+    // 保存/清空 App 链接（Build 页的输入框）。
+    if (path === '/api/build/app-url' && request.method === 'POST') {
+      let body: { url?: unknown } = {}
+      try { body = JSON.parse(await readBody(request)) as typeof body } catch { body = {} }
+      const url = typeof body.url === 'string' ? body.url : ''
+      const { setBuildAppUrl } = await import('../providers/registry.js')
+      const result = setBuildAppUrl(this.dataDir, url)
+      // ⚠️ 错误用 `{ error: '...' }` 形状（与其它接口一致）——前端 `api()`
+      //    读的是 `body.error`，用 `reason` 会退化成显示 "HTTP 400"（实测踩到）。
+      sendJson(response, result.ok ? 200 : 400,
+        result.ok ? { ok: true, url } : { error: result.reason })
+      return
+    }
+    if (path === '/api/build/connect' && request.method === 'POST') {
+      if (this.buildRelay === undefined) {
+        sendJson(response, 400, { error: 'Build 渠道未启用（请先在「供应商」页启用它）' })
+        return
+      }
+      let body: { connected?: unknown } = {}
+      try { body = JSON.parse(await readBody(request)) as typeof body } catch { body = {} }
+      const want = body.connected !== false
+      this.buildRelay.setAccepting(want)
+      sendJson(response, 200, { ok: true, ...this.buildRelay.status() })
       return
     }
 
