@@ -34,10 +34,6 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   { id: 'opencode',   displayName: 'OpenCode (Zen)',         defaultPort: 3914, defaultEnabled: true,  note: '匿名通道免登录；有 7 个免费模型，按账号可配代理出口' },
   { id: 'accio',      displayName: 'Accio (阿里)',           defaultPort: 3915, defaultEnabled: false, note: 'PKCE 登录 + 免签名推理（未测试稳定性）' },
   { id: 'officeace',  displayName: 'OfficeAce (果办)',       defaultPort: 3916, defaultEnabled: false, note: '多模态 + 自动领每日签到福利（未测试稳定性）' },
-  // ⚠️ build 是**唯一需要浏览器参与**的渠道：它的上游是跑在 Google Cloud Run 上的
-  //    AI Studio App，由你浏览器里的页面主动连回本网关。故默认关闭，且连接/断开是
-  //    显式动作（见 Web UI 的「Build 渠道」页）。
-  { id: 'build',      displayName: 'Build (AI Studio)',     defaultPort: 3917, defaultEnabled: false, note: '需浏览器常开 AI Studio App 页面；实测 5 个 flash 模型（含 3.5/3.6/3.7）' },
 ]
 
 export function catalogEntry(id: string): ProviderCatalogEntry | undefined {

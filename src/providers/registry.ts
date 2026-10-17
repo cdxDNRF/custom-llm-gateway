@@ -28,7 +28,6 @@ import {
   createOpencodeProvider,
 } from './extended.js'
 import { createAccioProvider, createOfficeAceProvider } from './extended.js'
-import { createBuildProvider } from './build.js'
 import { CodeArtsProvider } from './codearts.js'
 import { PROVIDER_CATALOG, catalogEntry } from './catalog.js'
 import type { Provider } from '../core/provider.js'
@@ -44,15 +43,6 @@ export interface ProviderEntryConfig {
    * 但**不建议**——同机其他进程可借道消耗你的额度）。
    */
   accessToken?: string
-  /**
-   * **Build 渠道专用**：AI Studio App 的链接。
-   *
-   * ⚠️ 刻意做成配置项而不是硬编码：每个用户的 App 链接不同（自己的 App id），
-   * 写死在代码里意味着"换个 App 就要改代码重新部署"。
-   *
-   * 用户在 Web UI 的「Build 渠道」页填一次，点「连接」时前端会直接打开它。
-   */
-  appUrl?: string
 }
 
 export interface GatewayConfig {
@@ -207,70 +197,6 @@ export async function setProviderEnabled(dataDir: string, id: string, enabled: b
   writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8')
 }
 
-/**
- * 持久化 Build 渠道的 App 链接。
- *
- * ⚠️ 与 `setProviderEnabled` 同一套「读-改-写」：config.json 同时承载
- * 供应商开关、host、令牌等字段，整体覆盖会丢掉其它内容。
- *
- * ⚠️ 校验：只接受 `http(s)://` 且 host 属于 Google（`*.google.com` /
- * `ai.studio` / `*.run.app`）—— 这个值会被前端用于 `window.open`，
- * 放任任意 URL 等于给了一个钓鱼跳板。
- */
-export function setBuildAppUrl(dataDir: string, rawUrl: string): { ok: true } | { ok: false; reason: string } {
-  const value = rawUrl.trim()
-  if (value.length === 0) {
-    // 允许清空（用户换 App 或不想自动跳转）。
-    writeProviderAppUrl(dataDir, '')
-    return { ok: true }
-  }
-  let parsed: URL
-  try {
-    parsed = new URL(value)
-  } catch {
-    return { ok: false, reason: '不是合法的 URL' }
-  }
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    return { ok: false, reason: '只支持 http/https 链接' }
-  }
-  const host = parsed.hostname.toLowerCase()
-  const allowed = host === 'ai.studio'
-    || host.endsWith('.google.com')
-    || host.endsWith('.run.app')
-  if (!allowed) {
-    return { ok: false, reason: '只接受 Google 域名（ai.studio / *.google.com / *.run.app）的 App 链接' }
-  }
-  writeProviderAppUrl(dataDir, value)
-  return { ok: true }
-}
-
-/** `setBuildAppUrl` 的落盘部分（读-改-写 config.json）。 */
-function writeProviderAppUrl(dataDir: string, value: string): void {
-  const configPath = configPathFor(dataDir)
-  let config: GatewayConfig = { ...DEFAULT_CONFIG, providers: {} }
-  try {
-    config = JSON.parse(readFileSync(configPath, 'utf8')) as GatewayConfig
-  } catch {
-    // 兜底：用默认值。
-  }
-  const entry = config.providers?.['build'] ?? { port: catalogEntry('build')?.defaultPort ?? 3917 }
-  config.providers = {
-    ...(config.providers ?? {}),
-    build: { ...entry, appUrl: value },
-  }
-  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8')
-}
-
-/** 读取 Build 渠道的 App 链接（未配置返回空串）。 */
-export function readBuildAppUrl(dataDir: string): string {
-  try {
-    const config = JSON.parse(readFileSync(configPathFor(dataDir), 'utf8')) as GatewayConfig
-    return config.providers?.['build']?.appUrl ?? ''
-  } catch {
-    return ''
-  }
-}
-
 /** 读取当前 config.json 里某供应商的开关（供控制台显示）。 */
 export function readProviderEnabled(dataDir: string, id: string): boolean | undefined {
   try {
@@ -282,13 +208,7 @@ export function readProviderEnabled(dataDir: string, id: string): boolean | unde
 }
 
 /** 单个供应商的创建工厂（按目录 id）。 */
-function factoryFor(
-  id: string,
-  dir: string,
-  level: GatewayConfig['logLevel'],
-  /** ⚠️ build 渠道需要它：App 连的是**网关端口**、带的是**网关令牌**。 */
-  rest?: { webPort: number; accessToken?: string },
-): (() => Promise<Provider>) | undefined {
+function factoryFor(id: string, dir: string, level: GatewayConfig['logLevel']): (() => Promise<Provider>) | undefined {
   const table: Record<string, () => Promise<Provider>> = {
     buddy: () => createBuddyProvider({ product: CODEBUDDY, dataDir: dir, logLevel: level }),
     workbuddy: () => createBuddyProvider({ product: WORKBUDDY, dataDir: dir, logLevel: level }),
@@ -306,12 +226,6 @@ function factoryFor(
     opencode: () => createOpencodeProvider(dir, level),
     accio: () => createAccioProvider(dir, level),
     officeace: () => createOfficeAceProvider(dir, level),
-    build: () => createBuildProvider(
-      dir,
-      level,
-      rest?.webPort ?? 8790,
-      rest?.accessToken ?? '',
-    ),
   }
   return table[id]
 }
@@ -322,22 +236,9 @@ function factoryFor(
  */
 export async function createProviderById(config: GatewayConfig, id: string): Promise<Provider> {
   if (catalogEntry(id) === undefined) throw new Error(`未知供应商 ${id}`)
-  const factory = factoryFor(id, config.dataDir, config.logLevel, {
-    webPort: config.webPort,
-    ...(config.accessToken === undefined ? {} : { accessToken: config.accessToken }),
-  })
+  const factory = factoryFor(id, config.dataDir, config.logLevel)
   if (factory === undefined) throw new Error(`供应商 ${id} 没有创建工厂`)
   return factory()
-}
-
-/** Build 渠道的 jobs 包装（它需要 webPort/token，与其它家的签名不同）。 */
-function createBuildProviderBuild(config: GatewayConfig): Promise<Provider> {
-  return createBuildProvider(
-    config.dataDir,
-    config.logLevel,
-    config.webPort,
-    config.accessToken ?? '',
-  )
 }
 
 /** 创建全部已启用的供应商。 */
@@ -365,7 +266,6 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createOpencodeProvider(dir, level),
     () => createAccioProvider(dir, level),
     () => createOfficeAceProvider(dir, level),
-    () => createBuildProviderBuild(config),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)
 

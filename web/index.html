@@ -21,7 +21,6 @@
     <button class="tab" role="tab" data-page="providers" aria-selected="true">供应商</button>
     <button class="tab" role="tab" data-page="gateway" aria-selected="false">网关</button>
     <button class="tab" role="tab" data-page="data" aria-selected="false">数据</button>
-    <button class="tab" role="tab" data-page="build" aria-selected="false">Build 渠道</button>
   </nav>
 
   <div class="topbar-actions">
@@ -122,70 +121,6 @@
     </div>
 
     <div id="usage-tables" class="usage-tables"></div>
-  </section>
-
-  <!-- ─────────────── 第 4 页：Build 渠道 ─────────────── -->
-  <section class="page" data-page="build" hidden>
-    <div class="page-head">
-      <h2>Build 渠道 <span id="build-updated" class="stamp"></span></h2>
-      <p class="hint">
-        Google AI Studio 的 <b>Build</b> 渠道 —— 模型比 API Key 多（本机实测 5 个 flash）。
-        它跑在你浏览器里的一个 AI Studio App 页面上，由那个页面主动连回本网关。
-        <b>页面关了渠道就失效</b>，所以默认不开启、需要时手动连接。
-      </p>
-    </div>
-
-    <div class="chart-card">
-      <div class="chart-head">
-        <h3>连接状态</h3>
-        <span class="chart-note" id="build-state-note"></span>
-      </div>
-      <div class="build-status" id="build-status"></div>
-
-      <div class="build-appurl">
-        <label for="build-app-url"><b>App 链接</b>
-          <span class="endpoint-note">（你的 AI Studio Build App 地址；点「连接」会自动打开它）</span>
-        </label>
-        <div class="build-appurl-row">
-          <input id="build-app-url" class="model-search" type="url" spellcheck="false"
-                 placeholder="https://ai.studio/apps/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-          <button class="btn" id="build-save-url">保存</button>
-        </div>
-        <p class="hint" id="build-appurl-hint"></p>
-      </div>
-
-      <div class="row" style="margin-top:12px">
-        <button class="btn btn-primary" id="build-connect">连接并打开 App</button>
-        <button class="btn btn-danger-ghost" id="build-disconnect">断开</button>
-        <button class="btn" id="build-refresh">刷新状态</button>
-      </div>
-    </div>
-
-    <div class="chart-card">
-      <div class="chart-head">
-        <h3>使用方法</h3>
-      </div>
-      <ol class="build-steps">
-        <li>在上面填入你的 <b>App 链接</b>并保存（只需一次）</li>
-        <li>点 <b>「连接并打开 App」</b> —— App 页面会自动打开</li>
-        <li>如果 App 里的地址是空的，填下面这个（通常已存好，不用每次填）：
-          <div style="margin:8px 0"><code class="copyable" id="build-ws-url">—</code></div>
-        </li>
-        <li>在 App 里点 <b>Connect</b> —— 这里的状态会变成「🟢 已连接」</li>
-      </ol>
-      <p class="hint" style="margin-top:10px">
-        ⚠️ 首次连接后建议把这两项存进 App 的默认值（用 localStorage），
-        否则刷新页面要重填。App 的重连有次数上限，超过后需要刷新页面。
-      </p>
-    </div>
-
-    <div class="chart-card">
-      <div class="chart-head">
-        <h3>可用模型</h3>
-        <span class="chart-note" id="build-models-note"></span>
-      </div>
-      <div id="build-models" class="model-list"></div>
-    </div>
   </section>
 </main>
 

@@ -15,7 +15,6 @@ import { ProviderServer } from './core/provider-server.js'
 import { OverviewServer } from './core/server.js'
 import { ProviderRuntime } from './core/provider-runtime.js'
 import { UsageStore } from './core/usage.js'
-import { buildRelayFor } from './providers/build.js'
 import { lanAddresses } from './core/net.js'
 
 async function main(): Promise<void> {
@@ -88,15 +87,6 @@ async function main(): Promise<void> {
   const usage = new UsageStore({ dataDir: config.dataDir })
   usage.load()
 
-  // ── Build 渠道的中继（仅当该供应商已启用时创建）──
-  //
-  // ⚠️ relay 必须在 **OverviewServer 构造前**建好：它要被 server（挂 upgrade）
-  //    与 provider（发请求）共享同一个实例。
-  const buildEnabled = providers.some((p) => p.id === 'build')
-  const buildRelay = buildEnabled
-    ? buildRelayFor(config.webPort, config.accessToken ?? '')
-    : undefined
-
   const overview = new OverviewServer({
     providers: providers.filter((p) => providerPorts[p.id] !== undefined),
     port: config.webPort,
@@ -106,7 +96,6 @@ async function main(): Promise<void> {
     dataDir: config.dataDir,
     runtime,
     usage,
-    ...(buildRelay !== undefined ? { buildRelay } : {}),
   })
   await overview.start()
 
