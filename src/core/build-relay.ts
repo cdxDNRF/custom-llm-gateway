@@ -454,7 +454,11 @@ export class BuildRelay {
       this.lastPingAt = Date.now()
       // ⚠️ App 在 ping 的 payload 里上报激活状态（可选字段 —— 旧版 App 不发，
       //    此时保持 undefined，UI 显示"未上报"而不是假装 false）。
-      this.readActivation(message.payload)
+      // ⚠️ 传**整个 message**（而不是 `message.payload`）—— App 把 activation 放在
+      //    **顶层**（`type`/`id` 的兄弟位）。先前误传 payload ⇒ 只有当 App 恰好
+      //    把它塞进 payload 时才能读到，而实测 App 是顶层 ⇒ **每次心跳都读不到、
+      //    值永远停在连上那一帧**（症状：服务端 moves 一直不变，与 App 界面脱节）。
+      this.readActivation(message)
       let reply: Record<string, unknown> = { type: 'pong', id: message.id }
       try { this.socket?.write(encodeFrame(JSON.stringify(reply), 0x1)) } catch { /* 忽略 */ }
       return
