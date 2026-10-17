@@ -26,6 +26,7 @@ import {
   createZcodeProvider,
   createGeminiProvider,
   createOpencodeProvider,
+  createAiStudioProvider,
 } from './extended.js'
 import { createAccioProvider, createOfficeAceProvider } from './extended.js'
 import { createBuildProvider } from './build.js'
@@ -306,6 +307,7 @@ function factoryFor(
     opencode: () => createOpencodeProvider(dir, level),
     accio: () => createAccioProvider(dir, level),
     officeace: () => createOfficeAceProvider(dir, level),
+    aistudio: () => createAiStudioProvider(dir, level),
     build: () => createBuildProvider(
       dir,
       level,
@@ -365,6 +367,7 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createOpencodeProvider(dir, level),
     () => createAccioProvider(dir, level),
     () => createOfficeAceProvider(dir, level),
+    () => createAiStudioProvider(dir, level),
     () => createBuildProviderBuild(config),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)

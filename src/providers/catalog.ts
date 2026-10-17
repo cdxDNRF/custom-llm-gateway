@@ -37,6 +37,10 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   // ⚠️ build 是**唯一需要浏览器参与**的渠道：它的上游是跑在 Google Cloud Run 上的
   //    AI Studio App，由你浏览器里的页面主动连回本网关。故默认关闭，且连接/断开是
   //    显式动作（见 Web UI 的「Build 渠道」页）。
+  // ⚠️ aistudio 与 gemini 是**两条独立额度**的渠道：
+  //    gemini = 反重力 OAuth（Antigravity 额度）
+  //    aistudio = 普通 API Key（API Key 免费层额度）—— 门槛最低，一个 AIza 密钥即可
+  { id: 'aistudio',   displayName: 'AI Studio (API Key)',   defaultPort: 3918, defaultEnabled: false, note: '填 AIza… 开头的 API Key 即可；额度与「Gemini (Google)」独立；需 Clash 代理' },
   { id: 'build',      displayName: 'Build (AI Studio)',     defaultPort: 3917, defaultEnabled: false, note: '需浏览器常开 AI Studio App 页面；实测 5 个 flash 模型（含 3.5/3.6/3.7）' },
 ]
 

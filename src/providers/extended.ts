@@ -1495,3 +1495,149 @@ export async function createOfficeAceProvider(
     } as never),
   })
 }
+
+// ─────────────────────────── AI Studio（API Key）───────────────────────────
+
+/**
+ * AI Studio 供应商：用普通 **API Key**（`AIza…`）调 Gemini。
+ *
+ * ## 与现有两个 Gemini 系渠道的区别（三者额度池互不相同）
+ *
+ * | 渠道 | 认证 | 额度池 | 需浏览器 |
+ * |---|---|---|---|
+ * | `gemini`（反重力） | OAuth（Google 账号） | Antigravity 额度 | 否 |
+ * | **`aistudio`**（本函数） | **API Key** | **API Key 免费层** | **否** |
+ * | `build` | 宿主页代劳 | Build 独立额度 | **是** |
+ *
+ * ⇒ 本渠道门槛最低：一个 `AIza…` 密钥即可，不需要 OAuth、不用开浏览器。
+ *
+ * ## ⚠️ 必须走代理
+ *
+ * Google 域名在本机网络环境**不可直连**（实测 `daily-cloudcode-pa`：直连超时
+ * 15s、经 Clash 0.8s）。本渠道用全局裸 `fetch`，由 `gemini-proxy.ts` 的
+ * host 路由拦截器接管（`*.googleapis.com` 已在其匹配列表），故这里只需
+ * **安装该拦截器**（与反重力渠道同一个）。
+ */
+export async function createAiStudioProvider(
+  dataDir: string,
+  logLevel?: 'debug' | 'info' | 'warn' | 'error',
+): Promise<Provider> {
+  const { gateway, pool } = await makeBase('aistudio', dataDir, logLevel)
+  const { AiStudioAdapter, AISTUDIO_MODELS } = await import('./aistudio-adapter.js')
+
+  // 装代理路由（与 gemini 渠道共用同一个按 host 分流的拦截器）。
+  {
+    const { installGeminiProxyRouting } = await import('../core/gemini-proxy.js')
+    const proxyUrl = installGeminiProxyRouting(dataDir)
+    if (proxyUrl === undefined) {
+      gateway.logger.warn(
+        'AI Studio 未配置代理出口：Google 域名在国内网络不可直连，请求会超时。'
+        + '请设置 GATEWAY_GEMINI_PROXY=http://127.0.0.1:7897，'
+        + `或在 ${dataDir}/gemini.env 写一行 PROXY=http://127.0.0.1:7897。`,
+      )
+    } else {
+      gateway.logger.info(`AI Studio 出口已配置：仅 Google 域名经 ${proxyUrl}，其余直连`)
+    }
+  }
+
+  /**
+   * 取当前可用账号的 API Key（**每次现读**，多账号**轮询**）。
+   *
+   * ⚠️ 不缓存：用户在界面停用/新增账号后应立刻生效，缓存会让开关看起来失灵
+   *    （opencode 的 identitySlots 同样处理）。
+   * ⚠️ 轮询而非固定取第一个：免费层额度**按 Key 独立**计算，轮询能把多份
+   *    额度都利用起来。
+   */
+  let cursor = 0
+  const apiKey = async (): Promise<string | undefined> => {
+    const entries = await pool.listAccounts('aistudio')
+    const usable = entries.filter((entry) => entry.enabled)
+    if (usable.length === 0) return undefined
+    const start = cursor % usable.length
+    cursor = (cursor + 1) % usable.length
+    for (let offset = 0; offset < usable.length; offset++) {
+      const entry = usable[(start + offset) % usable.length]!
+      const raw = gateway.credentials.get(entry.credentialRef)
+      if (raw === undefined) continue
+      try {
+        const parsed = JSON.parse(raw) as { api_key?: unknown }
+        const key = typeof parsed.api_key === 'string' ? parsed.api_key.trim() : ''
+        if (key.length > 0) return key
+      } catch {
+        // 凭据损坏：跳过该账号（不因一个坏条目让整渠道失效）。
+      }
+    }
+    return undefined
+  }
+
+  const adapter = new AiStudioAdapter({
+    apiKey,
+    warn: (message: string) => gateway.logger.warn(message),
+  }) as LlmAdapter
+
+  return new GenericImpl({
+    id: 'aistudio',
+    displayName: 'AI Studio (API Key)',
+    capabilities: {
+      login: true, dailyCheckin: false, balance: false,
+      permanentLock: false, multiAccount: true, refresh: false,
+    },
+    adapter, pool, gateway,
+    loginImpl: async () => ({
+      loginUrl: '',
+      accountId: '',
+      completed: Promise.resolve({ ok: true }),
+      input: {
+        placeholder: '粘贴 AI Studio API Key（AIza… 或 AQ.… 开头）',
+        hint: '在 https://aistudio.google.com/apikey 创建。'
+          + 'AIza…（标准 Key）与 AQ.…（授权 Key，2026-05 起默认）都支持。',
+      },
+    }),
+    submitLoginImpl: async ({ value }) => {
+      const key = value.trim()
+      if (key.length === 0) return { ok: false, error: '请粘贴 API Key' }
+      // ⚠️ 前缀校验是最有价值的一道防线：实测 OAuth token 与 `AQ.` 凭据都在
+      //    调用时以 401 `ACCESS_TOKEN_TYPE_UNSUPPORTED` 失败，用户很难从那
+      //    个错误看出"是凭据类型不对"。
+      // ⚠️ **不要按前缀拒绝**（这是先前的一个错误断言，已纠正）。
+      //
+      //    Google 官方文档（https://ai.google.dev/gemini-api/docs/api-key）：
+      //      · **标准 Key**：`AIza…`
+      //      · **授权 Key**：`AQ.…` —— 直接绑定 Cloud 服务账号，权限更细
+      //      自 **2026-05-28** 起，AI Studio 新建的 Key **默认就是授权 Key**。
+      //      Gemini API 已**拒绝无限制的标准 Key**。
+      //
+      //    ⇒ 新用户的 Key 很可能就是 `AQ.` 开头，按 `AIza` 硬拦会把
+      //      **当代的合法 Key 全部拒之门外**（用户实测报障："我的 key 是 AQ 开头"）。
+      //
+      //    故只在明显不像 Key 时提示（例如含空白、过长过短、是我们已知的
+      //    OAuth access token 形态 `ya29.`）：
+      if (key.startsWith('ya29.')) {
+        return {
+          ok: false,
+          error: '这是 OAuth access token（ya29. 开头），不是 API Key。'
+            + '请在 https://aistudio.google.com/apikey 创建 API Key（AIza… 或 AQ.… 开头）',
+        }
+      }
+      if (/\s/.test(key)) {
+        return { ok: false, error: 'Key 里含有空白字符，请检查是否复制完整/多粘贴了' }
+      }
+      const id = `aistudio-key-${shortId()}`
+      const refName = `AISTUDIO_KEY_${shortId().toUpperCase()}`
+      await pool.addAccount({
+        id, provider: 'aistudio',
+        nickname: `Key ...${key.slice(-6)}`,
+        enabled: true,
+        credentialRef: refName,
+        refreshable: false,
+        createdAt: Date.now(),
+      })
+      await gateway.credentials.set(refName, JSON.stringify({ api_key: key }))
+      gateway.logger.info(`账号 ${id} 已创建（API Key）`)
+      return { ok: true }
+    },
+    refreshAll: async () => {
+      // API Key 无过期/续期概念。
+    },
+  })
+}
