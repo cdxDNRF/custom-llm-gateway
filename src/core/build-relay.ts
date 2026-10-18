@@ -70,6 +70,17 @@ interface PendingRequest {
   headers?: Record<string, string>
   /** 已收到的正文分片。 */
   chunks: string[]
+  /**
+   * 逐块回调（**真流式**用）。
+   *
+   * ⚠️ 没有它时，`fetch()` 只能等 `stream_end` 才把完整 body 交出去 ——
+   *    上游的逐块 SSE 会被**压成一次性**（真实缺陷，2026-10-18 用户报障：
+   *    "真流式的模型好像依旧是非流式形态，酒馆输出是等好久突然全部输出完"）。
+   *    设了这个回调后，每个 `stream_chunk` 到达即刻推给消费者。
+   */
+  onChunk?: (data: string) => void
+  /** 收到 `stream_start` 时的回调（真流式需要尽早知道状态码）。 */
+  onStart?: (status: number, headers: Record<string, string>) => void
   /** 收到 `error` 帧时的错误信息。 */
   error?: string
   resolve: (value: RelayResponse) => void
@@ -332,6 +343,101 @@ export class BuildRelay {
     })
   }
 
+  /**
+   * 向 App 发请求并**逐块**产出响应正文（真流式）。
+   *
+   * ⚠️ 与 {@link fetch} 的区别：`fetch` 等到 `stream_end` 才把**完整 body**
+   *    交出去 —— 上游的逐块 SSE 因此被压成一次性（用户报障："等好久突然
+   *    全部输出完"）。本方法在每个 `stream_chunk` 到达时立即 `yield`。
+   *
+   * 用法：把产出物拼成 `ReadableStream` 喂给 SSE 消费器（见 build-adapter.ts）。
+   */
+  async *fetchStream(input: {
+    url: string
+    method: string
+    headers?: Record<string, string>
+    body?: string
+  }): AsyncGenerator<string, void, unknown> {
+    const socket = this.socket
+    if (socket === undefined || socket.destroyed) {
+      throw new Error('Build 渠道未连接：请先打开 AI Studio App 页面并点 Connect')
+    }
+    const id = randomUUID()
+    const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+
+    // 用队列 + 信号把「回调式到达」转成「异步迭代」。
+    const queue: string[] = []
+    let done = false
+    let failed: Error | undefined
+    let wake: (() => void) | undefined
+    const notify = (): void => { wake?.(); wake = undefined }
+
+    const timer = setTimeout(() => {
+      failed = new Error(
+        `Build 渠道流式超时（${timeoutMs}ms）：${input.url}`
+        + (this.activation?.active === false
+          ? '\n⚠️ App 页面的**用户激活**尚未满足 —— 请到 App 页面移动鼠标 / 按几下键。'
+          : ''),
+      )
+      this.failures++
+      done = true
+      notify()
+    }, timeoutMs)
+    timer.unref?.()
+
+    this.inflight = { url: input.url, at: Date.now() }
+    this.pending.set(id, {
+      url: input.url,
+      chunks: [],
+      resolve: () => { /* 流式路径不用 resolve */ },
+      reject: () => { /* 由 failed 承载 */ },
+      timer,
+      onChunk: (data) => { queue.push(data); notify() },
+      onStart: () => { /* 真流式由适配器先读状态再决定 */ },
+    })
+
+    const frame = encodeFrame(JSON.stringify({
+      id, type: 'http_request',
+      payload: {
+        url: input.url,
+        method: input.method,
+        headers: input.headers ?? {},
+        body: input.body ?? '',
+      },
+    }), 0x1)
+    try {
+      socket.write(frame)
+    } catch (error) {
+      clearTimeout(timer)
+      this.pending.delete(id)
+      this.failures++
+      throw new Error(`Build 渠道发送失败：${String(error)}`)
+    }
+
+    try {
+      for (;;) {
+        // 先冲刷队列里已有的块。
+        while (queue.length > 0) yield queue.shift()!
+        if (failed !== undefined) throw failed
+        if (done) return
+        // 等下一个块或结束信号。
+        await new Promise<void>((resolve) => {
+          wake = resolve
+          // ⚠️ 兜底轮询：万一 notify 丢失（理论上不该），最多 1 秒后自查一次。
+          setTimeout(resolve, 1000)
+        })
+        if (this.pending.has(id) === false) done = true
+      }
+    } finally {
+      clearTimeout(timer)
+      const still = this.pending.get(id)
+      if (still !== undefined) {
+        this.pending.delete(id)
+        this.inflight = undefined
+      }
+    }
+  }
+
   // ─────────────────────────── WebSocket 实现 ───────────────────────────
 
   private async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
@@ -477,6 +583,7 @@ export class BuildRelay {
       case 'stream_start':
         pending.status = typeof payload.status === 'number' ? payload.status : 200
         pending.headers = (payload.headers ?? {}) as Record<string, string>
+        pending.onStart?.(pending.status, pending.headers)
         // ⚠️ 在这里计数（而非发起时）：只有上游真的开始回应了才算消耗额度，
         //    "挂起/超时"多数没打到上游，不该计入。
         //
@@ -488,13 +595,19 @@ export class BuildRelay {
         this.bumpCounter(modelOf(pending.url))
         break
       case 'stream_chunk':
-        if (typeof payload.data === 'string') pending.chunks.push(payload.data)
+        if (typeof payload.data === 'string') {
+          pending.chunks.push(payload.data)
+          // ⚠️ **立即转发**（真流式关键）：不要等 stream_end 再一次性交出。
+          pending.onChunk?.(payload.data)
+        }
         break
       case 'stream_end': {
         this.pending.delete(id)
         clearTimeout(pending.timer)
         this.inflight = undefined
         this.relays++
+        // 通知流式消费者：正常结束。
+        pending.onChunk?.('')
         pending.resolve({
           status: pending.status ?? 200,
           headers: pending.headers ?? {},

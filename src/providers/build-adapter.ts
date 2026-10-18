@@ -306,6 +306,21 @@ export class BuildAdapter extends LlmAdapter {
       : options.useNonStream !== false
     const url = `${REST_BASE}/models/${model}:${useNonStream ? 'generateContent' : 'streamGenerateContent?alt=sse'}`
 
+    // ⚠️⚠️ **真流式必须走 `fetchStream`**（真实缺陷，2026-10-18 用户报障）：
+    //
+    //    用户原话："真流式的模型好像依旧是非流式形态，酒馆输出是等好久突然
+    //    全部输出完（明显的非流式传输特点）"。
+    //
+    //    根因：`relay.fetch()` 的实现是**把响应缓冲到 `stream_end`** 才返回
+    //    完整 body（`pending.chunks.join('')`），故上游逐块 SSE 被压成一次性。
+    //    要真流式必须用逐块产出的 `fetchStream()`。
+    //
+    //    非流式（假流式）本来就要完整 body 再分片，继续用 `fetch()`。
+    if (!useNonStream) {
+      yield* this.streamViaRelay({ url, body: prefillStripped ?? body, model })
+      return
+    }
+
     const response = await this.relay.fetch({
       url,
       method: 'POST',
@@ -450,11 +465,45 @@ export class BuildAdapter extends LlmAdapter {
       return
     }
 
-    // ── 流式：复用 vendor 的 SSE 消费器 ──
-    //    ⚠️ 它已兼容"信封"与"裸 Response"两种形态（源码注释：「先试信封形态，
-    //    再试裸 Response」），而 build 渠道正是裸形态。
-    const stream = new Response(response2.body).body
-    if (stream === null) throw new LlmError('build: 响应体为空', 'SERVER')
+    // 流式已在上面分流（走 fetchStream），不会到这里。
+    throw new LlmError('build: 内部错误 —— 流式路径未分流', 'SERVER')
+  }
+
+  /**
+   * 真流式：把 relay 的逐块到达包装成 `ReadableStream` 喂给 SSE 消费器。
+   *
+   * ⚠️ 为什么还要包一层 `ReadableStream`：`consumeGeminiSse` 的入参是
+   *    `ReadableStream<Uint8Array>`（它会 `getReader()` 并按 SSE 帧解析）。
+   *    直接把字符串块喂进去会绕过它的分帧/多行拼接逻辑。
+   */
+  private async *streamViaRelay(input: {
+    url: string
+    body: Record<string, unknown>
+    model: string
+  }): AsyncGenerator<StreamChunk, void, unknown> {
+    const encoder = new TextEncoder()
+    const chunks = this.relay.fetchStream({
+      url: input.url,
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input.body),
+    })
+    // 把 async generator 桥接成 ReadableStream。
+    const iterator = chunks[Symbol.asyncIterator]()
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done, value } = await iterator.next()
+          if (done) { controller.close(); return }
+          if (value.length > 0) controller.enqueue(encoder.encode(value))
+          else controller.close()
+        } catch (error) {
+          controller.error(error)
+        }
+      },
+      async cancel() { await iterator.return?.() },
+    })
+    // ⚠️ 复用 vendor 的 SSE 消费器（已兼容信封与裸两种形态）。
     yield* consumeGeminiSse({ body: stream }) as AsyncIterable<StreamChunk>
   }
 }
