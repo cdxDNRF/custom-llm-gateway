@@ -59,6 +59,18 @@ async function main(): Promise<void> {
   // ── 运行时管理器（让控制台的启用/停用立即生效，不必重启）──
   const runtime = new ProviderRuntime(config, providers)
 
+  // ── 用量统计（JSONL 追加 + 内存聚合，见 usage.ts）──
+  //
+  // ⚠️ **必须在 provider 服务器创建之前**（真实缺陷，2026-10-18 实测发现）：
+  //    先前它在两者的**之后**才实例化，导致 `ProviderServer` 拿不到 usage
+  //    ⇒ **直连供应商端口（如 3918）的调用完全不计入用量**（实测：
+  //    usage.jsonl 行数 845 → 845 不变，而走聚合端点则 845 → 846）。
+  //    用户看"数据"页时会以为那些调用没发生。
+  //
+  // ⚠️ load() 读入历史尾部数据，让重启后报表不归零（全量仍在 usage.jsonl）。
+  const usage = new UsageStore({ dataDir: config.dataDir })
+  usage.load()
+
   // ── 每个供应商一个独立端点 ──
   const providerServers: ProviderServer[] = []
   const providerPorts: Record<string, number> = {}
@@ -69,6 +81,8 @@ async function main(): Promise<void> {
       provider,
       port: entry.port,
       ...(entry.accessToken ? { accessToken: entry.accessToken } : {}),
+      // ⚠️ 传入共享的 usage，否则直连供应商端口的调用不会被统计。
+      usage,
     })
     try {
       await server.start()
@@ -80,13 +94,6 @@ async function main(): Promise<void> {
       provider.gateway.logger.error(`启动失败（端口 ${entry.port}）：`, error)
     }
   }
-
-  // ── 总览服务（Web UI + 聚合端点）──
-  // ── 用量统计（JSONL 追加 + 内存聚合，见 usage.ts）──
-  //
-  // ⚠️ load() 读入历史尾部数据，让重启后报表不归零（全量仍在 usage.jsonl）。
-  const usage = new UsageStore({ dataDir: config.dataDir })
-  usage.load()
 
   // ── Build 渠道的中继（仅当该供应商已启用时创建）──
   //

@@ -18,6 +18,7 @@ import {
   type OpenAiChatRequest,
 } from './protocol.js'
 import type { Provider } from './provider.js'
+import type { UsageStore } from './usage.js'
 import { corsHeaders } from './cors.js'
 import {
   anthropicToOpenAiRequest,
@@ -32,6 +33,13 @@ export interface ProviderServerOptions {
   host?: string
   /** 可选的访问令牌：设置后要求 `Authorization: Bearer <token>`（非 OpenAI key 语义）。 */
   accessToken?: string
+  /**
+   * 用量统计（与总览服务**共享同一个实例**）。
+   *
+   * ⚠️ 必须传：否则**直连供应商端口**的调用不计入用量（真实缺陷，
+   *    2026-10-18 实测：usage.jsonl 行数不变，而走聚合端点则 +1）。
+   */
+  usage?: UsageStore
 }
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -82,16 +90,79 @@ export class ProviderServer {
   readonly port: number
   private readonly host: string
   private readonly accessToken: string | undefined
+  private readonly usage: UsageStore | undefined
 
   constructor(options: ProviderServerOptions) {
     this.provider = options.provider
     this.port = options.port
     this.host = options.host ?? '127.0.0.1'
     this.accessToken = options.accessToken
+    this.usage = options.usage
   }
 
   get baseUrl(): string {
     return `http://${this.host}:${this.port}`
+  }
+
+  /**
+   * 包一层用量统计（**直连供应商端口的调用也要记账**）。
+   *
+   * ⚠️ 真实缺陷（2026-10-18 实测）：`ProviderServer` 原先**完全不记 usage**，
+   *    而 `usage` 又是在它之后才实例化的 —— 两重原因叠加，导致**直连供应商
+   *    端口（如 3918）的调用在「数据」页里完全看不到**。
+   *    实测证据：调用直连端口后 `usage.jsonl` 行数 845 → 845 不变，
+   *    而走聚合端点则 845 → 846。
+   *
+   * 这里在 `adapter.stream()` 收尾处记一条（成功/失败都记），
+   * 与总览服务共用同一个 `UsageStore` 实例，故两处调用会并入同一份统计。
+   */
+  private async *tapStreamUsage<T extends { type: string }>(
+    source: AsyncIterable<T>,
+    meta: { model: string; api: 'openai' | 'anthropic'; stream: boolean },
+  ): AsyncIterable<T> {
+    const usage = this.usage
+    if (usage === undefined) { yield* source; return }
+    const startedAt = Date.now()
+    let inputTokens = 0
+    let outputTokens = 0
+    let ok = false
+    let failure: unknown
+    try {
+      for await (const chunk of source) {
+        // 采集 token 用量（多家的 usage 帧形状不同，取能拿到的）。
+        const usageChunk = chunk as { type?: string; usage?: Record<string, unknown> }
+        if (usageChunk.type === 'usage' && usageChunk.usage !== undefined) {
+          const u = usageChunk.usage
+          const pick = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+          inputTokens = Math.max(inputTokens, pick(u.inputTokens ?? u.prompt_tokens))
+          outputTokens = Math.max(outputTokens, pick(u.outputTokens ?? u.completion_tokens))
+        }
+        if (usageChunk.type === 'finish') ok = true
+        yield chunk
+      }
+      // 没有 finish 帧也算成功（部分适配器不产出 finish）。
+      ok = true
+    } catch (error) {
+      failure = error
+      throw error
+    } finally {
+      try {
+        usage.record({
+          at: startedAt,
+          provider: this.provider.id,
+          model: meta.model,
+          api: meta.api,
+          stream: meta.stream,
+          ok,
+          ...(failure !== undefined ? { error: String(failure).slice(0, 200) } : {}),
+          inputTokens,
+          outputTokens,
+          ms: Date.now() - startedAt,
+        })
+      } catch {
+        // 统计失败不影响请求。
+      }
+    }
   }
 
   private authorized(request: IncomingMessage): boolean {
@@ -221,7 +292,11 @@ export class ProviderServer {
 
     let chunks: AsyncIterable<Parameters<typeof collectCompletion>[0] extends AsyncIterable<infer T> ? T : never>
     try {
-      chunks = this.provider.adapter.stream(generate) as typeof chunks
+      // ⚠️ 包一层用量统计（与总览服务共用 UsageStore）。
+      chunks = this.tapStreamUsage(
+        this.provider.adapter.stream(generate) as AsyncIterable<{ type: string }>,
+        { model: model, api: 'anthropic', stream: body.stream === true },
+      ) as typeof chunks
     } catch (error) {
       sendAnthropicError(502, 'api_error', this.describeUpstreamError(error))
       return
@@ -288,7 +363,11 @@ export class ProviderServer {
 
     let chunks: AsyncIterable<Parameters<typeof collectCompletion>[0] extends AsyncIterable<infer T> ? T : never>
     try {
-      chunks = this.provider.adapter.stream(generate) as typeof chunks
+      // ⚠️ 包一层用量统计（与总览服务共用 UsageStore）。
+      chunks = this.tapStreamUsage(
+        this.provider.adapter.stream(generate) as AsyncIterable<{ type: string }>,
+        { model: model, api: 'openai', stream: body.stream === true },
+      ) as typeof chunks
     } catch (error) {
       sendError(response, 502, this.describeUpstreamError(error), 'upstream_error')
       return
