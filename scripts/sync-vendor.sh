@@ -158,6 +158,24 @@ if [ -f "$PATCH_QODER" ]; then
   fi
 fi
 
+# ④f 本地补丁：腾讯风控指纹补 Claude Code 的触发句（2026-10-20）
+# Claude Code v2.1.293 的 system 首句会被腾讯网关以 400/11128 拒绝：
+#   "You are Claude Code, Anthropic's official CLI for Claude"
+# 实测仅这一句即触发（短句/半句都不触发 ⇒ 整句精确匹配；改任意一处即放行）。
+# 补丁只**新增一条改写规则**，既有规则逐字节不变。
+PATCH_TCFP="$HERE/vendor-patches/tencent-fingerprint-claude-code.patch"
+if [ -f "$PATCH_TCFP" ]; then
+  if git -C "$HERE" apply --check "$PATCH_TCFP" 2>/dev/null; then
+    git -C "$HERE" apply "$PATCH_TCFP"
+    echo "   ✓ 已应用腾讯指纹补丁（Claude Code）"
+  elif git -C "$HERE" apply --check --reverse "$PATCH_TCFP" 2>/dev/null; then
+    echo "   ✓ 腾讯指纹补丁已在（无需重复应用）"
+  else
+    echo "   ⚠️ 腾讯指纹补丁无法应用（上游可能已改 tencent-fingerprint.ts）" >&2
+    echo "      请核对后更新：vendor-patches/tencent-fingerprint-claude-code.patch" >&2
+  fi
+fi
+
 echo "⑤ 类型检查（自有代码）…"
 if [ ! -x ./node_modules/.bin/tsc ]; then
   echo "   跳过（未装 typescript）"

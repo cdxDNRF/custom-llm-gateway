@@ -1,0 +1,30 @@
+diff --git a/vendor/src/openai-gateway/tencent-fingerprint.ts b/vendor/src/openai-gateway/tencent-fingerprint.ts
+index 2e724f5..fce68c5 100644
+--- a/vendor/src/openai-gateway/tencent-fingerprint.ts
++++ b/vendor/src/openai-gateway/tencent-fingerprint.ts
+@@ -131,6 +131,25 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
+     replace: 'Main branch (PRs usually go here)',
+     note: 'Gitee IKJNA1；本机 2026-10-05 对 workbuddy / CodeBuddy 双端点实测复现',
+   },
++  {
++    // Claude Code v2.1.293 的 system 首句。本机 2026-10-20 实测：
++    // 仅这一句即触发 400/11128 —— 而 `You are Claude Code`（短句）与
++    // `Anthropic's official CLI`（半句）都**不**触发 ⇒ **整句精确匹配**。
++    //
++    // 敏感度实测（同一模型、同一端点）：
++    //   完整句                        → ✗ 拦截
++    //   去掉句号                      → ✗ 拦截（故 find 不含句号）
++    //   全小写                        → ✗ 拦截（故匹配大小写不敏感）
++    //   改一个词（official→main）      → ✓ 通过
++    //   句首加字                      → ✓ 通过
++    //   ⇒ 改动**任意一处**即可放行，故替换只要保持语义、字面量不同即可。
++    find: "You are Claude Code, Anthropic's official CLI for Claude",
++    // ⚠️ 替换**必须保留原意**：这句是 Claude Code 的自我介绍，模型需要知道
++    //    自己是 Claude Code、跑在 Anthropic 的 CLI 里。只调换词序与所有格，
++    //    语义等价而字面量不同。
++    replace: 'You are Claude Code - the official CLI from Anthropic for Claude',
++    note: 'Claude Code v2.1.293（本机 2026-10-20 实测，仅此一句即触发）',
++  },
+ ]
+ 
+ /** 正则元字符转义：把字面量安全地变成**精确**匹配，而不是模式。 */
