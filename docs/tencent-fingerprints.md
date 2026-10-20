@@ -102,3 +102,38 @@ DSH 的 `buddy` 提供商由 `dsh-providers-hub` 插件直连，它有一份**�
 
 插件是 npm 包、不能提交进本仓库；本地热修与重打步骤见
 `~/.dsh/profiles/web/.hotfix-backup/README.md`（改完需重启 DSH 生效）。
+
+## 同类盘点：还有哪些渠道会「看提示词」（2026-10-21）
+
+本仓库实测/代码证据里，**提示词内容级**的上游校验只有两家；其余渠道的风控都在
+「客户端身份 / 请求形态 / 内容安全」层，不在 system 正文上。
+
+| 渠道 | 上游校验 | 方向 | 触发形态 | 我们的应对 |
+|---|---|---|---|---|
+| `buddy` / `workbuddy` | 客户端模板句**黑名单** | 黑名单（逐词收录，会持续新增） | `400 / 11128 / Illegal API invocation from an unapproved channel`，`displayMsg.zh=请求被拦截，请重新发送` | 本文件的改写表：`system` + `assistant` 正文 |
+| `buddy` / `workbuddy`（请求形态） | `messages[0]` 必须是 `system`；`tool_calls`/`tool_result` 必须配对 | 硬性结构 | 同码 11128 `first message is not system prompt`（伪装成安全策略）；11148「工具记录不完整，请新建任务」 | 适配器无条件补 system 占位 + 工具配对归一化 |
+| `zcode`（智谱 z.ai） | `system` 必须带**官方身份块** | **白名单** | `405 / 3012 / request has been blocked due to unusual activity` | 内置官方身份块（2898 字符三段）+ 日期块，见 `vendor/src/zcode-identity.ts` |
+
+⚠️ 两类的「维护语义」相反，别混：
+
+- **腾讯 = 黑名单**：上游随时会**新增**一句（本文件第 3 条就是这么来的），
+  症状是「某客户端突然全挂、其他客户端正常」；应对 = 探针矩阵 + 表里加一条。
+- **ZCode = 白名单**：上游要求**必须带**官方身份块；官方客户端升级、身份块结构变了
+  就要同步更新，否则 3012 —— 而 **3012 有账号冷却惩罚**（30 分钟；24h 内第 3 次起
+  24h；5 次停用），**禁止用试错式探测去撞它**。
+
+其余渠道的风控层级（都不是「看提示词」）：
+
+| 渠道 | 校验方式 |
+|---|---|
+| `trae` | 持久化 `machine_id` / `device_id` 每请求携带；`X-Ide-Version` 决定模型准入（4001/4006 原文会误导排查方向） |
+| `qoder` / `qodercn` | 请求体 WASM 签名（含设备上下文）；按体积设限 |
+| `zcode` | 按需向阿里云索要 captcha（`3007`），命中后每轮换新 param |
+| `raccoon` | 短信验证码 + AES 加密参数 |
+| `lobsterai` | `X-LobsterAI-Client-Capabilities` / `-Version` 能力与版本头 |
+| `accio` | `utdid` 必须同时放进请求体 `properties`，否则 **HTTP 200 + HTML 风控拦截页**（按 `content-type` 判，别按 body 文本判） |
+| `gemini` / `aistudio` / `build` | 内容**安全审核**（输入/输出安全策略；Build 的流式审核更严、易截断）——按「内容是否违规」，不是「你是什么客户端」 |
+
+排查顺序建议：先看 **HTTP 码 + 业务 code + `displayMsg` 原文** ——
+`400/11128` → 腾讯内容级（本文件）；`405/3012` → ZCode 身份块；
+`200 + text/html` → accio 风控页；`401/403` → 客户端身份/凭据层。
