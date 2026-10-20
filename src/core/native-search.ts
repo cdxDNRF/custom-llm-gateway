@@ -478,8 +478,23 @@ export function renderSearchResults(query: string, sources: readonly NativeSearc
 /** 判断某个工具名是否是我们接管的搜索工具。 */
 export function isSearchToolName(name: string): boolean {
   const normalized = name.toLowerCase()
-  return normalized === 'web_search'
+  // 精确名（各家标准写法）
+  if (normalized === 'web_search'
     || normalized === 'websearch'
     || normalized === 'web_search_20250305'
-    || normalized === 'search'
+    || normalized === 'search') return true
+  // ⚠️ **模式匹配**（真实缺陷，2026-10-20 用户报障）：各客户端/agent 框架会用
+  //    **带前缀**的搜索工具名，精确枚举永远追不上。实测 DSH 传的是：
+  //      `exa_web_search_exa`、`tavily_tavily_search`、`tavily_tavily_research`
+  //    这些都不等于 `web_search` ⇒ 只做精确匹配就**完全不生效**，
+  //    而症状是"模型自己调搜索工具却返回 0 条结果"（因为那些工具没配 key），
+  //    极易被误判成"搜索功能坏了"。
+  //
+  //    判据：名字里**含 `search`** 且不是常见的**非搜索**工具
+  //    （如 `search_files` / `grep_search` 这类本地文件搜索不该被接管）。
+  if (!normalized.includes('search')) return false
+  // 排除本地/非网络搜索（这些不该走渠道原生搜索）
+  if (normalized.includes('file') || normalized.includes('code')
+    || normalized.includes('grep') || normalized.includes('repo')) return false
+  return true
 }
