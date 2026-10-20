@@ -53,6 +53,13 @@ export interface OverviewServerOptions {
    * 否则 server 收到连接 A、provider 往 B 发请求，症状是"已连接但请求超时"。
    */
   buildRelay?: BuildRelay
+  /**
+   * 模型目录保鲜器（供 `/api/catalog-status` 观察各家的最近刷新结果）。
+   *
+   * ⚠️ 只用于**观测**：刷新本身由 `main.ts` 里的定时器驱动，不由 HTTP 触发
+   *    （否则一次页面刷新就可能打一批上游请求）。
+   */
+  catalogRefresher?: { lastResults(): readonly { provider: string; ok: boolean; count: number; error?: string }[] }
 }
 
 import type { ProviderRuntime } from './provider-runtime.js'
@@ -112,6 +119,7 @@ export class OverviewServer {
   private readonly usage: UsageStore | undefined
   /** Build 渠道的 WebSocket 中继（可选；未启用时为 undefined）。 */
   private buildRelay: BuildRelay | undefined
+  private readonly catalogRefresher: OverviewServerOptions['catalogRefresher']
 
   constructor(options: OverviewServerOptions) {
     this.providers = options.providers
@@ -123,6 +131,7 @@ export class OverviewServer {
     this.runtime = options.runtime
     this.usage = options.usage
     this.buildRelay = options.buildRelay
+    this.catalogRefresher = options.catalogRefresher
   }
 
   get baseUrl(): string {
@@ -406,6 +415,14 @@ export class OverviewServer {
 
     if (path === '/api/logs' && request.method === 'GET') {
       sendJson(response, 200, { logs: recentLogs(300) })
+      return
+    }
+
+    // ── 模型目录保鲜状态（观测用）──
+    if (path === '/api/catalog-status' && request.method === 'GET') {
+      sendJson(response, 200, {
+        results: this.catalogRefresher?.lastResults() ?? [],
+      })
       return
     }
 

@@ -15,6 +15,7 @@ import { ProviderServer } from './core/provider-server.js'
 import { OverviewServer } from './core/server.js'
 import { ProviderRuntime } from './core/provider-runtime.js'
 import { UsageStore } from './core/usage.js'
+import { CatalogRefresher } from './core/catalog-refresher.js'
 import { buildRelayFor } from './providers/build.js'
 import { lanAddresses } from './core/net.js'
 
@@ -104,6 +105,25 @@ async function main(): Promise<void> {
     ? buildRelayFor(config.webPort, config.accessToken ?? '')
     : undefined
 
+  // ── 模型目录保鲜：20 分钟 TTL 刷新 + 冷启动有界预热 ──
+  //
+  // ⚠️ 为什么需要（真实痛点，2026-10-20 与上游 dsh-providers-hub 对比后引入）：
+  //    vendor 适配器把远端目录缓存在 `remoteModels`，短路判据是「非 undefined
+  //    就不再拉」⇒ **进程内只拉一次**，上游新增/下线模型要重启网关才可见。
+  //    且冷启动首拉失败后会永久退化到静态兜底表（没有任何东西再试一次）。
+  //
+  //    上游用「isCatalogFresh + 20 分钟刷新器 + 有界预热」解决了同类问题；
+  //    这里借鉴**这三点意图**、按本网关架构重写（见 catalog-refresher.ts）：
+  //      · 复用已有的 `Provider.refreshModels()`（它已会 delete 缓存字段）
+  //      · **不需要**目录变更广播（我们的 Web UI 是轮询式，无客户端短路缓存）
+  const catalogRefresher = new CatalogRefresher({
+    // ⚠️ 传函数而非快照数组：供应商可运行时热启用，固定数组会漏掉之后启用的。
+    providers: () => runtime.currentProviders(),
+    info: (message) => console.log(`  ${message}`),
+    warn: (message) => console.warn(`  ⚠️ ${message}`),
+  })
+  catalogRefresher.start()
+
   const overview = new OverviewServer({
     providers: providers.filter((p) => providerPorts[p.id] !== undefined),
     port: config.webPort,
@@ -114,6 +134,8 @@ async function main(): Promise<void> {
     runtime,
     usage,
     ...(buildRelay !== undefined ? { buildRelay } : {}),
+    // 观测用：让 /api/catalog-status 能看到各家的最近刷新结果。
+    catalogRefresher,
   })
   await overview.start()
 
@@ -173,6 +195,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`\n收到 ${signal}，正在停止…`)
     clearInterval(timer)
+    catalogRefresher.stop()
     await overview.stop().catch(() => {})
     // 逐个停（含运行时热启用起来的那些）——先停监听再 dispose。
     for (const id of runtime.runningIds()) await runtime.disable(id).catch(() => {})

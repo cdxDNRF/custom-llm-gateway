@@ -138,7 +138,23 @@ export async function refreshModels(
   // ⚠️ `remoteMeta` 必须一起清：它是 id→模型的映射，供能力判定（图片/推理/上下文）
   // 使用。只清 `remoteModels` 而不清它，会出现「模型列表是新的、能力查的是旧的」
   // 这种不一致（trae 的 inputModalitiesFor / reasoningConfigFor 都读它）。
-  delete target.remoteMeta
+  //
+  // ⚠️⚠️ **必须重置为 `new Map()`，不能用 `delete`**（真实缺陷，2026-10-20）：
+  //    这些字段在 vendor 里的声明是
+  //      `private remoteMeta: ReadonlyMap<string, T> = new Map()`
+  //    —— **初始值就是空 Map，永不 undefined**。而 `delete` 会把它变成
+  //    `undefined`，于是刷新过程中任何读它的代码（如 buddy 的
+  //    `isFreeModel` 里 `this.remoteMeta.get(modelId)`）直接抛
+  //    `TypeError: Cannot read properties of undefined (reading 'get')`。
+  //
+  //    为什么以前没暴露：手动点「重拉」前用户通常先打开过模型管理页
+  //    （`listModels` 已填好 `remoteMeta`），时序上恰好躲过；
+  //    而**后台保鲜器是自动跑的**，撞上「已清空但尚未重新填充」的窗口概率高得多
+  //    —— 正是它把这个潜伏缺陷暴露了出来。
+  if ('remoteMeta' in target) {
+    target.remoteMeta = new Map()
+  }
+  // `modelsCache` 的初始值在各家不同（多为 undefined），delete 是安全的。
   delete target.modelsCache
   const models = await target.listModels(provider)
   return { count: models.length }
