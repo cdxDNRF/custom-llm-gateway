@@ -41,7 +41,20 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   //    gemini = 反重力 OAuth（Antigravity 额度）
   //    aistudio = 普通 API Key（API Key 免费层额度）—— 门槛最低，一个 AIza 密钥即可
   { id: 'aistudio',   displayName: 'AI Studio (API Key)',   defaultPort: 3918, defaultEnabled: false, note: '填 AIza… 开头的 API Key 即可；额度与「Gemini (Google)」独立；需 Clash 代理' },
-  { id: 'build',      displayName: 'Build (AI Studio)',     defaultPort: 3917, defaultEnabled: false, note: '需浏览器常开 AI Studio App 页面；实测 5 个 flash 模型（含 3.5/3.6/3.7）' },
+  { id: 'build',      displayName: 'Build (AI Studio)',     defaultPort: 3917, defaultEnabled: false, note: '【已被 aistudio2api 取代】需浏览器常开 App 页面；aistudio2api 同时覆盖 Playground+Build 且无需开页面' },
+  // ⚠️ aistudio2api = **把 AIStudio2API 项目当作内部上游**（默认 127.0.0.1:2048）。
+  //
+  //    它把 AI Studio 的 **Playground 与 Build 两条独立额度通道**封装成标准
+  //    OpenAI 兼容端点。那两条通道都需要 Cookie + SAPISID 签名 + **WAA/BotGuard
+  //    proof**（要执行 Google 混淆过的 VM，上游项目为此写了 849 行文档并 fork
+  //    goja）—— 自己重写不现实，故**融合而非重造**。
+  //
+  //    与其它 Gemini 系渠道的额度互相独立：
+  //      gemini     = 反重力 OAuth（Antigravity 额度）
+  //      aistudio   = 官方 API Key（API Key 免费层）
+  //      build      = 自建 App 反代（Build 额度，需开页面）
+  //      aistudio2api = **Playground + Build 双额度**（无需开页面）
+  { id: 'aistudio2api', displayName: 'AI Studio (Web) Playground+Build', defaultPort: 3919, defaultEnabled: false, note: '融合 AIStudio2API：Playground+Build 两条独立额度、无需浏览器常开；需先自行启动 AIStudio2API（默认 127.0.0.1:2048）' },
 ]
 
 export function catalogEntry(id: string): ProviderCatalogEntry | undefined {

@@ -27,6 +27,7 @@ import {
   createGeminiProvider,
   createOpencodeProvider,
   createAiStudioProvider,
+  createAiStudio2ApiProvider,
 } from './extended.js'
 import { createAccioProvider, createOfficeAceProvider } from './extended.js'
 import { createBuildProvider } from './build.js'
@@ -45,6 +46,19 @@ export interface ProviderEntryConfig {
    * 但**不建议**——同机其他进程可借道消耗你的额度）。
    */
   accessToken?: string
+  /**
+   * **aistudio2api 专用**：上游（AIStudio2API 服务）的根地址。
+   *
+   * 形如 `http://127.0.0.1:2048`（不带 `/v1`）。留空则用默认值。
+   * 之所以做成配置而不是常量：用户可能把它跑在别的端口、容器或另一台机器上。
+   */
+  upstreamUrl?: string
+  /**
+   * **aistudio2api 专用**：上游的访问密钥（对应 AIStudio2API 的 `PROXY_API_KEY`）。
+   *
+   * ⚠️ 留空是**正常用法**（`PROXY_API_KEY=` 空时，本机回环免密）。
+   */
+  upstreamKey?: string
   /**
    * **Build 渠道专用**：AI Studio App 的链接。
    *
@@ -288,7 +302,13 @@ function factoryFor(
   dir: string,
   level: GatewayConfig['logLevel'],
   /** ⚠️ build 渠道需要它：App 连的是**网关端口**、带的是**网关令牌**。 */
-  rest?: { webPort: number; accessToken?: string },
+  rest?: {
+    webPort: number
+    accessToken?: string
+    /** aistudio2api 专用：上游地址与密钥。 */
+    upstreamUrl?: string
+    upstreamKey?: string
+  },
 ): (() => Promise<Provider>) | undefined {
   const table: Record<string, () => Promise<Provider>> = {
     buddy: () => createBuddyProvider({ product: CODEBUDDY, dataDir: dir, logLevel: level }),
@@ -314,6 +334,12 @@ function factoryFor(
       rest?.webPort ?? 8790,
       rest?.accessToken ?? '',
     ),
+    aistudio2api: () => createAiStudio2ApiProvider(
+      dir,
+      level,
+      rest?.upstreamUrl ?? 'http://127.0.0.1:2048',
+      rest?.upstreamKey,
+    ),
   }
   return table[id]
 }
@@ -324,9 +350,12 @@ function factoryFor(
  */
 export async function createProviderById(config: GatewayConfig, id: string): Promise<Provider> {
   if (catalogEntry(id) === undefined) throw new Error(`未知供应商 ${id}`)
+  const entry = config.providers[id]
   const factory = factoryFor(id, config.dataDir, config.logLevel, {
     webPort: config.webPort,
     ...(config.accessToken === undefined ? {} : { accessToken: config.accessToken }),
+    ...(entry?.upstreamUrl === undefined ? {} : { upstreamUrl: entry.upstreamUrl }),
+    ...(entry?.upstreamKey === undefined ? {} : { upstreamKey: entry.upstreamKey }),
   })
   if (factory === undefined) throw new Error(`供应商 ${id} 没有创建工厂`)
   return factory()
@@ -369,6 +398,12 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createOfficeAceProvider(dir, level),
     () => createAiStudioProvider(dir, level),
     () => createBuildProviderBuild(config),
+    () => createAiStudio2ApiProvider(
+      config.dataDir,
+      config.logLevel,
+      config.providers['aistudio2api']?.upstreamUrl ?? 'http://127.0.0.1:2048',
+      config.providers['aistudio2api']?.upstreamKey,
+    ),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)
 
