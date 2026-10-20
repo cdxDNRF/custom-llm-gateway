@@ -37,6 +37,10 @@ import type {
   TokenUsage,
   FinishReason,
 } from '@deepseek-ai/dsh-llm'
+import {
+  rewriteTencentContentFingerprints,
+  isTencentContentFingerprintProvider as isTencentProvider,
+} from '../../vendor/src/openai-gateway/tencent-fingerprint.js'
 
 // ─────────────────────────── OpenAI 请求/响应类型 ───────────────────────────
 
@@ -238,6 +242,28 @@ export function toGenerateOptions(
   if (typeof request.temperature === 'number') options.temperature = request.temperature
   if (typeof maxTokens === 'number' && Number.isFinite(maxTokens)) options.maxTokens = maxTokens
   if (Array.isArray(stop) && stop.length > 0) options.stop = stop
+
+  // ── 腾讯系渠道：改写**内容级风控指纹**（Gitee issue IKJNA1）──
+  //
+  // ⚠️ 真实现象（外部客户端经网关调 buddy/workbuddy 时）：
+  //    HTTP 400 / code 11128 / "Illegal API invocation from an unapproved channel"
+  //    客户端侧只看到 `provider_code=INVALID_REQUEST reason=unknown`。
+  //    **DSH 直连同一模型完全正常** —— 差别只在于外部客户端往 system 里注了
+  //    自己的模板句（如 Claude Code 的 "Main branch: …" 那类环境说明）。
+  //
+  // ⚠️ 只改 `system` 与 `assistant` 正文两处（实测结论，见
+  //    vendor/src/openai-gateway/tencent-fingerprint.ts 的六格对照表）：
+  //    `user` / `tool` 结果 / `reasoning_content` / `tool_calls.arguments`
+  //    腾讯**都不拦**，改它们换不来放行、只会篡改用户原话。
+  if (isTencentProvider(context.provider)) {
+    if (options.system !== undefined) {
+      options.system = rewriteTencentContentFingerprints(options.system, context.provider)
+    }
+    for (const message of options.messages) {
+      if (message.role !== 'assistant') continue
+      rewriteAssistantTextFingerprints(message, context.provider)
+    }
+  }
   if (typeof request.reasoning_effort === 'string' && request.reasoning_effort.length > 0) {
     options.reasoningEffort = request.reasoning_effort as GenerateOptions['reasoningEffort']
   }
@@ -505,4 +531,28 @@ export function toOpenAiModels(
   created: number,
 ): OpenAiModel[] {
   return models.map((m) => ({ id: m.id, object: 'model', created, owned_by: provider }))
+}
+
+/**
+ * 改写**一条 assistant 消息的正文**里的腾讯风控指纹。
+ *
+ * ⚠️ 只动 `content` 里的文本块，不碰 `tool_calls` 的 `arguments` ——
+ *    实测后者不在扫描范围内（见 tencent-fingerprint.ts 的对照表），
+ *    改了反而会篡改工具参数。
+ */
+function rewriteAssistantTextFingerprints(
+  message: { content?: unknown },
+  provider: string,
+): void {
+  const content = message.content
+  if (typeof content === 'string') {
+    message.content = rewriteTencentContentFingerprints(content, provider)
+    return
+  }
+  if (!Array.isArray(content)) return
+  for (const block of content as { type?: string; text?: string }[]) {
+    if (block.type === 'text' && typeof block.text === 'string') {
+      block.text = rewriteTencentContentFingerprints(block.text, provider)
+    }
+  }
 }

@@ -894,6 +894,17 @@ export class OverviewServer {
     providerId: string,
     body: OpenAiChatRequest,
   ): Promise<{ messages: OpenAiMessage[]; toolName: string } | undefined> {
+    // 临时诊断：记录客户端传来的工具名（定位 zcode 为何不生效）
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
+      const names = (body.tools as unknown[]).map((t) => {
+        if (typeof t !== 'object' || t === null) return '?'
+        const r = t as { name?: unknown; function?: { name?: unknown } }
+        return typeof r.name === 'string' ? r.name
+          : typeof r.function?.name === 'string' ? r.function.name : '?'
+      })
+      this.catalogInfo?.(`[tools] ${providerId} ← ${names.join(', ')}`)
+    }
+
     // ① 用户开关（Web UI）
     if (this.nativeSearchEnabled?.() !== true) return undefined
     // ② 该渠道支持原生搜索（能力表见 native-search.ts）
