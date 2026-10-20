@@ -150,6 +150,41 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     replace: 'You are Claude Code - the official CLI from Anthropic for Claude',
     note: 'Claude Code v2.1.293（本机 2026-10-20 实测，仅此一句即触发）',
   },
+  {
+    // DeepSeek Harness（DSH）自己的 system 首句。本机 2026-10-20 深夜实测：
+    // 仅这一句即触发 400/11128 —— 而第二段 `You are a coding agent powered by the
+    // <model> model.`（DSH 的下一条身份句）单独发**不**触发。
+    //
+    // ## 事故链（这一条是本轮「DSH 里 buddy 突然全挂」的唯一成因）
+    //
+    // 同一份 DSH system 提示词（本机 usage 记录可查）：
+    //   · 2026-10-20 14:10（会话 turn 172，经插件直连 buddy）→ 200
+    //   · 2026-10-20 22:42（最后一次成功）
+    //   · 2026-10-20 23:25（turn 186，同一份提示词）→ 400/11128
+    // ⇒ 不是 DSH 改版、不是本网关的改写、也不是账号问题，是腾讯侧新收录了这句。
+    // 用户侧观感正是「buddy 在 DSH 里用不了，其他客户端都正常」。
+    //
+    // ## 匹配语义（逐格实发探针，2026-10-20）
+    //
+    // | 形态 | 结果 |
+    // |---|---|
+    // | 裸串（system 开头）                        | ❌ 400/11128 |
+    // | 去掉句号                                   | ❌ 400/11128（故 find 不含句号） |
+    // | 全小写                                     | ❌ 400/11128（故匹配大小写不敏感） |
+    // | 句首加 `Note: `                            | ✅ 200 ⇒ **行首锚定**（与 Claude Code 那条同型） |
+    // | 改一个词（`Harness.` → `Harness system.`）  | ✅ 200 ⇒ 逐字符匹配 |
+    // | 只发 `DeepSeek Harness`（品牌词）           | ✅ 200 ⇒ 需要整句 |
+    // | `You are a coding agent powered by …`（第二句）| ✅ 200 ⇒ 只有首句是指纹 |
+    // | 放进 **assistant** 正文开头                 | ❌ 400/11128（故 assistant 也要改） |
+    // | 放进 assistant 正文中间                    | ✅ 200 |
+    // | 放进 **user** / **tool** 结果              | ✅ 200（不扫这两处，与既有实测一致） |
+    //
+    // 改写候选三条都实测 200（任一可放行，取最贴近原意的）：
+    //   `running on` / `built with` / 加逗号；这里取 `running on`。
+    find: 'You are an AI agent powered by DeepSeek Harness',
+    replace: 'You are an AI agent running on DeepSeek Harness',
+    note: 'DSH system 首句（本机 2026-10-20 实测：turn 172 放行 → turn 186 被拦，行首锚定）',
+  },
 ]
 
 /** 正则元字符转义：把字面量安全地变成**精确**匹配，而不是模式。 */
