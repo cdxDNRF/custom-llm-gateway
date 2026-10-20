@@ -282,13 +282,15 @@ export function readBuildAppUrl(dataDir: string): string {
   }
 }
 
-/** 读取原生搜索开关（缺省 false）。 */
+/** 读取原生搜索开关（**缺省 true** —— 用户要求默认开启）。 */
 export function readNativeSearchEnabled(dataDir: string): boolean {
   try {
     const config = JSON.parse(readFileSync(configPathFor(dataDir), 'utf8')) as GatewayConfig
-    return config.nativeSearch === true
+    // ⚠️ 只在**显式 false** 时关闭：未配置（undefined）视为开启。
+    //    这样老配置文件（没有这个字段）也会默认享受该能力。
+    return config.nativeSearch !== false
   } catch {
-    return false
+    return true
   }
 }
 

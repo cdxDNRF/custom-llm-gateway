@@ -251,14 +251,112 @@ function tencentEndpointOf(_providerId: string): string {
  */
 async function searchViaQoder(
   provider: Provider,
-  _request: NativeSearchRequest,
+  request: NativeSearchRequest,
 ): Promise<NativeSearchSource[]> {
-  throw new NativeSearchError(
-    'UNSUPPORTED',
-    `${provider.id} 的原生搜索需要 WASM 签名，尚未接入本网关`
-    + '（buddy / workbuddy 已可用）。',
-  )
+  const credential = await firstEnabledCredential(provider)
+  const oauthToken = typeof credential?.security_oauth_token === 'string'
+    ? credential.security_oauth_token
+    : typeof credential?.access_token === 'string' ? credential.access_token : ''
+  const machineId = typeof credential?.machine_id === 'string' ? credential.machine_id : ''
+  if (oauthToken.length === 0 || machineId.length === 0) {
+    throw new NativeSearchError(
+      'NO_ACCOUNT',
+      `${provider.id}: 没有可用的登录账号（缺 security_oauth_token / machine_id）`
+      + ' —— 请先在「供应商」页重新登录该渠道。',
+    )
+  }
+
+  // ⚠️ 用产品配置里的身份与 host（不硬编码）：Qoder 的 `clientMetadata` 是
+  //    请求签名的一部分，写错会被上游拒；而 CN / 国际站的 host 不同。
+  const { QODER, QODER_CN } = await import('../../vendor/src/qoder-product.js')
+  const product = provider.id === 'qodercn' ? QODER_CN : QODER
+  const host = product.encryptedInferBase
+  const { QoderEncryptedInfer } = await import('../../vendor/src/qoder-wasm.js')
+
+  // ⚠️ 每次新建 + finally dispose：wasm 的 QoderContext 是堆上对象，
+  //    不释放会让进程级 wasm 堆只增不减，长会话最后以裸 `unreachable` 暴毙
+  //    （见 vendor/src/qoder-wasm.ts 文件头的事故记录）。
+  let client: Awaited<ReturnType<typeof QoderEncryptedInfer.create>> | undefined
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS)
+  timer.unref?.()
+  try {
+    client = await QoderEncryptedInfer.create({
+      user: { uid: typeof credential?.uid === 'string' ? credential.uid : '', securityOauthToken: oauthToken },
+      machineId,
+      metadata: { ...product.clientMetadata },
+      host,
+    })
+
+    // ① payload（照官方 WebSearchTool 的字段与默认值）
+    const payload = {
+      query: request.query,
+      timeRange: 'NoLimit',
+      // ⚠️ 三项都关：只要标题/link/snippet，不要正文（正文会让响应大几十倍）。
+      contents: { mainText: false, markdownText: false, summary: false },
+    }
+    // ② 信封：官方是 `{ payload: <JSON 字符串>, encodeVersion: '1' }`
+    const bodyJson = JSON.stringify({ payload: JSON.stringify(payload), encodeVersion: '1' })
+    // ③ WASM 生成 url + 全套 COSY 签名头
+    const signed = client.prepareRequest(host, '/api/v1/webSearch/oneSearch', 'POST', 'auth', bodyJson, undefined)
+
+    const response = await fetch(signed.url, {
+      method: 'POST',
+      headers: signed.headers,
+      body: signed.body,
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      throw new NativeSearchError(
+        'UPSTREAM',
+        `${provider.id} 搜索失败（HTTP ${response.status}）—— ${detail.slice(0, 200)}`,
+      )
+    }
+
+    const json = await response.json() as { pageItems?: unknown }
+    const items = json.pageItems
+    if (!Array.isArray(items)) {
+      throw new NativeSearchError(
+        'BAD_RESPONSE',
+        `${provider.id} 搜索响应形状异常（缺少 pageItems 数组）—— 上游 API 可能已变更。`,
+      )
+    }
+
+    const out: NativeSearchSource[] = []
+    for (const raw of items) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const item = raw as { link?: unknown; title?: unknown; snippet?: unknown }
+      // ⚠️ Qoder 的字段名是 `link`（不是 `url`）。
+      const url = typeof item.link === 'string' ? item.link.trim() : ''
+      // ⚠️ 必须过滤空 url：官方 schema 要求 url 必填，空值会让整条工具调用报废。
+      if (url.length === 0) continue
+      out.push({
+        url,
+        ...(typeof item.title === 'string' && item.title.length > 0 ? { title: item.title } : {}),
+        ...(typeof item.snippet === 'string' && item.snippet.length > 0 ? { snippet: item.snippet } : {}),
+      })
+    }
+    return out
+  } catch (error) {
+    clearTimeout(timer)
+    if (error instanceof NativeSearchError) throw error
+    const aborted = (error as { name?: string }).name === 'AbortError'
+    throw new NativeSearchError(
+      aborted ? 'TIMEOUT' : 'UPSTREAM',
+      aborted
+        ? `${provider.id} 搜索超时（${SEARCH_TIMEOUT_MS}ms）。`
+        : `${provider.id} 搜索失败：${String(error)}`,
+    )
+  } finally {
+    clearTimeout(timer)
+    client?.dispose()
+  }
 }
+
+
 
 /**
  * 从工具列表里挑出「我们接管的搜索工具」。
@@ -322,6 +420,39 @@ export function buildSearchContextMessage(
     '请基于以上资料回答用户的问题，并在合适处引用来源 URL。',
     '若资料不足以回答，请明确说明，不要编造。',
   ].join('\n')
+}
+
+/**
+ * 把搜索结果**合并进最后一条 user 消息**（而不是追加一条 system）。
+ *
+ * ⚠️ 为什么不能追加 `role:'system'`（真实缺陷，2026-10-20 实测）：
+ *    OpenAI 协议里 system 消息**惯例在最前**，追加到末尾（在 user 之后）
+ *    会让多数上游**忽略它** —— 实测模型回答"我无法获取实时信息"，
+ *    明明搜索已成功、资料也注入了，模型却完全没看到。
+ *
+ * 合并进 user 消息则不存在这个问题：模型**必然**会读到自己那条输入。
+ */
+export function injectSearchIntoMessages<T extends { role?: string; content?: unknown }>(
+  messages: readonly T[],
+  context: string,
+): T[] {
+  if (messages.length === 0) return [...messages]
+  // 从后往前找最后一条 user。
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (message.role !== 'user') continue
+    const content = message.content
+    const merged = typeof content === 'string'
+      ? `${content}\n\n${context}`
+      : Array.isArray(content)
+        ? [...content, { type: 'text', text: context }]
+        : context
+    const copy = [...messages]
+    copy[i] = { ...message, content: merged } as T
+    return copy
+  }
+  // 没有 user 消息（极罕见）：追加一条。
+  return [...messages, { role: 'user', content: context } as unknown as T]
 }
 
 /**

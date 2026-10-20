@@ -1,0 +1,110 @@
+diff --git a/vendor/src/qoder-wasm.ts b/vendor/src/qoder-wasm.ts
+index 353234e..e9e044a 100644
+--- a/vendor/src/qoder-wasm.ts
++++ b/vendor/src/qoder-wasm.ts
+@@ -895,6 +895,105 @@ export class QoderEncryptedInfer {
+     }
+   }
+ 
++  /**
++   * **通用**请求签名：任意 endpoint / path / method（本仓库扩展，2026-10-20）。
++   *
++   * ## 为什么需要它（与 `prepareInfer` 的区别）
++   *
++   * WASM 里有两个签名入口，用途不同：
++   *
++   * | 导出 | 用途 | 本仓库 |
++   * |---|---|---|
++   * | `qodercontext_prepareInferRequest` | **仅推理**端点（`agent_chat_generation`） | ✅ `prepareInfer` |
++   * | `qodercontext_prepareRequest` | **通用**：任意 endpoint/path/method | ✅ 本方法 |
++   *
++   * 原生**搜索**（`/api/v1/webSearch/oneSearch`）走的是后者 —— 它的 host 与
++   * 推理不同（搜索挂 center host），且 path 任意，故不能复用 `prepareInfer`。
++   *
++   * ## 与 `prepareInfer` 的三点差异（照 wasm-bindgen glue 对齐）
++   *
++   * 1. **不读 `this.host`**：endpoint 作为参数传入（搜索与推理 host 不同）。
++   * 2. **6 个参数**（vs prepareInferRequest 的 4 个）。
++   * 3. **可选参数缺席传 `0`**（`MX(n) ? 0 : n`）—— 传空串会被 Rust 侧当成
++   *    "有值但为空"，与官方行为不一致。
++   *
++   * @param endpoint 目标 host（含 scheme，如 `https://gateway.qoder.com.cn`）
++   * @param path 请求路径（如 `/api/v1/webSearch/oneSearch`）
++   * @param method HTTP 方法（官方对搜索与推理都用 `POST`）
++   * @param mode 签名模式：`'auth'`（登录态）或 `'sign'`（匿名）
++   * @param body 请求体字符串；`undefined` = 不带 body
++   * @param headers 额外请求头的 JSON 字符串；`undefined` = 不带
++   * @returns `{ url, headers, body }` —— headers 含 `Authorization: Bearer COSY.<载荷>.<签名>`
++   */
++  prepareRequest(
++    endpoint: string,
++    path: string,
++    method: string,
++    mode: string,
++    body: string | undefined,
++    headers: string | undefined,
++  ): QoderInferRequest {
++    const g = this.g
++    if (this.disposed) {
++      // 与 prepareInfer 同款：显式报错好过拿悬垂指针后 trap 一句裸 unreachable。
++      throw new Error('qoder: QoderEncryptedInfer 已 dispose，不能再次 prepareRequest')
++    }
++
++    const result = g.callPointer((stack) => {
++      const ep = g.writeString(endpoint); const epLen = g.lastLength()
++      const pt = g.writeString(path); const ptLen = g.lastLength()
++      const md = g.writeString(method); const mdLen = g.lastLength()
++      const mo = g.writeString(mode); const moLen = g.lastLength()
++      // ⚠️ 可选参数缺席传 0（glue 的 `MX(n) ? 0 : ...` 语义），不能传空串指针。
++      const bd = body === undefined ? 0 : g.writeString(body)
++      const bdLen = body === undefined ? 0 : g.lastLength()
++      const hd = headers === undefined ? 0 : g.writeString(headers)
++      const hdLen = headers === undefined ? 0 : g.lastLength()
++      g.exports.qodercontext_prepareRequest!(
++        stack, this.context,
++        ep, epLen, pt, ptLen, md, mdLen, mo, moLen, bd, bdLen, hd, hdLen,
++      )
++    })
++
++    // 与 `prepareInfer` **完全同款**的读取 + 释放逻辑。
++    // ⚠️ 必须 try/finally：异常路径同样要释放 `result`，否则泄漏最多。
++    try {
++      const headerMap = g.takeObject(g.exports.requestresult_headers!(result))
++      const outHeaders: Record<string, string> = {}
++      if (headerMap instanceof Map) {
++        for (const [k, v] of headerMap) outHeaders[String(k)] = String(v)
++      }
++
++      const readResultString = (invoke: (stack: number, ptr: number) => void): string => {
++        let out = ''
++        let outPtr = 0
++        let outLen = 0
++        const v = g.view()
++        const stack = g.exports.__wbindgen_add_to_stack_pointer!(-16)
++        try {
++          invoke(stack, result)
++          outPtr = v.getInt32(stack + 0, true)
++          outLen = v.getInt32(stack + 4, true)
++          out = outPtr ? g.readString(outPtr, outLen) : ''
++        } finally {
++          g.exports.__wbindgen_add_to_stack_pointer!(16)
++          // Rust 侧新分配的 String，所有权已交给 JS ⇒ 必须释放（同 prepareInfer）。
++          g.freeString(outPtr, outLen)
++        }
++        return out
++      }
++
++      return {
++        url: readResultString((stack, ptr) => g.exports.requestresult_url!(stack, ptr)),
++        headers: outHeaders,
++        body: readResultString((stack, ptr) => g.exports.requestresult_body!(stack, ptr)),
++      }
++    } finally {
++      // 只释放 `result`（输入字符串由 Rust 持有，手工释放会 trap unreachable）。
++      g.freePointer('__wbg_requestresult_free', result)
++    }
++  }
++
+   /**
+    * 释放本实例持有的 wasm `QoderContext`。
+    *

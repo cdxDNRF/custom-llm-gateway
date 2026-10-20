@@ -912,22 +912,22 @@ export class OverviewServer {
       const sources = await nativeSearch(provider, { query, maxResults: 5 })
       const context = build(query, sources)
       this.catalogInfo?.(`原生搜索（${providerId}）：「${query}」→ ${sources.length} 条结果`)
-      // 把资料作为一条 system 消息插在最后（靠近提问处，模型更容易采用）。
-      const messages = [...(body.messages ?? []), { role: 'system' as const, content: context }]
+      // ⚠️ 合并进最后一条 user 消息，**不能**追加一条 role:'system'
+      //    （末尾的 system 会被多数上游忽略 —— 实测模型答"我无法获取实时信息"）。
+      const { injectSearchIntoMessages } = await import('./native-search.js')
+      const messages = injectSearchIntoMessages(body.messages ?? [], context)
       return { messages, toolName: tool.name }
     } catch (error) {
       const message = String(error instanceof Error ? error.message : error)
       this.catalogWarn?.(`原生搜索失败（${providerId}）：${message}`)
       // ⚠️ 失败也注入（说明"搜索没成功"），而不是静默忽略 —— 否则模型会
       //    误以为自己有搜索结果却拿不到，或者直接报错中断对话。
-      const messages = [
-        ...(body.messages ?? []),
-        {
-          role: 'system' as const,
-          content: `[网络搜索失败] 网关尝试为该渠道执行原生搜索时失败：${message}\n`
-            + '请明确告知用户搜索未能完成，并基于已有知识谨慎回答；不要编造搜索来源。',
-        },
-      ]
+      const { injectSearchIntoMessages } = await import('./native-search.js')
+      const messages = injectSearchIntoMessages(
+        body.messages ?? [],
+        `[网络搜索失败] 网关尝试为该渠道执行原生搜索时失败：${message}\n`
+        + '请明确告知用户搜索未能完成，并基于已有知识谨慎回答；不要编造搜索来源。',
+      )
       return { messages, toolName: tool.name }
     }
   }

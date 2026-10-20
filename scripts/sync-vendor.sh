@@ -138,6 +138,26 @@ if [ -f "$PATCH_FILE" ]; then
   fi
 fi
 
+# ④e 本地补丁：Qoder WASM 的**通用**请求签名（2026-10-20）
+# WASM 里有两个签名入口，我们的 vendor 只接了推理那个：
+#   · `qodercontext_prepareInferRequest` —— 仅推理端点（`prepareInfer`）
+#   · `qodercontext_prepareRequest`      —— **通用**：任意 endpoint/path/method
+# 原生**搜索**（`/api/v1/webSearch/oneSearch`）必须用后者：它的 host 与推理不同
+# （搜索挂 center host），且 path 任意。
+# 补丁只**新增**一个方法（`prepareRequest`），既有 `prepareInfer` 逐字节不变。
+PATCH_QODER="$HERE/vendor-patches/qoder-prepare-request.patch"
+if [ -f "$PATCH_QODER" ]; then
+  if git -C "$HERE" apply --check "$PATCH_QODER" 2>/dev/null; then
+    git -C "$HERE" apply "$PATCH_QODER"
+    echo "   ✓ 已应用 Qoder 通用签名补丁"
+  elif git -C "$HERE" apply --check --reverse "$PATCH_QODER" 2>/dev/null; then
+    echo "   ✓ Qoder 通用签名补丁已在（无需重复应用）"
+  else
+    echo "   ⚠️ Qoder 补丁无法应用（上游可能已改 qoder-wasm.ts）。" >&2
+    echo "      请核对后更新：vendor-patches/qoder-prepare-request.patch" >&2
+  fi
+fi
+
 echo "⑤ 类型检查（自有代码）…"
 if [ ! -x ./node_modules/.bin/tsc ]; then
   echo "   跳过（未装 typescript）"
