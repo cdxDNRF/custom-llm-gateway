@@ -12,7 +12,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { collectCompletion, streamChunksToSse, toGenerateOptions, type OpenAiChatRequest } from './protocol.js'
+import { collectCompletion, streamChunksToSse, toGenerateOptions, type OpenAiChatRequest,
+  type OpenAiMessage,
+} from './protocol.js'
 import { recentLogs } from './logger.js'
 import { lanAddresses } from './net.js'
 import { corsHeaders } from './cors.js'
@@ -60,6 +62,17 @@ export interface OverviewServerOptions {
    *    （否则一次页面刷新就可能打一批上游请求）。
    */
   catalogRefresher?: { lastResults(): readonly { provider: string; ok: boolean; count: number; error?: string }[] }
+  /**
+   * 渠道原生搜索的**总开关**（Web UI 上的开关）。
+   *
+   * ⚠️ 传**函数**而不是布尔值：用户在界面上切换后必须**立即生效**，
+   *    不能被启动时的快照钉死（与 Jet Hub 的 `nativeWebSearchEnabled()` 同一取舍）。
+   */
+  nativeSearchEnabled?: () => boolean
+  /** 日志出口（info 级）。 */
+  catalogInfo?: (message: string) => void
+  /** 日志出口（warn 级）。 */
+  catalogWarn?: (message: string) => void
 }
 
 import type { ProviderRuntime } from './provider-runtime.js'
@@ -120,6 +133,9 @@ export class OverviewServer {
   /** Build 渠道的 WebSocket 中继（可选；未启用时为 undefined）。 */
   private buildRelay: BuildRelay | undefined
   private readonly catalogRefresher: OverviewServerOptions['catalogRefresher']
+  private readonly nativeSearchEnabled: (() => boolean) | undefined
+  private readonly catalogInfo: ((message: string) => void) | undefined
+  private readonly catalogWarn: ((message: string) => void) | undefined
 
   constructor(options: OverviewServerOptions) {
     this.providers = options.providers
@@ -132,6 +148,9 @@ export class OverviewServer {
     this.usage = options.usage
     this.buildRelay = options.buildRelay
     this.catalogRefresher = options.catalogRefresher
+    this.nativeSearchEnabled = options.nativeSearchEnabled
+    this.catalogInfo = options.catalogInfo
+    this.catalogWarn = options.catalogWarn
   }
 
   get baseUrl(): string {
@@ -415,6 +434,25 @@ export class OverviewServer {
 
     if (path === '/api/logs' && request.method === 'GET') {
       sendJson(response, 200, { logs: recentLogs(300) })
+      return
+    }
+
+    // ── 渠道原生搜索：开关读写 + 能力查询（Web UI 的开关）──
+    if (path === '/api/native-search' && request.method === 'GET') {
+      const { NATIVE_SEARCH_PROVIDERS } = await import('./native-search.js')
+      const { readNativeSearchEnabled } = await import('../providers/registry.js')
+      sendJson(response, 200, {
+        enabled: readNativeSearchEnabled(this.dataDir),
+        providers: [...NATIVE_SEARCH_PROVIDERS],
+      })
+      return
+    }
+    if (path === '/api/native-search' && request.method === 'POST') {
+      let body: { enabled?: unknown } = {}
+      try { body = JSON.parse(await readBody(request)) as typeof body } catch { body = {} }
+      const { setNativeSearchEnabled, readNativeSearchEnabled } = await import('../providers/registry.js')
+      setNativeSearchEnabled(this.dataDir, body.enabled === true)
+      sendJson(response, 200, { ok: true, enabled: readNativeSearchEnabled(this.dataDir) })
       return
     }
 
@@ -842,6 +880,58 @@ export class OverviewServer {
     sendJson(response, 200, { object: 'list', data })
   }
 
+  /**
+   * **渠道原生搜索**：把客户端声明的 `web_search` 工具变成真实搜索。
+   *
+   * @returns `undefined` 表示「不接管」（保持原请求逐字节不变）；
+   *          否则返回注入搜索结果后的 message 列表。
+   *
+   * ⚠️ **失败绝不中断对话**：搜索失败时把失败原因也注入上下文，让模型知道
+   *    "搜索没成功"，从而改用其它方式回答 —— 而不是让整个请求 500。
+   */
+  private async maybeRunNativeSearch(
+    provider: Provider,
+    providerId: string,
+    body: OpenAiChatRequest,
+  ): Promise<{ messages: OpenAiMessage[]; toolName: string } | undefined> {
+    // ① 用户开关（Web UI）
+    if (this.nativeSearchEnabled?.() !== true) return undefined
+    // ② 该渠道支持原生搜索（能力表见 native-search.ts）
+    const { NATIVE_SEARCH_PROVIDERS, pickSearchTool, nativeSearch, buildSearchContextMessage } =
+      await import('./native-search.js')
+    if (!NATIVE_SEARCH_PROVIDERS.has(providerId)) return undefined
+    // ③ 客户端真的声明了搜索工具
+    const tool = pickSearchTool(body.tools as unknown[] | undefined)
+    if (tool === undefined) return undefined
+    // 还需要一条 user 文本作为查询
+    const query = latestUserText(body.messages)
+    if (query.length === 0) return undefined
+
+    const { buildSearchContextMessage: build } = await import('./native-search.js')
+    try {
+      const sources = await nativeSearch(provider, { query, maxResults: 5 })
+      const context = build(query, sources)
+      this.catalogInfo?.(`原生搜索（${providerId}）：「${query}」→ ${sources.length} 条结果`)
+      // 把资料作为一条 system 消息插在最后（靠近提问处，模型更容易采用）。
+      const messages = [...(body.messages ?? []), { role: 'system' as const, content: context }]
+      return { messages, toolName: tool.name }
+    } catch (error) {
+      const message = String(error instanceof Error ? error.message : error)
+      this.catalogWarn?.(`原生搜索失败（${providerId}）：${message}`)
+      // ⚠️ 失败也注入（说明"搜索没成功"），而不是静默忽略 —— 否则模型会
+      //    误以为自己有搜索结果却拿不到，或者直接报错中断对话。
+      const messages = [
+        ...(body.messages ?? []),
+        {
+          role: 'system' as const,
+          content: `[网络搜索失败] 网关尝试为该渠道执行原生搜索时失败：${message}\n`
+            + '请明确告知用户搜索未能完成，并基于已有知识谨慎回答；不要编造搜索来源。',
+        },
+      ]
+      return { messages, toolName: tool.name }
+    }
+  }
+
   private async aggregateChat(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const startedAt = Date.now()
     let body: OpenAiChatRequest
@@ -869,7 +959,28 @@ export class OverviewServer {
       return
     }
 
-    const generate = toGenerateOptions({ ...body, model: modelId }, {
+    // ── 渠道原生搜索：把客户端的 web_search 工具变成**真实搜索** ──
+    //
+    // 为什么在这里做（而不是返回 tool_call 让客户端执行）：
+    // 酒馆等客户端**没有搜索实现**，返回 tool_call 它执行不了、对话会卡住。
+    // 故网关在服务端闭环：先搜 → 把资料作为上下文注入 → 模型基于真实资料回答。
+    // 客户端全程无感（仍是一次普通 chat 请求）。
+    //
+    // ⚠️ 三重门槛，缺一不接管（宁可不生效，也不影响既有链路）：
+    //    ① 用户开关打开   ② 该渠道支持原生搜索   ③ 客户端**声明了**搜索工具
+    const searchOutcome = await this.maybeRunNativeSearch(provider, providerId, body)
+    // ⚠️ 接管后要**把搜索工具从声明里摘掉**（真实缺陷，2026-10-20 实测）：
+    //    只注入上下文而不摘工具时，模型看到 `web_search` 仍可用，倾向自己调
+    //    （返回 tool_calls），我们注入的资料白费。摘掉后它只能基于资料回答。
+    const effectiveBody = searchOutcome === undefined
+      ? body
+      : {
+          ...body,
+          messages: searchOutcome.messages,
+          tools: stripSearchTools(body.tools, searchOutcome.toolName),
+        }
+
+    const generate = toGenerateOptions({ ...effectiveBody, model: modelId }, {
       provider: providerId,
       model: modelId,
       sessionId: `gw-agg-${providerId}-${Date.now().toString(36)}`,
@@ -1105,4 +1216,53 @@ export class OverviewServer {
       })
     }
   }
+}
+
+/**
+ * 取**最近一条 user 消息**的纯文本（作为原生搜索的查询串）。
+ *
+ * ⚠️ 取「最近一条」而非拼接全部：搜索要的是一个查询，把整段对话塞进去
+ *    会让搜索结果跑偏（实测过长的 query 返回无关结果）。
+ */
+function latestUserText(messages: readonly OpenAiMessage[] | undefined): string {
+  if (!Array.isArray(messages)) return ''
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (message.role !== 'user') continue
+    const content = message.content
+    if (typeof content === 'string') return content.trim()
+    if (Array.isArray(content)) {
+      const text = content
+        .filter((part): part is { type?: string; text?: string } => typeof part === 'object' && part !== null)
+        .filter((part) => part.type === 'text' && typeof part.text === 'string')
+        .map((part) => part.text!)
+        .join('\n')
+        .trim()
+      if (text.length > 0) return text
+    }
+  }
+  return ''
+}
+
+/**
+ * 从工具声明里摘掉**已被我们接管**的搜索工具。
+ *
+ * ⚠️ 为什么必须摘（真实缺陷，2026-10-20 实测）：只注入搜索结果而不摘工具时，
+ *    模型看到 `web_search` 仍可用，**倾向于自己调用**（返回 `tool_calls`），
+ *    于是我们注入的资料完全白费，客户端还会因为不会执行该工具而卡住。
+ *
+ * ⚠️ 摘掉后若工具列表为空，要**整个删掉 `tools` 字段** —— 传空数组 `[]`
+ *    会让部分上游报 400（"tools 不能为空"）。
+ */
+function stripSearchTools<T>(tools: T[] | undefined, searchToolName: string): T[] | undefined {
+  if (!Array.isArray(tools)) return tools
+  const kept = tools.filter((tool) => {
+    if (typeof tool !== 'object' || tool === null) return true
+    const rec = tool as { name?: unknown; function?: { name?: unknown } }
+    const name = typeof rec.name === 'string' ? rec.name
+      : typeof rec.function?.name === 'string' ? rec.function.name
+        : ''
+    return name !== searchToolName
+  })
+  return kept.length > 0 ? kept : undefined
 }

@@ -16,6 +16,7 @@ import { OverviewServer } from './core/server.js'
 import { ProviderRuntime } from './core/provider-runtime.js'
 import { UsageStore } from './core/usage.js'
 import { CatalogRefresher } from './core/catalog-refresher.js'
+import { readNativeSearchEnabled } from './providers/registry.js'
 import { buildRelayFor } from './providers/build.js'
 import { lanAddresses } from './core/net.js'
 
@@ -136,6 +137,10 @@ async function main(): Promise<void> {
     ...(buildRelay !== undefined ? { buildRelay } : {}),
     // 观测用：让 /api/catalog-status 能看到各家的最近刷新结果。
     catalogRefresher,
+    // 渠道原生搜索总开关（Web UI 可切换，立即生效 —— 故传函数而非快照值）。
+    nativeSearchEnabled: () => readNativeSearchEnabled(config.dataDir),
+    catalogInfo: (message) => console.log(`  ${message}`),
+    catalogWarn: (message) => console.warn(`  ⚠️ ${message}`),
   })
   await overview.start()
 

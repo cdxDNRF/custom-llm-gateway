@@ -58,6 +58,28 @@
     <div id="endpoints" class="endpoints"></div>
 
     <div class="page-head page-head-spaced">
+      <h2>渠道原生搜索</h2>
+      <p class="hint">
+        开启后，客户端声明的 <code>web_search</code> 工具会被网关用<b>该渠道自带的搜索后端</b>真实执行，
+        搜索结果注入上下文交给模型回答 —— <b>客户端无需自己实现搜索</b>。
+        支持的渠道：buddy / workbuddy（腾讯）、qoder / qodercn（Qoder）。
+      </p>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <h3>开关</h3>
+        <span class="chart-note" id="native-search-note"></span>
+      </div>
+      <div class="row" style="align-items:center; gap:10px">
+        <label class="switch" title="开启后 web_search 由渠道原生后端执行">
+          <input type="checkbox" id="native-search-toggle">
+          <span>渠道原生搜索</span>
+        </label>
+        <span class="hint" id="native-search-detail" style="margin:0"></span>
+      </div>
+    </div>
+
+    <div class="page-head page-head-spaced">
       <h2>运行日志</h2>
       <p class="hint">最近 300 条（登录、签到、限流切换等都会出现在这里）。</p>
     </div>

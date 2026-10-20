@@ -61,6 +61,16 @@ export interface GatewayConfig {
   dataDir: string
   logLevel: 'debug' | 'info' | 'warn' | 'error'
   /**
+   * **渠道原生搜索**的总开关（Web UI 上可切换，默认关闭）。
+   *
+   * 开启后：客户端声明的 `web_search` 工具会被网关用**该渠道自带的搜索后端**
+   * 真实执行（buddy/workbuddy → 腾讯、qoder → Qoder），搜索结果注入上下文
+   * 交给模型回答。客户端无需自己实现搜索。
+   *
+   * ⚠️ 默认 **false**：这是新增能力，默认关闭才符合"不改变既有行为"的预期。
+   */
+  nativeSearch?: boolean
+  /**
    * 总览服务（Web UI + 聚合端点）的监听地址。
    *
    * - `127.0.0.1`（默认）：仅本机可访问，最安全。
@@ -270,6 +280,30 @@ export function readBuildAppUrl(dataDir: string): string {
   } catch {
     return ''
   }
+}
+
+/** 读取原生搜索开关（缺省 false）。 */
+export function readNativeSearchEnabled(dataDir: string): boolean {
+  try {
+    const config = JSON.parse(readFileSync(configPathFor(dataDir), 'utf8')) as GatewayConfig
+    return config.nativeSearch === true
+  } catch {
+    return false
+  }
+}
+
+/** 持久化原生搜索开关（读-改-写，不丢其它字段）。 */
+export function setNativeSearchEnabled(dataDir: string, enabled: boolean): void {
+  const configPath = configPathFor(dataDir)
+  let config: Record<string, unknown> = {}
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as unknown
+    if (typeof parsed === 'object' && parsed !== null) config = parsed as Record<string, unknown>
+  } catch {
+    // 读不到/损坏：以空对象为底，仅改本次字段。
+  }
+  config.nativeSearch = enabled
+  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8')
 }
 
 /** 读取当前 config.json 里某供应商的开关（供控制台显示）。 */

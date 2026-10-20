@@ -1391,6 +1391,40 @@ $('#usage-clear')?.addEventListener('click', async () => {
   }
 })
 
+// ── 渠道原生搜索开关 ──
+//
+// 开启后：客户端声明的 web_search 工具由**渠道自带后端**真实执行
+// （buddy/workbuddy → 腾讯、qoder → Qoder），结果注入上下文给模型。
+async function loadNativeSearch() {
+  const toggle = $('#native-search-toggle')
+  const note = $('#native-search-note')
+  const detail = $('#native-search-detail')
+  if (toggle === null) return
+  try {
+    const r = await api('/api/native-search')
+    toggle.checked = r.enabled === true
+    if (note !== null) note.textContent = r.enabled === true ? '已开启' : '已关闭'
+    if (detail !== null) detail.textContent = `支持 ${r.providers?.length ?? 0} 家：${(r.providers ?? []).join(' / ')}`
+  } catch (error) {
+    if (detail !== null) detail.textContent = `读取失败：${error.message || error}`
+  }
+}
+
+$('#native-search-toggle')?.addEventListener('change', async (event) => {
+  const enabled = event.target.checked === true
+  try {
+    const r = await api('/api/native-search', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+    toast(r.enabled === true ? '渠道原生搜索已开启' : '渠道原生搜索已关闭', 'ok')
+    await loadNativeSearch()
+  } catch (error) {
+    event.target.checked = !enabled
+    toast(String(error.message || error), 'err')
+  }
+})
+
 // ── Build 渠道页 ──
 //
 // 这个渠道与其它 17 家的形态不同：上游是跑在 Google Cloud Run 上的 AI Studio App，
@@ -1593,6 +1627,8 @@ function showPage(name) {
   if (target === 'data') void loadUsage()
   // 切到 Build 页同理：连接状态变化很快，进来就该拉最新的。
   if (target === 'build') void loadBuild()
+  // 网关页的「原生搜索」开关状态（可能被别处改动，进来就重读一次）。
+  if (target === 'gateway') void loadNativeSearch()
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
