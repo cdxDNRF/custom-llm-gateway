@@ -280,6 +280,13 @@ export class ProviderServer {
 
     const { adapterProvider, model } = adapterFor(this.provider.id, body.model)
     const openAiBody = anthropicToOpenAiRequest({ ...body, model })
+    // ── 客户端断开即中止上游（同总览服务，见 `aggregateChat` 的注释）──
+    const abort = new AbortController()
+    const onClientGone = (): void => {
+      if (!abort.signal.aborted) abort.abort(new Error('client disconnected'))
+    }
+    response.on('close', onClientGone)
+    response.on('finish', () => response.off('close', onClientGone))
     const generate = toGenerateOptions(openAiBody, {
       provider: adapterProvider,
       model,
@@ -288,6 +295,7 @@ export class ProviderServer {
       //    客户端显式 stream:true 时才走真流式。其它适配器忽略此字段。
       useNonStream: openAiBody.stream !== true,
     })
+    generate.signal = abort.signal
     const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 
     let chunks: AsyncIterable<Parameters<typeof collectCompletion>[0] extends AsyncIterable<infer T> ? T : never>
@@ -350,12 +358,20 @@ export class ProviderServer {
     }
 
     const { adapterProvider, model } = adapterFor(this.provider.id, body.model)
+    // ── 客户端断开即中止上游（同总览服务，见 `aggregateChat` 的注释）──
+    const abort = new AbortController()
+    const onClientGone = (): void => {
+      if (!abort.signal.aborted) abort.abort(new Error('client disconnected'))
+    }
+    response.on('close', onClientGone)
+    response.on('finish', () => response.off('close', onClientGone))
     const generate = toGenerateOptions(body, {
       provider: adapterProvider,
       model,
       sessionId: `gw-${this.provider.id}-${Date.now().toString(36)}`,
       useNonStream: body.stream !== true,
     })
+    generate.signal = abort.signal
 
     const id = `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     const created = Math.floor(Date.now() / 1000)

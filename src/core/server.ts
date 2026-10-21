@@ -991,6 +991,31 @@ export class OverviewServer {
           tools: stripSearchTools(body.tools, searchOutcome.toolName),
         }
 
+    // ── 客户端断开即中止上游 ──
+    //
+    // ⚠️ 真实缺陷（2026-10-21 排查「消息发出去但一直没有响应」时发现）：
+    //    网关**从不监听** `response` 的 close/aborted，也从不给适配器传
+    //    `AbortSignal`。后果链：
+    //      ① 客户端（DSH / Claude Code）那边这一轮已经结束了（用户按了停止、
+    //         UI 超时、或客户端自己重试），但网关这边的上游 SSE 还在跑；
+    //      ② 适配器每收到一帧都往已关闭的 response 写 → `write()` 静默失败
+    //         （Node 不会抛），网关仍然继续消费整条流；
+    //      ③ 上游额度/积分照烧，且这条「幽灵请求」占着账号池的并发位，
+    //         于是用户**下一条**消息的 TTFT 明显变长（实测 TTFT p99 ≈ 17.6s、
+    //         最长 21.3s，而中位数只有 1.9s）。
+    //    ⇒ 用户在界面上看到的就是「消息发出去了，半天没反应」。
+    //
+    // 修法：用 `AbortController` 串起来 —— 连接一断就 abort，适配器随即停止
+    // 读上游并释放连接（适配器本来就都实现了 `options.signal` 的处理）。
+    const abort = new AbortController()
+    const onClientGone = (): void => {
+      if (!abort.signal.aborted) abort.abort(new Error('client disconnected'))
+    }
+    response.on('close', onClientGone)
+    // ⚠️ 正常结束后也要摘掉监听，否则长连接复用时（keep-alive）会把
+    //    下一轮请求的 close 误当成这一轮的断开。
+    response.on('finish', () => response.off('close', onClientGone))
+
     const generate = toGenerateOptions({ ...effectiveBody, model: modelId }, {
       provider: providerId,
       model: modelId,
@@ -1001,6 +1026,8 @@ export class OverviewServer {
       //    打 8790 时 raw=undefined、始终走假流式，而打 3917 才生效）。
       useNonStream: body.stream !== true,
     })
+    // 把断开信号交给适配器（`GenerateOptions.signal` 是 DSH 的正式字段）。
+    generate.signal = abort.signal
     const id = `chatcmpl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     const created = Math.floor(Date.now() / 1000)
     const stream = body.stream === true
@@ -1172,6 +1199,18 @@ export class OverviewServer {
           messages: searchOutcome.messages,
           tools: stripSearchTools(openAiBody.tools, searchOutcome.toolName),
         }
+    // ── 客户端断开即中止上游（同 aggregateChat，见那里的注释）──
+    //
+    // Claude Code / ZCode 这类 Claude 系客户端**尤其**需要：它们会主动
+    // 重试、也会在用户按 Esc 时断开连接；不 abort 就会留下幽灵请求，
+    // 白烧账号池额度并拖慢下一条消息的 TTFT。
+    const abort = new AbortController()
+    const onClientGone = (): void => {
+      if (!abort.signal.aborted) abort.abort(new Error('client disconnected'))
+    }
+    response.on('close', onClientGone)
+    response.on('finish', () => response.off('close', onClientGone))
+
     const generate = toGenerateOptions(effectiveBody, {
       provider: providerId,
       model: modelId,
@@ -1179,6 +1218,7 @@ export class OverviewServer {
       // 同聚合 Chat：Build 渠道默认假流式，需显式传开关。
       useNonStream: openAiBody.stream !== true,
     })
+    generate.signal = abort.signal
     // Anthropic 的消息 id 惯例是 `msg_` 前缀。
     const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
     const startedAt = Date.now()
