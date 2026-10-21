@@ -478,6 +478,15 @@ export function renderSearchResults(query: string, sources: readonly NativeSearc
 /** 判断某个工具名是否是我们接管的搜索工具。 */
 export function isSearchToolName(name: string): boolean {
   const normalized = name.toLowerCase()
+  // ⚠️⚠️ **先排除「伪搜索工具名」**（真实缺陷，2026-10-21 真 CLI 实测）：
+  //    Claude Code v2.1.293 有一个叫 **`ToolSearch`** 的工具 —— 它搜的是
+  //    「延迟加载的工具 schema」（`select:WebSearch` 那种），**不是网络搜索**。
+  //    按「名字含 search」的规则会把它误当成 web_search 接管 ⇒ 网关偷偷执行
+  //    一次网络搜索、注入结果、并把 `ToolSearch` 从工具列表里摘掉 ⇒ 模型再也
+  //    载入不了 WebSearch/WebFetch 等延迟工具，只会答「我没有搜索工具」。
+  //    这正是用户报障的现象。故这类**必须**先挡掉。
+  if (normalized === 'toolsearch' || normalized === 'tool_search') return false
+  if (normalized.startsWith('toolsearch') || normalized.startsWith('tool_search')) return false
   // 精确名（各家标准写法）
   if (normalized === 'web_search'
     || normalized === 'websearch'
@@ -496,5 +505,9 @@ export function isSearchToolName(name: string): boolean {
   // 排除本地/非网络搜索（这些不该走渠道原生搜索）
   if (normalized.includes('file') || normalized.includes('code')
     || normalized.includes('grep') || normalized.includes('repo')) return false
+  // 排除「工具/能力检索」类（tool search / skill search / mcp 检索）：
+  // 它们检索的是**本地能力清单**，不是网络。与上面的 ToolSearch 同理。
+  if (normalized.includes('tool') || normalized.includes('skill')
+    || normalized.includes('mcp') || normalized.includes('capab')) return false
   return true
 }

@@ -63,6 +63,15 @@ export interface AnthropicTool {
   name: string
   description?: string
   input_schema?: Record<string, unknown>
+  /**
+   * 工具类型。
+   *
+   * 自定义工具恒为 `'custom'`（或不带）；**服务端工具**（如
+   * `web_search_20250305`）用类型名标识自己，且**不带 `input_schema`** ——
+   * 这类工具由 Anthropic 服务端执行，没有入参 schema 是正常的。
+   * 丢掉它等于告诉模型「你没有搜索工具」（真实缺陷，2026-10-21）。
+   */
+  type?: string
   /** 部分客户端会带；忽略。 */
   [key: string]: unknown
 }
@@ -222,15 +231,43 @@ export function anthropicToOpenAiRequest(body: AnthropicMessagesRequest): OpenAi
     const tools: OpenAiTool[] = []
     for (const tool of body.tools) {
       if (typeof tool.name !== 'string' || tool.name.length === 0) continue
-      // Anthropic 内置工具（如 web_search_*）没有 input_schema 且**不能**
-      // 透传给上游（我们的上游没有同名工具）。没有 input_schema 的一律跳过。
-      if (tool.input_schema === undefined) continue
+      // ⚠️⚠️ **Anthropic 服务端工具（`web_search_20250305` 等）没有 `input_schema`**
+      //    （真实缺陷，2026-10-21 实测）：旧写法直接 `continue` 跳过 ⇒ 该工具
+      //    在转换后**彻底消失**，于是：
+      //      ① 我们自己的「渠道原生搜索」看不到它（`pickSearchTool` 拿不到名字）；
+      //      ② 模型收到的工具列表里也没有它 ⇒ 回答「我没有搜索工具」。
+      //    这正是「Claude Code 说没有搜索工具」的成因之一。
+      //
+      //    修法：**认出服务端搜索工具并补一个最小 schema**，让它在转换后仍然存在。
+      //    它不一定能直达上游（上游没有同名工具），但会走到原生搜索那一层被接管；
+      //    若渠道不支持原生搜索，则由 `stripSearchTools` 之外的路径原样保留 ——
+      //    模型看到工具存在但上游不认，行为与「客户端声明了不可执行工具」一致。
+      const declaredType = typeof tool.type === 'string' ? tool.type : ''
+      const isServerSearchTool = tool.input_schema === undefined
+        && (declaredType.startsWith('web_search') || declaredType.startsWith('web_fetch'))
+      if (tool.input_schema === undefined && !isServerSearchTool) continue
+      const schema = tool.input_schema ?? (declaredType.startsWith('web_search')
+        // 与 Anthropic 官方 `web_search` 的入参一致：`query` 必填。
+        ? {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'The search query to use' },
+            },
+            required: ['query'],
+          }
+        : {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: 'The URL to fetch' },
+            },
+            required: ['url'],
+          })
       tools.push({
         type: 'function',
         function: {
           name: tool.name,
           ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
-          parameters: tool.input_schema,
+          parameters: schema as Record<string, unknown>,
         },
       })
     }

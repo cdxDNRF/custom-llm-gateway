@@ -185,6 +185,47 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     replace: 'You are an AI agent running on DeepSeek Harness',
     note: 'DSH system 首句（本机 2026-10-20 实测：turn 172 放行 → turn 186 被拦，行首锚定）',
   },
+  {
+    // Claude Code v2.1.293 的 **system 首块**：一个伪装成 HTTP 头的计费标记。
+    //
+    // ```
+    // x-anthropic-billing-header: cc_version=2.1.293.866; cc_entrypoint=sdk-cli;
+    // ```
+    //
+    // ## 事故链（本轮「Claude Code 里 buddy 全挂」的成因）
+    //
+    // 2026-10-21 用 `claude -p`（v2.1.293，真 CLI，配置指向本网关 8790）复现：
+    // 每条请求都 502 +「请求被拦截，请重新发送 Illegal API invocation from an
+    // unapproved channel」⇒ Claude Code 里**任何 buddy 模型都用不了**。
+    //
+    // 抓包（本机 mock 服务）确认它恒为 `system[0]` 的第一行（74 字符）。
+    // 上游拦截把整条请求判成「未获批准渠道」—— 因为这句话本来就是用于
+    // **让 Anthropic 官方统计第三方入口**的标记，腾讯把它当成了非官方渠道证据。
+    //
+    // ## 匹配语义（逐格实发探针，2026-10-21，经网关 → buddy）
+    //
+    // | 形态 | 结果 |
+    // |---|---|
+    // | 整行（system 开头）                        | ❌ 400/11128 |
+    // | 只留头名 `x-anthropic-billing-header`（无冒号/值）| ❌ 400/11128 |
+    // | 头名少一个字母（`…-heade`）                | ✅ 200 ⇒ 需要**完整头名** |
+    // | 头名后接字母（`…-headerX`）                | ❌ 400/11128 ⇒ 是**词边界**匹配，不是子串 |
+    // | 全大写 `X-ANTHROPIC-BILLING-HEADER`        | ❌ 400/11128 ⇒ 大小写不敏感 |
+    // | 值改版本号 / 改 entrypoint                 | ❌ 400/11128 ⇒ **值与内容无关，只认头名** |
+    // | 头名后加空格再冒号（`…-header :`）         | ❌ 400/11128 |
+    // | 头名前加任意字符（`\n` / `hello `）        | ✅ 200 ⇒ 行首锚定（同前两条） |
+    // | 改头名任一字母（`x-billing-header:` / `anthropic-…`）| ✅ 200 |
+    // | 放进 **assistant** 正文开头                | ❌ 400/11128（故 assistant 也要改） |
+    // | 放进 assistant 正文中间 / user / tool 结果 | ✅ 200（不扫这几处） |
+    //
+    // ⇒ 判据是「**行首 + 完整头名**」，值随便。故 `find` 只写头名——比整行短、
+    //    覆盖将来版本号变化；替换保留 `billing-header` 语义但不再像 HTTP 头名。
+    find: 'x-anthropic-billing-header',
+    // ⚠️ 替换**必须保留原意**：这是给上游统计入口用的标记，不是面向模型的话。
+    //    只把「头名」改成带前缀的标签形态，语义（计费/入口标记）不变而字面量不同。
+    replace: 'anthropic-billing-header-tag',
+    note: 'Claude Code v2.1.293（本机 2026-10-21 用真 CLI 复现并测得；行首锚定、只认头名）',
+  },
 ]
 
 /** 正则元字符转义：把字面量安全地变成**精确**匹配，而不是模式。 */

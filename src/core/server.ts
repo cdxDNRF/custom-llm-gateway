@@ -1151,7 +1151,28 @@ export class OverviewServer {
     }
 
     const openAiBody = anthropicToOpenAiRequest({ ...body, model: modelId })
-    const generate = toGenerateOptions(openAiBody, {
+    // ── 渠道原生搜索（Anthropic 入口）──
+    //
+    // ⚠️ 真实缺陷（2026-10-21 真 CLI 复现）：原生搜索原先**只**接在
+    //    `aggregateChat`（OpenAI `/v1/chat/completions`）上，Anthropic 入口
+    //    `/v1/messages` **完全没接线** —— 而 Claude Code / ZCode 等 Claude 系
+    //    客户端**只**走这条入口。后果：它们声明了 `WebSearch` 也永远不会被接管，
+    //    模型只能答「我没有搜索工具」。
+    //
+    //    与 OpenAI 入口同一套三重门槛（开关 → 渠道能力 → 客户端声明），
+    //    搜索把结果注入最后一条 user 消息后，照原路径走。
+    //
+    // ⚠️ 必须用 `openAiBody`（已转换的 OpenAI 形状）：`pickSearchTool` 认的是
+    //    `tools[].function.name`，Anthropic 原始请求是 `tools[].name`。
+    const searchOutcome = await this.maybeRunNativeSearch(provider, providerId, openAiBody)
+    const effectiveBody = searchOutcome === undefined
+      ? openAiBody
+      : {
+          ...openAiBody,
+          messages: searchOutcome.messages,
+          tools: stripSearchTools(openAiBody.tools, searchOutcome.toolName),
+        }
+    const generate = toGenerateOptions(effectiveBody, {
       provider: providerId,
       model: modelId,
       sessionId: `gw-msg-${providerId}-${Date.now().toString(36)}`,
@@ -1241,18 +1262,68 @@ function latestUserText(messages: readonly OpenAiMessage[] | undefined): string 
     const message = messages[i]!
     if (message.role !== 'user') continue
     const content = message.content
-    if (typeof content === 'string') return content.trim()
-    if (Array.isArray(content)) {
-      const text = content
+    let text = ''
+    if (typeof content === 'string') text = content
+    else if (Array.isArray(content)) {
+      text = content
         .filter((part): part is { type?: string; text?: string } => typeof part === 'object' && part !== null)
         .filter((part) => part.type === 'text' && typeof part.text === 'string')
         .map((part) => part.text!)
         .join('\n')
-        .trim()
-      if (text.length > 0) return text
     }
+    const query = toSearchQuery(text)
+    if (query.length > 0) return query
   }
   return ''
+}
+
+/**
+ * 把一条 user 消息的正文**净化为可用的搜索查询**。
+ *
+ * ⚠️⚠️ 真实缺陷（2026-10-21 实测，真 CLI 复现时抓到）：直接拿「最后一条 user
+ *    消息的全文」当查询，会拿到一大坨**客户端注入的噪音**，而不是用户的问题。
+ *    实测到的两种：
+ *
+ *    · Claude Code：最后一条 user 常是 `<total_tokens>14999858 tokens left</total_tokens>`
+ *      ⇒ 搜索词变成「…tokens left…」，返回 5 条完全无关的页面；
+ *    · DSH：最后一条 user 是 `<system-reminder>A skill is a reusable set …`
+ *      或 `Current runtime context. …` 或 `Time sampled while preparing turn …`
+ *      ⇒ 同理。
+ *
+ *    症状是「搜索功能好像在工作、但结果全是垃圾」，比完全不搜更难排查。
+ *
+ * 故这里按「**去掉已知噪音 → 取剩余正文**」的顺序处理，取不到就**继续往前找**
+ * 上一条 user（见 {@link latestUserText} 的循环）。
+ */
+function toSearchQuery(raw: string): string {
+  let text = raw
+  // ① 整块剔除客户端注入的标记块（标签名来自实测：Claude Code / DSH / 通用 agent 框架）。
+  for (const tag of [
+    'system-reminder', 'total_tokens', 'available_skills', 'env', 'functions',
+    'budget:token_budget', 'working_directory', 'tool_result',
+  ]) {
+    text = text.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi'), ' ')
+  }
+  // ② 剔除自闭合/孤立标记残留（块被截断时只剩开标签）。
+  text = text.replace(/<[a-z_][a-z0-9_-]*\b[^>]*>/gi, ' ').replace(/<\/[a-z_][a-z0-9_-]*>/gi, ' ')
+  // ③ 剔除已知的**格式化元信息行**（整行匹配，避免误删正文）。
+  const noiseLine = /^\s*(?:Time sampled while preparing\b|Browser time zone for this request\b|Elapsed since the preceding\b|Current runtime context\.|Current working directory:|Current DSH file policy:|\[model changed:|<dcp-message-id>)/i
+  text = text
+    .split('\n')
+    .filter((line) => !noiseLine.test(line))
+    .join('\n')
+  // ④ 折叠空白。
+  text = text.replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim()
+  // ⑤ 太短的不当作查询（`OK` / `继续` 这类应答不构成搜索意图）—— 继续往前找上一条 user。
+  if (text.length < 3) return ''
+  // ⑥ **截断**：过长 query 会让搜索结果跑偏（实测过长的 query 返回无关结果）。
+  //    取前 300 个字符，并优先在第一行/第一句处断开。
+  if (text.length > 300) {
+    const cut = text.slice(0, 300)
+    const lastBreak = Math.max(cut.lastIndexOf('\n'), cut.lastIndexOf('。'), cut.lastIndexOf('. '))
+    text = (lastBreak > 60 ? cut.slice(0, lastBreak) : cut).trim()
+  }
+  return text
 }
 
 /**
