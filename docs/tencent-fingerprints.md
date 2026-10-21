@@ -179,3 +179,62 @@ Claude Code / ZCode 走 Anthropic 协议 `/v1/messages`，这条链路上有三�
 客户端会往最后一条 user 消息里塞噪音（Claude Code 的 `total_tokens` 标签、
 DSH 的 `system-reminder` / `Current runtime context.` / `Time sampled while…`）——
 直接拿全文当 query 会搜出无关结果。`toSearchQuery()` 负责净化。
+
+## 抗版本漂移：这套修复在 Claude Code 升级后还成立吗（2026-10-21 实测）
+
+结论：**指纹这一层不会失效**，但搜索那一层有两个「上游一改就失效」的点，已按
+「只认结构、不认字面量」的原则实现。逐项说明：
+
+### ① 计费头指纹 —— 已按「只认头名」实现，跨版本成立
+
+`find` 只写 `x-anthropic-billing-header`（头名），不含版本号 / entrypoint / 值。
+实证：
+
+| 输入 | 我们的结论 | 依据 |
+|---|---|---|
+| v2.1.293 真实头 | ✅ 改写放行 | 真 CLI 抓包 |
+| **v2.1.306 真实头**（npm `latest`，2026-10-21） | ✅ 改写放行 | 真 CLI 抓包 + 实发 |
+| 版本号改成 3.x / entrypoint=vscode / 追加参数 / CRLF | ✅ 全部改写放行 | 6 格单元全绿 |
+| 头名少一个字母 / 后接字母 / 加空格再冒号 | 上游不拦（无需改写） | 探针矩阵实测 |
+
+也确认了 **v2.1.306 依然发送这个头**（`cc_version=2.1.306.dcf; cc_entrypoint=sdk-cli;`
+逐字同形），所以升级到最新版后这条修复**仍然必要且仍然有效** —— 我用 2.1.306 的真实
+二进制跑了完整链路（搜索 + 引用来源），全部 200。
+
+**唯一会失效的情形**：Anthropic 把「头名」本身改掉（比如换成
+`x-anthropic-attribution`）。届时腾讯会不会跟着拦，**取决于腾讯的名单**，不是我们能推的。
+我顺带探了一组「相近改名」，当前腾讯**都不拦**（`x-anthropic-client-header` /
+`x-anthropic-attribution` / `x-anthropic-beta` / `x-anthropic-sdk` / 去掉 `x-` 前缀
+全部 200），说明它目前登记的是**这一个具体头名**，只跟着这一个改才需要动。
+
+> 另有一个**客户端侧**的彻底规避：Claude Code 支持
+> `CLAUDE_CODE_ATTRIBUTION_HEADER=0` 关掉这个头（实测生效：system 从 3 块变 2 块，
+> 计费头整块消失）。但**不建议依赖它**做主要修法 —— 它是 Anthropic 的开关、随时可能
+> 改名或收回；网关侧改写才是我们可控的那一层。把它当「万一网关不在链路上」的备选。
+
+### ② 搜索接管 —— 两个「认字面量」的点，已改成认结构
+
+| 位置 | 旧写法（会随版本失效） | 现写法（抗变化） |
+|---|---|---|
+| `anthropicToOpenAiRequest` 识别服务端工具 | 按 `input_schema === undefined` 一律丢弃 | 认 `type` 字段前缀 `web_search` / `web_fetch`，补最小 schema |
+| `isSearchToolName` 认搜索工具 | 名字含 `search` 就接管 | 先排除 `tool` / `skill` / `mcp` / `capab`（`ToolSearch` 这类能力检索） |
+
+实测 2.1.306 的请求形态与 2.1.293 **一致**（`system` 3 块、首块为计费头、
+`tools` 里含 `ToolSearch` + `DeferredToolPlaceholder`），故两个修复都直接适用。
+
+**仍可能随版本漂移的两点**（记录在此，便于日后排查）：
+
+1. 服务端工具名若从 `web_search` 改叫别的（如 `web_search_v2`），仍会命中
+   `startsWith('web_search')`；但若改成完全无关的名字（如 `browse`），需再加规则。
+2. 延迟工具机制若换实现（`ToolSearch` → 别的名字），排除名单要同步 ——
+   症状会复现为「模型说没有搜索工具」，按本文件末尾的三层排查入口查即可。
+
+### ③ 冒烟检查（怀疑升级后失效时跑这一条）
+
+```bash
+# 用真 CLI 跑一次带搜索的问答；能返回带来源链接的内容即正常
+claude -p "用 WebSearch 查一下今天的科技新闻，给2条带链接" --allowedTools WebSearch
+```
+
+若报 `400 / 11128`：计费头或另一条新指纹未覆盖 → 按本文「新增一条指纹」流程补。
+若模型说「没有搜索工具」：搜索接管那一层 → 按「三层排查入口」逐层查。
