@@ -137,3 +137,45 @@ DSH 的 `buddy` 提供商由 `dsh-providers-hub` 插件直连，它有一份**�
 排查顺序建议：先看 **HTTP 码 + 业务 code + `displayMsg` 原文** ——
 `400/11128` → 腾讯内容级（本文件）；`405/3012` → ZCode 身份块；
 `200 + text/html` → accio 风控页；`401/403` → 客户端身份/凭据层。
+
+## 第 4 条：Claude Code 的计费头（2026-10-21）
+
+```
+x-anthropic-billing-header: cc_version=2.1.293.866; cc_entrypoint=sdk-cli;
+```
+
+Claude Code v2.1.293 把它放在 `system[0]` 的**第一行**（74 字符）。这是它给
+Anthropic 官方统计「第三方入口」用的标记，腾讯把它当成「未获批准渠道」的证据，
+于是**每条请求**都 400/11128 —— 表现为「Claude Code 里任何 buddy 模型都用不了」，
+而其它客户端正常（它们不发这一行）。
+
+| 形态 | 结果 |
+|---|---|
+| 整行 / 只有头名 / 头名+冒号 / 全大写 / 值改版本号、改 entrypoint | ❌ 400 |
+| 头名少一个字母（`…-heade`） | ✅ 200 ⇒ 需要**完整头名** |
+| 头名后接字母（`…-headerX`） | ❌ 400 ⇒ 是**词边界**匹配，不是子串 |
+| 头名后加空格再冒号（`…-header :`） | ❌ 400 |
+| 头名前加任意字符（换行 / 空格 / `hello `） | ✅ 200 ⇒ **行首锚定** |
+| 改头名字母（`x-billing-header:` / `anthropic-billing-header:`） | ✅ 200 |
+| 放进 assistant 正文**开头** / 中间 / user / tool 结果 | ❌ / ✅ / ✅ / ✅ |
+
+⇒ 判据是「行首 + 完整头名」，**值与内容无关**；故 `find` 只写头名，
+`replace` 改成 `anthropic-billing-header-tag`（保留计费语义、不再是 HTTP 头名）。
+
+## 排查入口：Claude 系客户端「说没有搜索工具」的三层原因
+
+Claude Code / ZCode 走 Anthropic 协议 `/v1/messages`，这条链路上有三处会让搜索失效，
+症状都相似（模型声称没有搜索工具 / 搜索结果无关），排查时按顺序看：
+
+1. **服务端工具被转换层丢弃** —— Anthropic 的 `web_search_20250305` 没有
+   `input_schema`，`anthropicToOpenAiRequest` 若直接 `continue` 就会让它消失。
+2. **原生搜索没接线** —— 若 `maybeRunNativeSearch` 只挂在 OpenAI 端点上，
+   Anthropic 入口永远不会接管搜索。
+3. **误接管「工具检索」类工具** —— Claude Code 的 `ToolSearch`（查延迟加载的
+   工具 schema，如 `select:WebSearch`）名字也含 `search`；被当成网络搜索后，
+   网关会把它从工具列表里摘掉 ⇒ 模型再也载入不了 WebSearch/WebFetch。
+
+外加一条**查询质量**问题（不是上面三层，但症状同样是「搜了但没用」）：
+客户端会往最后一条 user 消息里塞噪音（Claude Code 的 `total_tokens` 标签、
+DSH 的 `system-reminder` / `Current runtime context.` / `Time sampled while…`）——
+直接拿全文当 query 会搜出无关结果。`toSearchQuery()` 负责净化。
