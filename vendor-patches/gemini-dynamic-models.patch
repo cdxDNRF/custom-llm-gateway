@@ -1,28 +1,27 @@
 diff --git a/vendor/src/gemini-adapter.ts b/vendor/src/gemini-adapter.ts
-index 9cd86ee..bc22190 100644
 --- a/vendor/src/gemini-adapter.ts
 +++ b/vendor/src/gemini-adapter.ts
-@@ -257,6 +257,19 @@ export interface GeminiAdapterOptions {
+@@ -303,6 +303,19 @@
    logger?: { warn(message: string): void }
    /** 产品配置；默认 {@link GEMINI}。 */
    product?: GeminiProduct
 +  /**
-+   * **动态模型表**（本仓库扩展，2026-10-15）。
++   * **动态模型表**（本仓库扩展，2026-10-15；2026-10-24 适配上游共享骨架）。
 +   *
-+   * 缺省时退回静态表 `geminiFallbackEntries()`（只有 1 个模型）。
-+   * 接线侧传入远端拉取的结果（`fetchAvailableModels`）即可暴露账号
-+   * 真正可用的全部模型（实测 15 个，含 Claude 系列）。
++   * 缺省时退回静态表 `geminiFallbackEntries()`（上游只登记 1 个模型）。
++   * 接线侧传入远端拉取的结果（`fetchAvailableModels`）即可暴露账号**真正可用**
++   * 的全部模型（实测 15 个，含 Claude 系列）。
 +   *
 +   * ⚠️ **必须同步返回数组**（同 `listAllModels` 的契约）：写成 `async` 会让
 +   *    `[...all]` / `all.map` 抛 `TypeError: all is not iterable`。
-+   * ⚠️ 返回空数组时**退回静态表**而不是暴露空目录 —— 否则一次拉取失败
-+   *    会让用户看到"一个模型都没有"。
++   * ⚠️ 返回空数组时**退回静态表**而不是暴露空目录 —— 否则一次拉取失败会让用户
++   *    看到「一个模型都没有」。
 +   */
 +  modelsProvider?: () => readonly GeminiModelEntry[]
  }
  
  /** Gemini（Cloud Code Assist）模型适配器。 */
-@@ -297,6 +310,9 @@ export class GeminiAdapter extends LlmAdapter {
+@@ -343,6 +356,9 @@
     * 「表被改过但进程还拿着旧值」这一种故障。
     */
    private loadModels(): readonly GeminiModelEntry[] {
@@ -32,7 +31,7 @@ index 9cd86ee..bc22190 100644
      return geminiFallbackEntries()
    }
  
-@@ -499,7 +515,16 @@ export class GeminiAdapter extends LlmAdapter {
+@@ -545,7 +561,16 @@
        && declared?.efforts.some((item) => String(item.id) === requested) === true
        ? requested
        : undefined
@@ -50,11 +49,64 @@ index 9cd86ee..bc22190 100644
  
      /**
       * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+diff --git a/vendor/src/gemini.ts b/vendor/src/gemini.ts
+--- a/vendor/src/gemini.ts
++++ b/vendor/src/gemini.ts
+@@ -534,10 +534,28 @@
+  * **加第二个模型时必须先用 `modelId` 选 upstream** —— 否则表里两个模型会撞车
+  * （用户选 A、实际跑 B），症状与上述宽容完全相同。
+  */
+-export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSpec {
+-  if (geminiCanonicalModelId(modelId) !== GEMINI_UPSTREAM_FLASH) {
++export function geminiModelSpec(
++  modelId: string,
++  effort?: string,
++  /**
++   * **本仓库扩展（2026-10-15，2026-10-24 适配共享骨架）**：允许的模型 id 集合。
++   *
++   * 缺省时退化为「只允许 `gemini-3.8-flash`」—— 与改动前逐字节一致，
++   * 故既有调用方零行为变化。
++   *
++   * 接线侧把远端目录（`fetchAvailableModels`）的 id 集合传进来，即可支持
++   * 账号真正可用的全部模型（实测 15 个，含 Claude 系列）。
++   */
++  allowedModels?: readonly { id: string; needsEffortSuffix?: boolean }[],
++): GeminiModelSpec {
++  const canonical = geminiCanonicalModelId(modelId)
++  const allowed = allowedModels === undefined || allowedModels.length === 0
++    ? [{ id: GEMINI_UPSTREAM_FLASH, needsEffortSuffix: true }]
++    : allowedModels
++  const allowedIds = allowed.map((m) => m.id)
++  if (!allowedIds.includes(canonical)) {
+     throw new LlmError(
+-      `gemini: 模型 "${modelId}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
++      `gemini: 模型 "${modelId}" 不在本 provider 目录中（当前可用：${allowedIds.join(', ')}）`,
+       'INVALID_REQUEST',
+       // ⚠️ `status` 只落在 `LlmError.failure`（不是顶层属性），且网关的
+       // `failureToOpenAiError` 两处都要读 —— 见 `openai-gateway/stream.ts`。
+@@ -545,8 +563,17 @@
+     )
+   }
+   const tier = geminiEffortToTier(effort)
++  // ⚠️ **upstream 必须用本模型的裸名**（不是恒为 GEMINI_UPSTREAM_FLASH）——
++  //    否则表里多个模型会撞车：用户选 A、实际跑 B，且没有任何征兆。
++  //
++  // ⚠️⚠️ **档位后缀按模型族决定，不能统一拼**（实测对照表见
++  //    `GeminiCatalogModel.needsEffortSuffix` 的注释）：
++  //    `gemini-3.8-flash` / `gpt-oss-120b` **必须**带后缀；
++  //    `claude-sonnet-4-6` / `gemini-3-flash` / `gemini-2.5-flash` 用**裸名**。
++  //    统一拼接会让后者全部 404（实测把 11 个可用模型误判成不可用）。
++  const needsSuffix = allowed.find((m) => m.id === canonical)?.needsEffortSuffix !== false
+   return {
+-    upstream: `${GEMINI_UPSTREAM_FLASH}-${tier}`,
++    upstream: needsSuffix ? `${canonical}-${tier}` : canonical,
+     tier,
+     thinkingBudget: geminiThinkingBudget(tier),
+     includeThoughts: true,
 diff --git a/vendor/src/gemini-messages.ts b/vendor/src/gemini-messages.ts
-index 0aa9d55..9a40568 100644
 --- a/vendor/src/gemini-messages.ts
 +++ b/vendor/src/gemini-messages.ts
-@@ -363,11 +363,28 @@ function buildGenerationConfig(
+@@ -432,11 +432,28 @@
    maxTokens: number | undefined,
    temperature: number | undefined,
  ): Record<string, unknown> {
@@ -62,8 +114,8 @@ index 0aa9d55..9a40568 100644
 +  // ⚠️⚠️ **`maxOutputTokens` 必须大于 `thinkingBudget`**（真实缺陷，2026-10-15）。
 +  //
 +  // 上游对**思考型**模型硬要求这一点：
-+  //   · Claude 系直接 400：`` `max_tokens` must be greater than
-+  //     `thinking.budget_tokens` ``（实测 `claude-sonnet-4-6` + max_tokens=2048
++  //   · Claude 系直接 400：`max_tokens` must be greater than
++  //     `thinking.budget_tokens`（实测 `claude-sonnet-4-6` + max_tokens=2048
 +  //     + budget=4000 → 400）；
 +  //   · Gemini 系宽容（给小于预算的值也能跑），故旧代码一直没暴露这个约束
 +  //     —— 那时表里只有 Gemini 3.8。
@@ -85,59 +137,3 @@ index 0aa9d55..9a40568 100644
    config.thinkingConfig = thinkingConfig
    if (temperature !== undefined) config.temperature = temperature
    return config
-diff --git a/vendor/src/gemini.ts b/vendor/src/gemini.ts
-index 71d2aac..3f81cd1 100644
---- a/vendor/src/gemini.ts
-+++ b/vendor/src/gemini.ts
-@@ -534,19 +534,46 @@ export function geminiCanonicalModelId(modelId: string): string {
-  * **加第二个模型时必须先用 `modelId` 选 upstream** —— 否则表里两个模型会撞车
-  * （用户选 A、实际跑 B），症状与上述宽容完全相同。
-  */
--export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSpec {
--  if (geminiCanonicalModelId(modelId) !== GEMINI_UPSTREAM_FLASH) {
-+export function geminiModelSpec(
-+  modelId: string,
-+  effort?: string,
-+  /**
-+   * **本仓库扩展（2026-10-15）**：允许的模型 id 集合。
-+   *
-+   * 缺省时退化为「只允许 `gemini-3.8-flash`」—— 与改动前逐字节一致，
-+   * 故既有调用方零行为变化。
-+   *
-+   * 接线侧把远端目录（`fetchAvailableModels`）的 id 集合传进来，即可支持
-+   * 账号真正可用的全部模型（实测 15 个，含 Claude 系列）。
-+   */
-+  allowedModels?: readonly { id: string; needsEffortSuffix?: boolean }[],
-+): GeminiModelSpec {
-+  const canonical = geminiCanonicalModelId(modelId)
-+  const allowed = allowedModels === undefined || allowedModels.length === 0
-+    ? [{ id: GEMINI_UPSTREAM_FLASH, needsEffortSuffix: true }]
-+    : allowedModels
-+  const allowedIds = allowed.map((m) => m.id)
-+  if (!allowedIds.includes(canonical)) {
-     throw new LlmError(
--      `gemini: 模型 "${modelId}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
-+      `gemini: 模型 "${modelId}" 不在本 provider 目录中（当前可用：${allowedIds.join(', ')}）`,
-       'INVALID_REQUEST',
-       // ⚠️ `status` 只落在 `LlmError.failure`（不是顶层属性），且网关的
--      // `failureToOpenAiError` 两处都要读 —— 见 `openai-gateway/stream.ts`。
-+      // `failureToOpenAiError` 两处都读 —— 见 `openai-gateway/stream.ts`。
-       { status: 404 },
-     )
-   }
-   const tier = geminiEffortToTier(effort)
-+  // ⚠️ **upstream 必须用本模型的裸名**（不是恒为 GEMINI_UPSTREAM_FLASH）——
-+  //    否则表里多个模型会撞车：用户选 A、实际跑 B，且没有任何征兆。
-+  //
-+  // ⚠️⚠️ **档位后缀按模型族决定，不能统一拼**（实测对照表见
-+  //    `GeminiCatalogModel.needsEffortSuffix` 的注释）：
-+  //    `gemini-3.8-flash` / `gpt-oss-120b` **必须**带后缀；
-+  //    `claude-sonnet-4-6` / `gemini-3-flash` / `gemini-2.5-flash` 用**裸名**。
-+  //    统一拼接会让后者全部 404（实测把 11 个可用模型误判成不可用）。
-+  const needsSuffix = allowed.find((m) => m.id === canonical)?.needsEffortSuffix !== false
-   return {
--    upstream: `${GEMINI_UPSTREAM_FLASH}-${tier}`,
-+    upstream: needsSuffix ? `${canonical}-${tier}` : canonical,
-     tier,
-     thinkingBudget: geminiThinkingBudget(tier),
-     includeThoughts: true,

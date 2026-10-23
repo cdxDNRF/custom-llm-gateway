@@ -352,3 +352,69 @@ GitHub Push Protection 会拒绝整个推送。`scripts/sync-vendor.sh` 的 ④c
 ⇒ **结论**：同步 vendor 应该用 `bash scripts/sync-vendor.sh`（它含 ④b/④c 密钥清洗 +
 ④d/④e/④f 补丁应用 + 类型检查 + 重启），而不是手工 rsync。本次手工做是因为要
 「只同步 vendor、不动上游的补丁机制」，但这要求自己把清洗和补丁那几步补齐。
+
+## 2026-10-24 同步后的「本机修复保留」全量核对
+
+用户追问「本机之前修复的东西肯定要保留，检查是否更新后有老问题出现」。逐项核过，
+结论：**本机修复全部在位**，但发现**补丁文件本身已失效**（下次同步会丢修复），
+已重建并把 sync-vendor 改成硬失败。
+
+### A. 补丁文件失效（本次新发现的隐患，比修复本身更危险）
+
+三个补丁里有**两个已不能应用**（既不能正向也不能反向）：
+
+| 补丁 | 同步前状态 | 原因 | 处理 |
+|---|---|---|---|
+| `gemini-dynamic-models.patch` | ❌ 失效 | 基线是 10-15 的 gemini 三文件，上游已大改（共享骨架） | **重建**（139 行，3 文件） |
+| `tencent-content-fingerprints.patch` | ❌ 失效 | 同上，指纹表从 2 条涨到 6 条 | **重建**（58 行） |
+| `qoder-prepare-request.patch` | ⚠️ 可正向应用 | 上游 `5fd128e` 已自带 `prepareRequest`（实现更严） | **删除补丁**，④e 改成解释注释 |
+
+危害：`sync-vendor.sh` 原来的失败分支只 `echo ⚠️` 然后**继续跑**。于是下次同步
+会「vendor 被覆盖 → 补丁应用失败 → 只打印一条警告 → 继续提交」⇒ **静默丢失修复**，
+症状是「同步完 gemini 只剩 1 个模型 / Claude Code 又全 400」，而日志里看不出是这原因。
+
+已改成 **`exit 1` 硬失败**（④d / ④f 两处），并在 stderr 写明「不能继续」+ 重生成方法。
+
+重建补丁的方法（本次实际用的）：以**清洗后的上游原文**为基线做 `diff -u`，
+再验证「在干净基线上应用补丁 ⇒ 结果与本机 vendor 逐字节一致」。
+提交前还要确认补丁里**不含凭据字面量**（Gemini OAuth 那两个值必须已清空）。
+
+### B. 本机历史修复逐项在位确认
+
+| 修复 | 位置 | 状态 |
+|---|---|---|
+| 腾讯 6 条指纹改写 | `vendor/.../tencent-fingerprint.ts` | ✅ 6 条全在，逐条实发 200 |
+| 指纹改写接线（system + assistant） | `src/core/protocol.ts` | ✅ 未被 rsync 触及 |
+| 原生搜索（OpenAI 入口） | `src/core/native-search.ts` + `server.ts` | ✅ `exa_web_search` 实发 200 |
+| 原生搜索（Anthropic 入口接线） | `src/core/server.ts::aggregateMessages` | ✅ Claude Code 形状实发 200，服务端闭环（不返 tool_use） |
+| Anthropic 服务端工具 rescue | `src/core/anthropic.ts` | ✅ `web_search_20250305` 不再被丢 |
+| `ToolSearch` 不被误接管 | `src/core/native-search.ts` | ✅ 实发 200（未被当网络搜索） |
+| 搜索查询净化 `toSearchQuery` | `src/core/server.ts` | ✅ 未被触及 |
+| 客户端断开即中止上游（4 入口） | `server.ts` / `provider-server.ts` | ✅ 实测 abort 后立刻落 `client disconnected` |
+| `refreshModels` 重置 `remoteMeta = new Map()` | `src/core/provider-common.ts` | ✅ 在（vendor 里没这个函数，是我们的） |
+| gemini 动态目录（3 处） | `vendor/src/gemini{,-adapter,-messages}.ts` | ✅ 三处逐项运行时验证（见下） |
+| `disabledModels` → `accountPool` | `src/providers/extended.ts` | ✅ gemini 精确过滤（关 8 个、列 3 个、无泄漏） |
+
+### C. gemini 三处改动逐项运行时验证（不只「编译通过」）
+
+1. **`modelsProvider` 生效**：目录里出现了静态表外的 `claude-sonnet-4-6` /
+   `claude-opus-4-6-thinking` ⇒ 动态目录真的接上了（静态表只有 `gemini-3.8-flash`）。
+2. **按 modelId 选 upstream + 逐模型档位后缀**：两族模型各打一次都 200 ——
+   `gemini-3.8-flash`（需后缀，拼成 `gemini-3.8-flash-<tier>`）与
+   `claude-opus-4-6-thinking`（裸名）。若统一拼后缀，后者会 404。
+3. **`maxOutputTokens > thinkingBudget` 抬升**：`max_tokens=2048` 打
+   `claude-sonnet-4-6` → **200**（没有这个修复时 Claude 系会 400
+   `max_tokens must be greater than thinking.budget_tokens`）。
+
+### D. 回归矩阵（两轮各 13 项，0 失败）
+
+```
+6 条指纹（ZCode / Claude 身份句 / Claude 反馈句 / 计费头 / DSH 身份句 / DSH Web 面）
+原生搜索 OpenAI 入口（exa_web_search_exa）
+原生搜索 Anthropic 入口（服务端工具 rescue，服务端闭环）
+ToolSearch 不被误接管
+trae / zcode / gemini 渠道可用
+7 家模型目录非空（buddy16 trae39 qoder17 zcode2 gemini3 aistudio3 build14）
+```
+
+→ 可复跑脚本思路见本节各项；建议每次同步 vendor 后跑一遍。

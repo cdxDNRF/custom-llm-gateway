@@ -135,28 +135,22 @@ if [ -f "$PATCH_FILE" ]; then
     echo "      请手工核对 vendor/src/gemini{,-adapter}.ts 后更新：" >&2
     echo "      vendor-patches/gemini-dynamic-models.patch" >&2
     echo "      补丁若确实过时，用 git diff 重新生成。" >&2
+    exit 1  # ⚠️ 缺失该补丁 ⇒ gemini 只剩 1 个模型且多模型被门控拒绝
   fi
 fi
 
-# ④e 本地补丁：Qoder WASM 的**通用**请求签名（2026-10-20）
-# WASM 里有两个签名入口，我们的 vendor 只接了推理那个：
-#   · `qodercontext_prepareInferRequest` —— 仅推理端点（`prepareInfer`）
-#   · `qodercontext_prepareRequest`      —— **通用**：任意 endpoint/path/method
-# 原生**搜索**（`/api/v1/webSearch/oneSearch`）必须用后者：它的 host 与推理不同
-# （搜索挂 center host），且 path 任意。
-# 补丁只**新增**一个方法（`prepareRequest`），既有 `prepareInfer` 逐字节不变。
-PATCH_QODER="$HERE/vendor-patches/qoder-prepare-request.patch"
-if [ -f "$PATCH_QODER" ]; then
-  if git -C "$HERE" apply --check "$PATCH_QODER" 2>/dev/null; then
-    git -C "$HERE" apply "$PATCH_QODER"
-    echo "   ✓ 已应用 Qoder 通用签名补丁"
-  elif git -C "$HERE" apply --check --reverse "$PATCH_QODER" 2>/dev/null; then
-    echo "   ✓ Qoder 通用签名补丁已在（无需重复应用）"
-  else
-    echo "   ⚠️ Qoder 补丁无法应用（上游可能已改 qoder-wasm.ts）。" >&2
-    echo "      请核对后更新：vendor-patches/qoder-prepare-request.patch" >&2
-  fi
-fi
+# ④e Qoder 通用签名（`prepareRequest`）—— **2026-10-24 起不再是本地补丁**
+#
+# 历史上 WASM 有两个签名入口而我们只接了推理那个，故本地打过一个补丁
+# （`vendor-patches/qoder-prepare-request.patch`）接上通用的
+# `qodercontext_prepareRequest`，供原生搜索（`/api/v1/webSearch/oneSearch`）用。
+#
+# ⚠️ 上游在 `5fd128e` 已**自带**这个实现（且参数类型更严：`mode: 'auth' | 'sign'`、
+#    可选参用 `?` 而非 `| undefined`）。2026-10-24 同步后 `vendor/src/qoder-wasm.ts`
+#    与上游逐字节一致 ⇒ **补丁文件已删除**，本步骤一并移除。
+#
+# 保留这段注释是为了让后人知道「这里曾经有过一个补丁、为什么没了」——
+# 否则下一个人看到 `searchViaQoder` 调 `prepareRequest` 会以为漏了什么。
 
 # ④f 本地补丁：腾讯风控指纹表补两条触发句（2026-10-20）
 # 腾讯网关以 400/11128 拒绝时的两条「客户端身份句」指纹：
@@ -179,6 +173,7 @@ if [ -f "$PATCH_TCFP" ]; then
   else
     echo "   ⚠️ 腾讯指纹补丁无法应用（上游可能已改 tencent-fingerprint.ts）" >&2
     echo "      请核对后更新：vendor-patches/tencent-content-fingerprints.patch" >&2
+    exit 1  # ⚠️ 缺失该补丁 ⇒ 外部客户端整轮 400/11128
   fi
 fi
 
