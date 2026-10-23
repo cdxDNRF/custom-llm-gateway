@@ -238,3 +238,65 @@ claude -p "用 WebSearch 查一下今天的科技新闻，给2条带链接" --al
 
 若报 `400 / 11128`：计费头或另一条新指纹未覆盖 → 按本文「新增一条指纹」流程补。
 若模型说「没有搜索工具」：搜索接管那一层 → 按「三层排查入口」逐层查。
+
+## 2026-10-24 对照上游：补 2 条（第 6/7 条），并发现一条**正在发生**的事故
+
+上游 `4ec67a8` → `a777741`（342 提交 / 129 文件），指纹表由 2 条增到 6 条。
+逐条与我们的表对照，缺 2 条：
+
+### 第 6 条（正在拦当前 DSH）：Web 运行面开头两句
+
+上游登记的是**旧版**措辞 `…Web GUI at <url>.`；而本机当前安装的 DSH
+（`dsh-harness-dev-context` 2026-10-20 构建）已改成**新版**：
+
+```
+…through the DeepSeek Harness Web GUI whose URL the runtime context names.
+When the user refers to "this page", "this GUI", or "this app" without
+naming another target, they mean this GUI.
+```
+
+用会话日志重建的同一份真实 system（只这一句不同）实发对比 ⇒ 旧版 200、**新版 400**。
+**症状：DSH 里新建会话选 buddy 直接整轮失败**；老会话（历史里是旧版措辞）反而正常
+—— 这解释了「有时能用有时不能用」的错觉。
+
+字面量粒度：前 221 字符被拦 / 前 220 放行 / 只发第一句放行 ⇒ 触发串**跨句边界**，
+`find` 必须写全两句。位置语义：**位置无关**（前接任意前言仍拦），与第 4 条的行首锚定相反。
+
+### 第 7 条：Claude Code 的「反馈」段默认句
+
+```
+To give feedback, users should report the issue at
+ https://github.com/anthropics/claude-code/issues
+```
+
+与身份句不同，这条是 system prompt 的**固定段落、每轮必带**（上游记录单日白撞 647 次）。
+本机复验：裸串 400 / 改写后 200。`find` 必须写整句（砍掉前半或后半都放行 ⇒ 写短了空跑）。
+
+### 顺带：第 4 条的 replace 换成「官方同形」
+
+原来 `running on DeepSeek Harness` 虽放行，但**保留品牌 token** ⇒ 上游一旦放宽成
+关键词匹配就失效。改用 `You are an AI coding assistant, powered by a large language model`
+（结构取自 CodeBuddy 自己的提示词资产，实测 200），收益是**出站 system 里不再出现
+`DeepSeek Harness`**。
+
+### 现在表里有 7 条
+
+| # | find（简写） | 位置语义 | 来源 |
+|---|---|---|---|
+| 1 | `Main branch (you will usually use this for PRs)` | 位置无关 | ZCode |
+| 2 | `You are Claude Code, Anthropic's official CLI for Claude` | 行首锚定 | Claude Code |
+| 3 | `To give feedback, users should report the issue at https://…` | 位置无关（整句） | Claude Code |
+| 4 | `You are an AI agent powered by DeepSeek Harness` | 行首锚定 | DSH 身份句 |
+| 5 | `x-anthropic-billing-header` | 行首锚定（只认头名） | Claude Code 计费头 |
+| 6 | `You are interacting with the user through the DeepSeek Harness Web GUI whose URL…GUI.` | 位置无关（221 字符） | DSH Web 运行面 |
+| 7 | （上游另有旧版 Web 运行面登记） | — | 我方实测不拦，作防线保留 |
+
+⚠️ **新增/同步一条时的纪律**（本轮再次验证有效）：**位置语义与 `find` 长度都必须逐条
+实测**，不能拿别条的结论推 —— 本表里「行首锚定」和「位置无关」各占一半，
+`find` 从 30 字符到 221 字符都有。
+
+### 同步上游的正确姿势（本轮结论）
+
+上游的指纹表**不能整份覆盖**我们的（会丢掉第 5 条 `x-anthropic-billing-header`，
+它是我们本地实测登记、上游至今没有的）。正确做法是**逐条对照 `find`**，
+把缺的补进来，而不是 `rsync` 覆盖整个文件。
