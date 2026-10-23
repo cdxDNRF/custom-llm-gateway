@@ -179,10 +179,26 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     // | 放进 assistant 正文中间                    | ✅ 200 |
     // | 放进 **user** / **tool** 结果              | ✅ 200（不扫这两处，与既有实测一致） |
     //
-    // 改写候选三条都实测 200（任一可放行，取最贴近原意的）：
-    //   `running on` / `built with` / 加逗号；这里取 `running on`。
+    // 改写候选三条都实测 200（任一可放行）：`running on` / `built with` / 加逗号。
+    //
+    // ⚠️ **2026-10-24 改用「官方同形」措辞**（对齐上游的做法，理由成立）：
+    //    原来的 `running on DeepSeek Harness` 虽然放行，但**把品牌 token 原样留着**
+    //    —— 属于「只躲开了字面量、没解决身份」：上游一旦把名单从「整句逐字符」
+    //    放宽成关键词/正则，这条立刻失效。
+    //
+    //    参照取证：CodeBuddy 自己的提示词资产（`craft-agent-prompt`）首行是
+    //    `You are an AI coding assistant,{{ ModelNamePrompt }}.`，而该变量渲染成
+    //    `" powered by <模型展示名> model"` ⇒ 官方真实形态是
+    //    `You are an AI coding assistant, powered by <X> model.`，与我们这句
+    //    **结构完全同形**（`You are <名词> powered by <Y>`），差别只在 Y 填什么。
+    //
+    //    故改用官方**原生兜底**措辞（模型名缺失时官方发出来的就是这一形态）：
+    //    ① 出站 system 里**彻底不再出现 `DeepSeek Harness`** —— 本条的真正收益；
+    //    ② 措辞取自官方资产而**不是自造** ⇒ 与官方同形，不是新的可疑信号；
+    //    ③ 刻意不带具体模型名（那要把 model 透传进本函数 7 处调用点，且我们的
+    //       目录展示名与官方不一定一致，多一处信号反而多一处不一致）。
     find: 'You are an AI agent powered by DeepSeek Harness',
-    replace: 'You are an AI agent running on DeepSeek Harness',
+    replace: 'You are an AI coding assistant, powered by a large language model',
     note: 'DSH system 首句（本机 2026-10-20 实测：turn 172 放行 → turn 186 被拦，行首锚定）',
   },
   {
@@ -225,6 +241,97 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     //    只把「头名」改成带前缀的标签形态，语义（计费/入口标记）不变而字面量不同。
     replace: 'anthropic-billing-header-tag',
     note: 'Claude Code v2.1.293（本机 2026-10-21 用真 CLI 复现并测得；行首锚定、只认头名）',
+  },
+  {
+    // **Claude Code system prompt 的「帮助 / 反馈」段默认句**（Gitee IKLYCT）。
+    //
+    // ```
+    // To give feedback, users should report the issue at
+    //  https://github.com/anthropics/claude-code/issues
+    // ```
+    //
+    // ## 与其他条不同：这一条**每轮必带**，不是概率性泄漏
+    //
+    // 身份句只有某些客户端走探测路径时才注入（实测约 34%）；本句属于 Claude Code
+    // system prompt 的**固定段落**，只要客户端把默认 system 整份发过来就必然带上
+    // ⇒ **漏登记 = 必然命中**。上游记录：单日 buddy/workbuddy 因它白撞 647 次。
+    //
+    // ## 匹配语义（上游 2026-10-18 双端点逐格实测 + 本机 2026-10-24 复验）
+    //
+    // | 形态 | 结果 |
+    // |---|---|
+    // | 裸串 / 前接 `Note: ` / 前接行首 `  - ` | ❌ 400/11128 ⇒ **位置无关** |
+    // | 后接换行 + 其他文本 / 全大写 | ❌ 400/11128 ⇒ 大小写不敏感 |
+    // | 换 org/repo、换域名、改一个词、只留 URL | ✅ 200 ⇒ **逐字符** |
+    // | **砍掉前半 / 砍掉后半** | ✅ 200 ⇒ **`find` 必须写整句** |
+    //
+    // ⚠️ 最后那一格是要害：子串本身不触发，**写短了等于空跑** —— 而空跑的症状是
+    //    「登记了却仍每轮 400」，极难归因。本 `find`（整句 99 字符）已贴着上游
+    //    屏蔽名单的粒度，不要再按 ZCode 那条的思路去「缩短 find 覆盖更多变体」。
+    //
+    // ⚠️ 与身份句同理**不做行首锚定**：改写宁可略宽（漏改 = 整轮 400，
+    //    多改 = 语义等价的措辞变化）。故与其它条共用同一条实现路径。
+    //
+    // ⚠️⚠️ **「缩短/删字」这类变异只有实发能验，单测锁不住**：单测能证明
+    //    「砍掉半句时我们**不**改写」（那是真事实），但证明不了「砍掉半句后上游
+    //    **仍会拦**」。改本行时必须跑一次双端点的 e2e。
+    find: 'To give feedback, users should report the issue at '
+      + 'https://github.com/anthropics/claude-code/issues',
+    // 实测两端点均 200（buddy / workbuddy）。措辞与原文等义：仍是「去项目 issue 跟踪器反馈」。
+    replace: 'To give feedback, users should report the issue at the project issue tracker',
+    note: 'Gitee IKLYCT；上游 2026-10-18 双端点实测；本机 2026-10-24 复验「裸串 400 / 改写后 200」',
+  },
+  {
+    // **DSH Web 运行面的开头两句** —— 来自 `@deepseek-ai/dsh-harness-dev-context`
+    // 插件的 `WEB_SURFACE_PROMPT`。该插件**只在 Web 运行时挂载**（README：「`--help`
+    // 与非 Web 组合从不挂载」）⇒ CLI / 桌面面的会话 system 里没有这句，这也是它
+    // 长期没被发现的原因。
+    //
+    // ## 事故链（2026-10-24 本机实测，**这条是当前正在发生的**）
+    //
+    // 本机当前安装的 DSH（0.2.1-rc.2，`dsh-harness-dev-context` 2026-10-20 构建）
+    // 的 `WEB_SURFACE_PROMPT` 用的是新版措辞 `…Web GUI **whose URL the runtime
+    // context names**`；而我们这张表此前**没有登记它**（上游 2026-10-21 已登记，
+    // 我们是 2026-10-24 对照上游才发现漏的）。实测对比（同一账号、同一模型，
+    // system 只差这一句）：
+    //
+    // | system | 结果 |
+    // |---|---|
+    // | 旧版（`at http://127.0.0.1:3080`） | ✅ 200（上游记录为拦，本站实测不拦） |
+    // | **新版（`whose URL the runtime context names`）** | ❌ **400/11128** |
+    //
+    // ⇒ 漏登记的后果是「DSH 里新建会话选 buddy 直接整轮 400」。用**当前安装的 DSH
+    // 真实 system**（8529 → 9438 字符整段）实发复现并验证修复。
+    //
+    // ## 匹配语义（本机 2026-10-24 逐格实发，buddy + deepseek-v4.1-flash）
+    //
+    // | 载荷 | 结果 |
+    // |---|---|
+    // | 新版前两句（221 字符） | ❌ 400/11128 |
+    // | 新版前 220 字符 | ✅ 200 |
+    // | 只发第一句（`…names.`） | ✅ 200 |
+    // | 前面接任意前言 | ❌ 400/11128 ⇒ **位置无关**（与第 4 条行首锚定**相反**） |
+    // | 旧版形态（`at <url>`） | ✅ 200（本站不拦；仍保留上游那条登记作防线） |
+    // | 只发品牌词 `DeepSeek Harness` | ✅ 200 ⇒ **不是「认 token」** |
+    //
+    // ⚠️ **`find` 不能短于 221 字符**：220 放行 / 221 拦，且按句切开后前后两句
+    //    **各自都放行** ⇒ 触发串**跨了句边界**，是前两句的并集。切开任何一半都会
+    //    **空跑**（症状：登记了却仍每轮 400）。这是「非单调现象只能逐格实测」的又一例。
+    //
+    // ⚠️ **脆弱性（如实登记）**：上游认的是**逐字符**长字面量 ⇒ DSH 哪天再改这两句
+    //    里的任一字符，本规则会**静默停止匹配**（症状 = 该渠道整轮 400 复发，且行为
+    //    与「完全没登记」同形）。诚实的结论：**这类漂移只能靠「出站 system 里仍出现
+    //    `DeepSeek Harness` 就报警」那种运行时闸门兜**，本表锁不住。当前只有本注释。
+    find: 'You are interacting with the user through the DeepSeek Harness Web GUI '
+      + 'whose URL the runtime context names. When the user refers to "this page", "this GUI", '
+      + 'or "this app" without naming another target, they mean this GUI.',
+    // 只去掉品牌串，语义不变：仍是「你在一个 Web GUI 里，它的 URL 由 runtime context 给出」。
+    replace: 'You are interacting with the user through the harness Web GUI '
+      + 'whose URL the runtime context names. When the user refers to "this page", "this GUI", '
+      + 'or "this app" without naming another target, they mean this GUI.',
+    note: '本机 2026-10-24 实测：新版 DSH 措辞 221 字符被拦 / 220 前缀放行 / 位置无关；'
+      + '去掉品牌串后 200。旧版 `at <url>` 形态实测不拦（与上游 2026-10-21 的记录相反，'
+      + '故两条都保留、互为防线）',
   },
 ]
 
