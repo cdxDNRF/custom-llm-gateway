@@ -300,3 +300,55 @@ To give feedback, users should report the issue at
 上游的指纹表**不能整份覆盖**我们的（会丢掉第 5 条 `x-anthropic-billing-header`，
 它是我们本地实测登记、上游至今没有的）。正确做法是**逐条对照 `find`**，
 把缺的补进来，而不是 `rsync` 覆盖整个文件。
+
+## 2026-10-24 全量同步上游 vendor（只取修复，不加供应商）
+
+用户要求「供应商无需增加，仅做修复工作」⇒ 同步 `vendor/src`（`4ec67a8` →
+`a777741`，342 提交 / 129 文件 / 新增 43 个文件），但**不动**渠道注册
+（`src/providers/registry.ts`、`config.json`、Web UI）：上游新增的 Codely /
+AutoClaw / AStudio / modelscope 不进网关。
+
+### 同步后必须重做的本地补丁（这是本次踩到的最大坑）
+
+`rsync -a --delete` 会**原样覆盖**所有本地改动，包括我们独有的东西。这次有 3 处：
+
+| # | 覆盖掉的东西 | 后果 | 处理 |
+|---|---|---|---|
+| 1 | gemini 动态模型目录（3 个文件） | 只剩静态表 1 个模型，账号真实可用的 15 个全丢 | 按新代码重打（见下） |
+| 2 | **第 6 条指纹 `x-anthropic-billing-header`**（本仓库独有，上游无） | Claude Code 经网关调 buddy 又全部 400/11128 | 补回 |
+| 3 | `disabledModels` 回调（`src/providers/extended.ts`） | 编译错误（上游已删除该字段） | 改传 `accountPool` |
+
+⇒ **纪律**：同步 vendor 后必须逐项核对这三处。前两处靠文档（本条 + 指纹表注释），
+第三处靠 `bash scripts/typecheck.sh`（编译期就能抓住）。
+
+### gemini 动态目录的三处改动（按新骨架重打）
+
+1. `GeminiAdapterOptions.modelsProvider?: () => readonly GeminiModelEntry[]`
+   —— 动态表优先、空则回退静态表（拉取失败不该让目录变空）。
+2. `geminiModelSpec(modelId, effort, allowedModels?)` —— 按 `modelId` 选 upstream
+   （不是恒为 `GEMINI_UPSTREAM_FLASH`），档位后缀按 `needsEffortSuffix` **逐模型**
+   决定：`gemini-3.8-flash` / `gpt-oss-120b` 必须带后缀，`claude-sonnet-4-6` /
+   `gemini-3-flash` / `gemini-2.5-flash` 用裸名。统一拼接会让后者全部 404。
+3. `buildGenerationConfig` 的 `maxOutputTokens > thinkingBudget` 抬升
+   —— Claude 系硬要求，小 max_tokens + 大 thinkingBudget 会 400。
+
+### ⚠️ 跨端同步一律走 git，不要手工 `cp`
+
+本次为了图快，只 `cp` 了「改过的 4 个文件」到 Windows 端，漏了上游**新增**的
+`gemini-proxy.ts` / `gemini-rpc.ts`（新版 `gemini-adapter.ts` 会 import 它们）。
+后果：gemini provider 启动即 `ERR_MODULE_NOT_FOUND`，而日志里**先**打印了
+「已监听 3913」**再**静默崩掉 ⇒ 端口无监听 ⇒ 表现为「gemini 模型列表变成空的」，
+且 `/api/catalog-status` 里 gemini 直接不出现（很有误导性）。
+
+正确做法：`git fetch --all && git reset --hard origin/main`（两端同 commit）。
+
+### 推送被 GitHub 拒绝（已知问题的复发）
+
+上游 `vendor/src/gemini-oauth.ts` 硬编码了 Google OAuth client id/secret，
+GitHub Push Protection 会拒绝整个推送。`scripts/sync-vendor.sh` 的 ④c 本来就做了
+清洗，但本次是手工 rsync，**跳过了那个脚本** ⇒ 撞上 GH013。
+已按脚本同一规则清空（真值走 `CMDC_PAK_GOOGLE_CLIENT_*` 环境变量）。
+
+⇒ **结论**：同步 vendor 应该用 `bash scripts/sync-vendor.sh`（它含 ④b/④c 密钥清洗 +
+④d/④e/④f 补丁应用 + 类型检查 + 重启），而不是手工 rsync。本次手工做是因为要
+「只同步 vendor、不动上游的补丁机制」，但这要求自己把清洗和补丁那几步补齐。
