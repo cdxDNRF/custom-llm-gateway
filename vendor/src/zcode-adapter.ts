@@ -63,7 +63,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { collectImages, serializeMessages } from './openai-compat.js'
@@ -317,7 +317,11 @@ export interface ZcodeAdapterOptions {
   /**
    * 时钟（注入以便单测推进 TTL；缺省 `Date.now`）。
    *
-   * ⚠ 只给「先探后取」的需求记忆用。别拿它去做别的计时 —— 计时与超时仍走
+   * ⚠ **原为「只给『先探后取』的需求记忆用」**；2026-10-18 起**目录 TTL 也用它**
+   *   （`loadModels()` 的 `isCatalogFresh`）。⚠️ 本家是 A 类四家里**唯一已有 `now` 字段**
+   *   的一家，故**复用**它而**不新加第二个** —— 同一语义两个字段就是
+   *   「一文件两套同义判据」（本仓库红线）。
+   * ⚠ 下半句依然成立、**未改动**：别拿它去做**超时/退避**计时 —— 那些仍走
    * 真实时钟，否则超时行为会随测试注入漂移。
    */
   now?: () => number
@@ -353,6 +357,14 @@ export class ZcodeAdapter extends LlmAdapter {
   /** 兜底模型索引（id → 条目）。 */
   private readonly fallbackIndex: ReadonlyMap<string, ZcodeFallbackModel>
   private remoteModels: ZcodeRemoteModel[] | undefined
+  /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。两者缺一都会坏：只有 `remoteModels` 则目录永不更新
+   *    （现状）；只有 `catalogAt` 则无内容可展示。
+   */
+  private catalogAt = 0
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
   /**
@@ -401,6 +413,17 @@ export class ZcodeAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+         * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.loadModels()
+        },
         // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
         unknownModelInputModalities: () => ['text'] as const,
       },
@@ -430,6 +453,21 @@ export class ZcodeAdapter extends LlmAdapter {
    * ⚠️ **2026-10-08 Task 7d**：骨架（含上面这条理由）已上移到共享实现
    * `src/model-catalog.ts`，此处只剩委托。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }
@@ -538,16 +576,43 @@ export class ZcodeAdapter extends LlmAdapter {
    * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
    */
   private async loadModels(): Promise<ZcodeRemoteModel[]> {
-    if (this.remoteModels !== undefined) return this.remoteModels
+    // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
+    //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
+    //
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+    //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+    //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+    //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
+    //
+    // ⚠️⚠️ **结构与另三家不同**：本家已有 `this.nowImpl`（构造时从 `options.now`
+    //    归一而来，`options.now ?? (() => Date.now())`）⇒ 这里**复用 `nowImpl()`**
+    //    而不是照抄 loomy 的 `options.now?.() ?? Date.now()`。
+    //    两者取值**逐值相同**，但再造一份 `options.now?.() ?? Date.now()` 就是
+    //    「同一语义两套写法」，将来改归一方式必漏一处。
+    // ⚠️ 第 ① 处（方法入口）用 `isCatalogFreshFor`：用户在 Jet Hub 改开关后要
+    //    **立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+    //    ⚠️ 第 ② 处（gate 之后复查）**刻意仍用 `isCatalogFresh`**：那里问的是
+    //    「手上这份旧读数还能不能用」—— 若也判失效，一次失败的拉取会把**完整旧
+    //    目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.nowImpl())) {
+      return this.remoteModels
+    }
     const fetchRemote = this.options.fetchRemoteModels
     if (fetchRemote !== undefined) {
       await this.catalogGate.run(async () => {
         const fetched = await fetchRemote()
         if (fetched.length === 0) return false
         this.remoteModels = fetched
+        // ⚠️ **只在成功时**记时刻：失败不写，否则一次抖动会把上界刷新掉、
+        //    下轮还要等满 20 分钟才发现上游没恢复。
+        this.catalogAt = this.nowImpl()
         return true
       })
-      if (this.remoteModels !== undefined) return this.remoteModels
+      if (this.remoteModels !== undefined
+        && isCatalogFresh(this.catalogAt, this.nowImpl())) {
+        return this.remoteModels
+      }
     }
     return this.product.fallbackModels.map(fallbackToRemote)
   }

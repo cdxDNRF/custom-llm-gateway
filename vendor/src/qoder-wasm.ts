@@ -746,8 +746,9 @@ export async function generateRuntimeAuthFields(user: QoderWasmUserInfo): Promis
  * 这个报错看起来像「密文损坏」，实际是缺参数。
  * 该值由本插件生成并随凭据持久化（`QoderCredential.machine_id`）。
  *
- * 仅用于离线读取本机缓存做核对/排查；线上模型列表仍走兜底表
- * （目录端点需 WASM 签名，见 `qoder-adapter.ts` 的 `listModels`）。
+ * 仅用于离线读取本机缓存做核对/排查。**线上模型列表不走它** —— 走
+ * `src/qoder-catalog.ts` 的签名请求（`/api/v2/model/list?Encode=1`），
+ * 响应解密用下面那个 {@link decryptServerResponse}（两把锁不同，见其注释）。
  */
 export async function decryptModelCatalog(encrypted: string, machineId: string): Promise<unknown> {
   const g = await getGlue()
@@ -759,6 +760,53 @@ export async function decryptModelCatalog(encrypted: string, machineId: string):
     g.exports.model_cache_decrypt!(stack, a, aLen, b, bLen)
   })
   return JSON.parse(raw)
+}
+
+/**
+ * 解密**服务端响应体**（带 `Encode=1` 的端点，如 `/api/v2/model/list?Encode=1`）。
+ *
+ * ## 为什么需要它
+ *
+ * 官方客户端解响应只有一行（`qoder-worker-runtime` 的 `rb`）：
+ *
+ * ```js
+ * function rb(A) { try { return AE().decrypt_server_response(A) } catch { return A } }
+ * async function $x(A) { let e = await A.text(); return JSON.parse(rb(e)) }
+ * ```
+ *
+ * 即：**先试着解密，失败就当成明文** —— 这个「失败即明文」不是容错洁癖，
+ * 而是协议的一部分：同一个端点在未加密场景（如未登录/降级）会直接回明文 JSON。
+ * 故 {@link decryptServerResponseOrRaw} 保留了这条回退，而不是把失败抛给上层。
+ *
+ * ⚠️ **与 `decryptModelCatalog` 是两把不同的锁**：那个解的是本地
+ * `catalog-v6` 缓存（第二参是 **uid**），这个解的是**线上响应**（无第二参）。
+ * 混用会得到 `AES-GCM decrypt failed: aead::Error`（看着像密文损坏，实为用错函数）。
+ *
+ * @param encrypted - 服务端原始响应文本。
+ * @returns 解密后的明文；**解密失败时调用方应回退原文**（见
+ *   {@link decryptServerResponseOrRaw}）。
+ */
+export async function decryptServerResponse(encrypted: string): Promise<string> {
+  const g = await getGlue()
+  return g.callString((stack) => {
+    const a = g.writeString(encrypted)
+    g.exports.decrypt_server_response!(stack, a, g.lastLength())
+  })
+}
+
+/**
+ * `decryptServerResponse` + 「失败即明文」回退（复刻官方 `rb()` 的语义）。
+ *
+ * 抽成独立函数的理由：**回退是协议要求，不是可选优化**（见
+ * {@link decryptServerResponse} 的注释）。把它内联到调用点会让每个新端点
+ * 各自决定「失败怎么办」—— 而官方只有一个答案。
+ */
+export async function decryptServerResponseOrRaw(text: string): Promise<string> {
+  try {
+    return await decryptServerResponse(text)
+  } catch {
+    return text
+  }
 }
 
 /**
@@ -896,46 +944,69 @@ export class QoderEncryptedInfer {
   }
 
   /**
-   * **通用**请求签名：任意 endpoint / path / method（本仓库扩展，2026-10-20）。
+   * 构造并签名**任意端点**的请求（不只推理）。
    *
-   * ## 为什么需要它（与 `prepareInfer` 的区别）
+   * ## 为什么需要它
    *
-   * WASM 里有两个签名入口，用途不同：
+   * WASM 同时导出了两个请求构造函数：
    *
-   * | 导出 | 用途 | 本仓库 |
+   * | 导出 | 用途 | 本插件此前用了吗 |
    * |---|---|---|
-   * | `qodercontext_prepareInferRequest` | **仅推理**端点（`agent_chat_generation`） | ✅ `prepareInfer` |
-   * | `qodercontext_prepareRequest` | **通用**：任意 endpoint/path/method | ✅ 本方法 |
+   * | `qodercontext_prepareInferRequest` | 推理端点（`agent_chat_generation`） | ✅ `prepareInfer` |
+   * | `qodercontext_prepareRequest` | **通用**：任意 endpoint / path / method | ❌ 本方法才接上 |
    *
-   * 原生**搜索**（`/api/v1/webSearch/oneSearch`）走的是后者 —— 它的 host 与
-   * 推理不同（搜索挂 center host），且 path 任意，故不能复用 `prepareInfer`。
+   * 官方客户端的**搜索**走后者 —— 见 `qoder-worker-runtime` 的 `tPl`：
+   * ```js
+   * let n = i.prepareRequest(A, e, "POST", "auth", t, void 0)
+   * return { url: n.url, path: e, headers: kc(n.headers), body: n.body ?? t, free: () => n.free() }
+   * ```
+   * 即 `prepareRequest(endpoint, path, method, mode, bodyJson, headersJson)`。
    *
-   * ## 与 `prepareInfer` 的三点差异（照 wasm-bindgen glue 对齐）
+   * ## 参数语义（照 wasm-bindgen glue 逐位对齐）
    *
-   * 1. **不读 `this.host`**：endpoint 作为参数传入（搜索与推理 host 不同）。
-   * 2. **6 个参数**（vs prepareInferRequest 的 4 个）。
-   * 3. **可选参数缺席传 `0`**（`MX(n) ? 0 : n`）—— 传空串会被 Rust 侧当成
-   *    "有值但为空"，与官方行为不一致。
+   * ```js
+   * prepareRequest(A, e, t, i, n, r) {
+   *   // A=endpoint  e=path  t=method  i=签名模式  n=body(可选)  r=headers(可选)
+   *   qodercontext_prepareRequest(sp, ctx,
+   *     A, lenA, e, lenE, t, lenT, i, lenI,
+   *     MX(n) ? 0 : n, lenN,      // ⚠️ 可选参数：缺席时**传 0**，不是空串
+   *     MX(r) ? 0 : r, lenR)
+   * }
+   * ```
+   * 故本方法对 `body` / `headers` 的**缺席**（`undefined`）传 `0` —— 传空串
+   * 会让 Rust 侧当成「有值但为空」，与官方行为不一致。
    *
-   * @param endpoint 目标 host（含 scheme，如 `https://gateway.qoder.com.cn`）
-   * @param path 请求路径（如 `/api/v1/webSearch/oneSearch`）
-   * @param method HTTP 方法（官方对搜索与推理都用 `POST`）
-   * @param mode 签名模式：`'auth'`（登录态）或 `'sign'`（匿名）
-   * @param body 请求体字符串；`undefined` = 不带 body
-   * @param headers 额外请求头的 JSON 字符串；`undefined` = 不带
-   * @returns `{ url, headers, body }` —— headers 含 `Authorization: Bearer COSY.<载荷>.<签名>`
+   * ## ⚠️ 与 `prepareInfer` 的三点差异
+   *
+   * 1. **不写 `host`**：`prepareInfer` 用实例上的 `this.host`；本方法把
+   *    endpoint（host）**作为参数传入** —— 因为搜索与推理的 host 不同
+   *    （搜索挂 center 的 host，见 `qoder-product.ts`）。
+   * 2. **参数个数不同**：glue 里 `prepareRequest` 是 6 个 JS 参（含可选），
+   *    `prepareInferRequest` 是 4 个（host / body / modelKey / source）。
+   * 3. **返回值同形**：都是 `RequestResult`，用同一组 `requestresult_*`
+   *    读取器 + 同一个 `__wbg_requestresult_free` 释放。
+   *
+   * @param endpoint - 目标 host（含 scheme，如 `https://gateway.qoder.com.cn`）。
+   * @param path - 请求路径（如 `/api/v1/webSearch/oneSearch`）。
+   * @param method - HTTP 方法（官方对搜索与推理都用 `POST`）。
+   * @param mode - 签名模式：`'auth'`（登录态）或 `'sign'`（匿名）。
+   * @param body - 请求体字符串；`undefined` 表示不带 body。
+   * @param headers - 额外请求头的 JSON 字符串；`undefined` 表示不带。
+   * @returns `{ url, headers, body }` —— headers 含 `Authorization: Bearer COSY.<载荷>.<签名>`。
+   * @throws {Error} 实例已 `dispose`，或 wasm 侧返回错误时。
    */
   prepareRequest(
     endpoint: string,
     path: string,
     method: string,
-    mode: string,
-    body: string | undefined,
-    headers: string | undefined,
+    mode: 'auth' | 'sign',
+    body?: string,
+    headers?: string,
   ): QoderInferRequest {
     const g = this.g
+
     if (this.disposed) {
-      // 与 prepareInfer 同款：显式报错好过拿悬垂指针后 trap 一句裸 unreachable。
+      // 与 `prepareInfer` 同款：显式报错好过拿到悬垂指针后 trap 一句裸 `unreachable`。
       throw new Error('qoder: QoderEncryptedInfer 已 dispose，不能再次 prepareRequest')
     }
 
@@ -950,13 +1021,12 @@ export class QoderEncryptedInfer {
       const hd = headers === undefined ? 0 : g.writeString(headers)
       const hdLen = headers === undefined ? 0 : g.lastLength()
       g.exports.qodercontext_prepareRequest!(
-        stack, this.context,
-        ep, epLen, pt, ptLen, md, mdLen, mo, moLen, bd, bdLen, hd, hdLen,
+        stack, this.context, ep, epLen, pt, ptLen, md, mdLen, mo, moLen, bd, bdLen, hd, hdLen,
       )
     })
 
-    // 与 `prepareInfer` **完全同款**的读取 + 释放逻辑。
-    // ⚠️ 必须 try/finally：异常路径同样要释放 `result`，否则泄漏最多。
+    // 与 `prepareInfer` 完全同款的读取 + 释放（理由见那处的长注释：
+    // 读进 JS 字符串后即可释放 `result`，且必须用 try/finally 覆盖异常路径）。
     try {
       const headerMap = g.takeObject(g.exports.requestresult_headers!(result))
       const outHeaders: Record<string, string> = {}
@@ -977,7 +1047,6 @@ export class QoderEncryptedInfer {
           out = outPtr ? g.readString(outPtr, outLen) : ''
         } finally {
           g.exports.__wbindgen_add_to_stack_pointer!(16)
-          // Rust 侧新分配的 String，所有权已交给 JS ⇒ 必须释放（同 prepareInfer）。
           g.freeString(outPtr, outLen)
         }
         return out
@@ -989,7 +1058,6 @@ export class QoderEncryptedInfer {
         body: readResultString((stack, ptr) => g.exports.requestresult_body!(stack, ptr)),
       }
     } finally {
-      // 只释放 `result`（输入字符串由 Rust 持有，手工释放会 trap unreachable）。
       g.freePointer('__wbg_requestresult_free', result)
     }
   }

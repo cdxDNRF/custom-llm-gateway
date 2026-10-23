@@ -66,6 +66,7 @@ import {
 import { consumeGeminiSse, translateGeminiRequest } from './gemini-messages.js'
 import { planSessionTitleThinking } from './session-title.js'
 import { persistGeminiProject, resolveGeminiProject } from './gemini-project.js'
+import { geminiNetworkHint } from './gemini-proxy.js'
 import type { GeminiSigStore } from './gemini-sigstore.js'
 
 /** 最多换几个账号（含起始账号）。 */
@@ -248,6 +249,51 @@ export interface GeminiAdapterOptions {
   /** 探测用的 fetch（测试注入；缺省全局 `fetch`）。 */
   projectFetcher?: typeof fetch
   /**
+   * 推理请求用的 fetch（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ **这一处此前连 seam 都没有**：`stream()` 里的 `streamGenerateContent`
+   * 直接写死裸 `fetch`，因此 issue 建议里「接上已有的 seam」若照字面实现，
+   * **推理主路径会漏掉**（而它恰恰是用户唯一会卡住的那条路）。
+   *
+   * ⚠️ 与 `projectFetcher` **分成两个字段**：项目探测与推理是两次独立请求，
+   * 测试替身通常只想拦其中一条；合成一个字段会让「只拦探测」的用例意外拦到推理。
+   */
+  fetchImpl?: typeof fetch
+  /**
+   * 按**账号 id** 取 fetcher（代理支持，Gitee issue IKLTZ2）。
+   *
+   * ⚠️ 必须是**函数**而不是一份定好的 fetcher：本适配器在一轮请求内会**换号**
+   * （限流 / 401 时 `getAvailableAccount` 换人），出口必须跟着换。
+   */
+  fetchFor?: (accountId: string) => typeof fetch
+  /**
+   * **显式**指定本适配器代表的账号池条目 id（Gitee issue IKLTZ2 审计 P1-1）。
+   *
+   * ## ⚠️ 为什么必须有它（真实缺陷，独立审计实测）
+   *
+   * 出口代理是**账号维度**的，而「本适配器正在替哪个账号发请求」有两个来源：
+   *
+   * - 主推理路径：有 `accountPool` ⇒ 按 `access_token` 反查（既有逻辑）；
+   * - **探测路径**（账号卡片上的「测试」/「重测」）：`account-probe.ts` **刻意
+   *   不传 `accountPool`**（见其 L213 的注释：探测只测这一个账号、且不写标记）
+   *   ⇒ 反查那一条路**根本不存在** ⇒ `currentAccountId` 恒为 `''`
+   *   ⇒ 解析器按「空 id = 直连」处理 ⇒ **该账号的代理被完全绕过**。
+   *
+   * 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+   * 与「账号已失效」在 UI 上**完全同形** ⇒ 用户会去误删好号。
+   *
+   * ## ⚠️ 为什么是「显式传入」而不是「探测时也传 accountPool」
+   *
+   * 传池会把探测接进换号/写标记的整套编排，而探测的**既定语义**就是不写任何
+   * 东西、只测这一个账号。改 `account-probe.ts` 会破坏那套语义并波及十家适配器。
+   *
+   * ## ⚠️ 为什么**优先于**反查
+   *
+   * 探测时反查恰恰是拿不到的那条路；即便将来有人给探测也挂了池，显式值也是
+   * 更权威的（调用方明确说了「我代表这个账号」）。
+   */
+  accountIdOverride?: string
+  /**
    * 把探测到的项目号回写凭据（跨启动缓存，best-effort）。
    *
    * ⚠️ 只回写**探测到的真值**，不回写兜底串 —— 理由见 `persistGeminiProject`。
@@ -258,16 +304,16 @@ export interface GeminiAdapterOptions {
   /** 产品配置；默认 {@link GEMINI}。 */
   product?: GeminiProduct
   /**
-   * **动态模型表**（本仓库扩展，2026-10-15）。
+   * **动态模型表**（本仓库扩展，2026-10-15；2026-10-24 适配上游共享骨架）。
    *
-   * 缺省时退回静态表 `geminiFallbackEntries()`（只有 1 个模型）。
-   * 接线侧传入远端拉取的结果（`fetchAvailableModels`）即可暴露账号
-   * 真正可用的全部模型（实测 15 个，含 Claude 系列）。
+   * 缺省时退回静态表 `geminiFallbackEntries()`（上游只登记 1 个模型）。
+   * 接线侧传入远端拉取的结果（`fetchAvailableModels`）即可暴露账号**真正可用**
+   * 的全部模型（实测 15 个，含 Claude 系列）。
    *
    * ⚠️ **必须同步返回数组**（同 `listAllModels` 的契约）：写成 `async` 会让
    *    `[...all]` / `all.map` 抛 `TypeError: all is not iterable`。
-   * ⚠️ 返回空数组时**退回静态表**而不是暴露空目录 —— 否则一次拉取失败
-   *    会让用户看到"一个模型都没有"。
+   * ⚠️ 返回空数组时**退回静态表**而不是暴露空目录 —— 否则一次拉取失败会让用户
+   *    看到「一个模型都没有」。
    */
   modelsProvider?: () => readonly GeminiModelEntry[]
 }
@@ -556,8 +602,13 @@ export class GeminiAdapter extends LlmAdapter {
 
     // ⚠️ 起点账号：**局部可变**。不能每次问回调 —— 回调返回的是池的当前
     // 默认账号，换号后不跟着变，会让「换号」变成在两个账号间无限来回。
-    let currentAccountId = ''
-    if (pool !== undefined && credential.access_token !== '') {
+    //
+    // ⚠️ `accountIdOverride` **优先于**反查（IKLTZ2 审计 P1-1）：探测路径
+    // 刻意不挂 `accountPool` ⇒ 反查那条路不存在 ⇒ 没有这个覆盖值时
+    // `currentAccountId` 恒为 `''` ⇒ 账号代理被完全绕过（且症状与
+    // 「账号已失效」同形，用户会去误删好号）。
+    let currentAccountId = this.options.accountIdOverride ?? ''
+    if (currentAccountId === '' && pool !== undefined && credential.access_token !== '') {
       currentAccountId = await pool
         .findAccountIdByCredential(this.product.id, credential.access_token)
         .catch(() => '')
@@ -570,6 +621,21 @@ export class GeminiAdapter extends LlmAdapter {
     // 项目号缓存：**跨账号共用一份 Map**（键是凭据身份），故放在循环外。
     // 见 `gemini-project.ts` 的三级缓存。
     const projectCache = this.options.projectCache ?? new Map<string, string>()
+
+    /**
+     * 取当前账号该走的 fetcher（Gitee issue IKLTZ2）。
+     *
+     * ⚠️ **在循环内按 `currentAccountId` 现取**：换号后出口必须跟着换 ——
+     * 循环外固化一份会让换号后**仍走旧账号的代理**（症状是「换了号还是超时」，
+     * 且无任何报错，属最难查的一类静默失效）。
+     *
+     * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor`（生产代理）> 全局 `fetch`。
+     */
+    const fetcherForCurrentAccount = (): typeof fetch => {
+      if (this.options.fetchImpl !== undefined) return this.options.fetchImpl
+      if (this.options.fetchFor !== undefined) return this.options.fetchFor(currentAccountId)
+      return fetch
+    }
 
     let endpointIdx = 0
     let endpointSwitched = false
@@ -604,9 +670,11 @@ export class GeminiAdapter extends LlmAdapter {
           const probe = await resolveGeminiProject({
             credential,
             cache: projectCache,
-            ...this.options.projectFetcher === undefined
-              ? {}
-              : { fetcher: this.options.projectFetcher },
+            // ⚠️ 项目探测与推理**共用同一个账号出口**（否则探测走代理、推理直连，
+            // 用户会看到「项目号探测失败」这种指向错误的原因）。故这里也走
+            // `fetcherForCurrentAccount()`，但仍尊重显式注入的 `projectFetcher`
+            // —— 测试里「只拦探测、不拦推理」是常见需求。
+            fetcher: this.options.projectFetcher ?? fetcherForCurrentAccount(),
             // ⚠️ 透传调用方信号：否则探测自带的 30s 超时会把更短的调用方超时拖长。
             ...options.signal === undefined ? {} : { signal: options.signal },
           })
@@ -676,7 +744,10 @@ export class GeminiAdapter extends LlmAdapter {
         }
         let response: Response
         try {
-          response = await fetch(url, {
+          // ⚠️ **走 `fetcherForCurrentAccount()`**（Gitee issue IKLTZ2）：此处原先是
+          // 写死的裸 `fetch`，没有任何 seam —— 那正是 issue 建议里没点到的缺口
+          // （照字面只接 `fetchImpl` / `projectFetcher` 会让**推理主路径**漏掉代理）。
+          response = await fetcherForCurrentAccount()(url, {
             method: 'POST',
             // ⚠️ 流式**刻意不带 `Accept`**（抓包一致，见 `geminiHeaders`）。
             headers: geminiHeaders(credential),
@@ -687,8 +758,15 @@ export class GeminiAdapter extends LlmAdapter {
           // 网络层失败：**如实抛 TRANSPORT**，让 harness 的退避去处理
           // （本适配器不自己重试网络错误 —— 那会与 harness 的退避叠加）。
           if (error instanceof LlmError) throw error
+          // ⚠️ **点名代理**（IKLTZ2 修法 3 / 审计 P2-2）：「连不上 Google」与
+          // 「Google 报错」在 TRANSPORT 这一格同形，而前者唯一出路是配代理。
+          // ⚠️ `aborted` 必须**真读调用方的 signal**（原先恒传字面量 `false`）：
+          // harness 给的 deadline 到期时，报文是 `AbortError`、**不带**
+          // `UND_ERR_*` 码 ⇒ 恒 false 会让「调用方超时」这类墙外症状拿不到提示。
+          const hint = geminiNetworkHint(error, options.signal?.aborted === true)
           throw new LlmError(
-            `gemini: 请求发送失败 — ${error instanceof Error ? error.message : String(error)}`,
+            `gemini: 请求发送失败 — ${error instanceof Error ? error.message : String(error)}`
+            + (hint === undefined ? '' : `；${hint}`),
             'TRANSPORT',
             { cause: error },
           )

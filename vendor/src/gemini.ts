@@ -538,7 +538,7 @@ export function geminiModelSpec(
   modelId: string,
   effort?: string,
   /**
-   * **本仓库扩展（2026-10-15）**：允许的模型 id 集合。
+   * **本仓库扩展（2026-10-15，2026-10-24 适配共享骨架）**：允许的模型 id 集合。
    *
    * 缺省时退化为「只允许 `gemini-3.8-flash`」—— 与改动前逐字节一致，
    * 故既有调用方零行为变化。
@@ -558,7 +558,7 @@ export function geminiModelSpec(
       `gemini: 模型 "${modelId}" 不在本 provider 目录中（当前可用：${allowedIds.join(', ')}）`,
       'INVALID_REQUEST',
       // ⚠️ `status` 只落在 `LlmError.failure`（不是顶层属性），且网关的
-      // `failureToOpenAiError` 两处都读 —— 见 `openai-gateway/stream.ts`。
+      // `failureToOpenAiError` 两处都要读 —— 见 `openai-gateway/stream.ts`。
       { status: 404 },
     )
   }

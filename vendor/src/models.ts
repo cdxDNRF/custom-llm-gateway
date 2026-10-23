@@ -60,6 +60,18 @@ export const MODEL_REFRESH_INTERVAL_MS = 2 * 3_600_000
 export interface RemoteModel {
   id: string
   name: string
+  /**
+   * 消耗倍率的**展示串**（如 `0.7x`）；取不到时为 `undefined`。
+   *
+   * ⚠️ 为什么存**展示串**而不是数值（2026-10-21）：
+   * 上游 `/v1/model/builtin` 的 `credit[]` 同时给了两个数 ——
+   * `ratio`（`0.05`）与 `ratio_display`（`0.7x`），而**主界面显示的是后者**，
+   * 两者**不是同一个量纲**（`GLM-5.2` ratio=0.05 却显示 0.7x；
+   * `deepseek-v4.1-flash` 同样 ratio=0.05 却显示 0.18x）。
+   * ⇒ 存数值再去拼 `x{n}` 会**编造出一个上游没显示过的倍率**（本仓红线：
+   *   绝不臆造上游未下发的数）。故直接取 `ratio_display`，取不到就不显示。
+   */
+  rateLabel?: string
 }
 
 /**
@@ -110,7 +122,12 @@ export function normalizeModelId(id: string): string {
   return id
 }
 
-function parseModelInfo(m: Record<string, unknown>, seen: Set<string>): RemoteModel | undefined {
+function parseModelInfo(
+  m: Record<string, unknown>,
+  seen: Set<string>,
+  /** 取倍率时用的「现在」（单测注入；缺省 `Date.now()`）。 */
+  nowMs?: number,
+): RemoteModel | undefined {
   const rawId = m['model_id']
   if (typeof rawId !== 'string' || rawId.length === 0) return undefined
   const id = normalizeModelId(rawId)
@@ -122,7 +139,118 @@ function parseModelInfo(m: Record<string, unknown>, seen: Set<string>): RemoteMo
   const name = typeof rawName === 'string' && rawName.length > 0 ? normalizeModelId(rawName) : id
   if (seen.has(id)) return undefined
   seen.add(id)
-  return { id, name }
+  return { id, name, ...readRateLabel(m, nowMs) }
+}
+
+/**
+ * 从 `/v1/model/builtin` 的单条模型里读**展示用倍率串**。
+ *
+ * ## 字段实况（2026-10-21 真机取证，8 个模型）
+ *
+ * ```json
+ * "credit": [{ "ratio":"0.05", "ratio_display":"0.7x", "before_display_ratio":null }]
+ * ```
+ *
+ * 6 个常规模型有 `credit[0]`，两个 VL 模型（`Qwen3-VL-235B` / `kimi-k2.6-vl`）
+ * **整个 `credit` 数组为空**（它们上面已被 `parseModelInfo` 滤掉，这里只是顺带记下）。
+ *
+ * ⚠️ **只取 `ratio_display`，不取 `ratio`**：
+ * 两个字段不同量纲（见 `RemoteModel.rateLabel` 的注释），用 `ratio` 拼串
+ * 会显示出一个上游主界面从未出现过的数字。
+ *
+ * ⚠️ 任何一步取不到就返回空对象（**不落 `rateLabel` 键**）—— 调用方据此
+ * 保持裸名，与「上游没给倍率」完全同形（绝不用占位值冒充）。
+ */
+function readRateLabel(m: Record<string, unknown>, nowMs: number = Date.now()): { rateLabel?: string } {
+  const credit = m['credit']
+  if (!Array.isArray(credit) || credit.length === 0) return {}
+  // ⚠️ **按时段选档**，不是无脑取 `credit[0]`（2026-10-21 真实缺陷）。
+  //    `deepseek-v4.1-flash` 有两档，且**当前生效的可能是第二档**：
+  //      · `default`  → 0.18x
+  //      · `off_peak` → 0.09x（每晚 21:00 起、持续 11 小时 = 至次日 7:59，Asia/Shanghai）
+  //    取 `credit[0]` 会在整个错峰时段显示**过高的 0.18x**（用户当场发现）。
+  const slots = m['time_slots']
+  const picked = pickActiveCredit(credit, slots, nowMs)
+  if (picked === undefined) return {}
+  const display = picked['ratio_display']
+  if (typeof display !== 'string' || display.length === 0) return {}
+  return { rateLabel: display }
+}
+
+/**
+ * 从 `credit[]` 里挑出**当前时段生效**的那一档。
+ *
+ * ## 实况（2026-10-21 真机取证）
+ *
+ * ```json
+ * "time_slots": {
+ *   "off_peak": { "timezone":"Asia/Shanghai", "schedule":"0 0 21 * * *",
+ *                 "duration":11, "timeunit":"hour", ... },
+ *   "default":  { "schedule":null, "duration":null }
+ * }
+ * ```
+ *
+ * ⇒ `schedule` 是 **6 段 cron（秒 分 时 日 月 周）**，`duration`+`timeunit` 给窗口长度。
+ * 只有 `deepseek-v4.1-flash` 真正带时段；`openpangu-2.0-pro` 虽有两档，但两档的
+ * `time_slot_id` 都是 `null`、display 也相同 ⇒ 取任一都对。
+ *
+ * ⚠️ **不做通用 cron 解析器**（本仓红线：不为一种上游形态臆造一套通用实现）。
+ * 只认已实测的这一种：固定的「时分 + 小时时长」窗口；解析不出就退回
+ * `credit[0]`（与上游「无时段」时同形）。
+ */
+function pickActiveCredit(
+  credit: unknown[],
+  slots: unknown,
+  nowMs: number,
+): Record<string, unknown> | undefined {
+  const entries = credit.filter(
+    (c): c is Record<string, unknown> => typeof c === 'object' && c !== null,
+  )
+  if (entries.length === 0) return undefined
+  if (typeof slots !== 'object' || slots === null) return entries[0]
+
+  for (const entry of entries) {
+    const slotId = entry['time_slot_id']
+    if (typeof slotId !== 'string') continue
+    const slot = (slots as Record<string, unknown>)[slotId]
+    if (typeof slot !== 'object' || slot === null) continue
+    if (isTimeSlotActive(slot as Record<string, unknown>, nowMs)) return entry
+  }
+  return entries[0]
+}
+
+/**
+ * 判断一个 `time_slot` 此刻是否生效。
+ *
+ * ⚠️ 时区**硬取 Asia/Shanghai**（上游明确下发 `timezone` 字段，且本仓已有
+ * 同口径先例：`auto-checkin.ts` 的 `utc8DateString` 用算术平移而非本机时区
+ * —— 用户出差/改系统时区时不该改变结果）。
+ */
+function isTimeSlotActive(slot: Record<string, unknown>, nowMs: number): boolean {
+  const schedule = slot['schedule']
+  if (typeof schedule !== 'string' || schedule.length === 0) return false
+  // 6 段 cron：秒 分 时 日 月 周（实测形态 `0 0 21 * * *`）
+  const parts = schedule.trim().split(/\s+/)
+  if (parts.length < 3) return false
+  const hour = Number(parts[2])
+  const minute = Number(parts[1])
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return false
+
+  const duration = Number(slot['duration'])
+  const unit = slot['timeunit']
+  if (!Number.isFinite(duration) || duration <= 0) return false
+  // 只认小时（实测唯一形态）；其他单位不臆造换算。
+  if (unit !== 'hour') return false
+
+  // 算术平移到 Asia/Shanghai（UTC+8）后取「当天已过分钟数」。
+  const shanghaiMs = nowMs + 8 * 3600_000
+  const dayMinutes = Math.floor(shanghaiMs / 60_000) % (24 * 60)
+  const startMinutes = hour * 60 + minute
+  const windowMinutes = duration * 60
+  // ⚠️ 窗口可以**跨日界**（21:00 + 11h → 次日 7:59）：取模处理。
+  const offset = (dayMinutes - startMinutes + 24 * 60) % (24 * 60)
+  return offset < windowMinutes
 }
 
 /** 从 JSON 响应中沿路径指针取数组。 */
@@ -193,6 +321,14 @@ export async function fetchCodeArtsRemoteModels(
    * 不传即不关心完整性，行为逐字节不变。
    */
   outcome?: RemoteCatalogOutcome,
+  /**
+   * 「现在」的时刻（毫秒）—— **只为倍率选时段**用。
+   *
+   * ⚠️ 加它是因为倍率**随时间变**（`deepseek-v4.1-flash` 错峰档 21:00–次日 7:59
+   * 显示 0.09x，其余时段 0.18x）。单测必须能注入时刻，否则「是否落在错峰窗口」
+   * 这条逻辑无法被确定性覆盖。缺省 `Date.now()` ⇒ 生产行为不变。
+   */
+  nowMs: number = Date.now(),
 ): Promise<RemoteModel[]> {
   const { access_key_id: ak, secret_access_key: sk, security_token: st } = credential
   if (!ak || !sk) {
@@ -232,7 +368,7 @@ export async function fetchCodeArtsRemoteModels(
       if (typeof item === 'object' && item !== null) {
         const entry = item as Record<string, unknown>
         const rawId = typeof entry['model_id'] === 'string' ? entry['model_id'] : ''
-        const mi = parseModelInfo(entry, seen)
+        const mi = parseModelInfo(entry, seen, nowMs)
         if (mi) {
           // 仅当归一化未改写 id 时才记为 benefit（见上方说明）
           if (rawId.length > 0 && normalizeModelId(rawId) === rawId) benefitIds.push(mi.id)
@@ -257,7 +393,7 @@ export async function fetchCodeArtsRemoteModels(
   if (snapArr !== undefined) {
     for (const item of snapArr) {
       if (typeof item === 'object' && item !== null) {
-        const mi = parseModelInfo(item as Record<string, unknown>, seen)
+        const mi = parseModelInfo(item as Record<string, unknown>, seen, nowMs)
         if (mi) models.push(mi)
       }
     }

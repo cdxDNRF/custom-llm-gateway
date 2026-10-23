@@ -49,6 +49,9 @@
  */
 
 import type { ProviderDescriptor } from './provider-registry.js'
+// ⚠️ 只导入**类型**：本模块是运行时注册表的宿主，不该把缓存的实现拉进来
+//（实现由 `src/index.ts` 建好后注册，见 `registerBalanceCache`）。
+import type { BalanceCache } from './balance-cache.js'
 import type { AccountPool } from './account-pool.js'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { CheckinStatus, ClaimOutcome, CreditBalance } from './credits.js'
@@ -95,6 +98,15 @@ export interface ProviderCallContext {
   readonly warn: (message: string) => void
   /** 账号池（少数实现需要，如 TRAE 的设备指纹代次读写）。 */
   readonly accountPool: AccountPool
+  /**
+   * 本次查询所属的**账号池条目 id**（Gitee issue IKLTZ2 起）。
+   *
+   * ⚠️ **刻意新增**而不是让各家自己按 ref 反查：账号 id 与 `credentialRef`
+   * 之间**没有可逆映射**（ref 由 RPC 随机生成），而「按账号取出口代理」
+   * （Gemini）必须知道 id。空串/未提供 = 「不知道是谁」⇒ 实现应当直连，
+   * **不得**猜一个账号去用它的出口（那是把请求发到错误的出口上）。
+   */
+  readonly accountId?: string
 }
 
 /**
@@ -169,6 +181,30 @@ export interface ProviderExpiryContext {
    * ⚠️ 缺席时实现方照常返回折算值，只是清不掉旧标记。
    */
   readonly clearModelsExhausted?: (accountId: string, modelIds: readonly string[]) => Promise<void>
+  /**
+   * **共享余额读数**入口（2026-10-15，`src/balance-cache.ts` 的消费者之一）。
+   *
+   * ## ⚠️ 为什么需要它（规格 §5.7 的分层）
+   *
+   * 「账号积分缓存是更底层基础设施，取号逻辑只是在调用缓存时的取舍」——
+   * ⇒ buddy 系四家的折算原语原先**自己发一次余额请求**（`fetchCreditBalance`），
+   * 而积分面板 / 用量徽标也各发一次 ⇒ 同一个账号在一分钟内被查 2~3 次。
+   * 本字段让折算**吃同一份读数**（`balance-cache` 按 `(provider, accountId)` 去重）。
+   *
+   * ## 契约
+   *
+   * - 返回 `undefined` ⇒ **本次没有共享读数可用**（未注入 / 未命中且取数失败）。
+   *   实现方必须**回落到自己发请求**（`fallback`）：折算的可用性**不得**依赖本字段
+   *   —— 否则「未接线」会变成「该渠道折算恒 UNUSABLE」（静默少一个候选，正是本仓库
+   *   复发过三次的形态）。
+   * - 抛错 ⇒ 由实现方按自己的既有口径处理（buddy 系是「折算成 `UNUSABLE`」）。
+   *   ⚠️ **但中止必须逃逸**：本入口可能网络取数。
+   *
+   * ⚠️ 只有**形态匹配**的渠道该用（buddy 系四家的 `CreditBalance`）；其余渠道
+   * （officeace 的套餐摘要、zcode 的分桶、loomy 的命名池）**形态不同**，接入前
+   * 要先把原语拆成「取数」与「折算」两段（规格 §5.7.3 的「登记待接」）。
+   */
+  readonly cachedBalance?: (accountId: string | undefined) => Promise<unknown>
 }
 
 /**
@@ -300,10 +336,11 @@ export interface ProviderRuntime {
    *
    * ⚠️⚠️ **但「已接入清单」并不由本表派生**（2026-10-08 设计复审更正）：
    * `WIRED_EXPIRY_PROVIDERS`（同文件）是**编译期常量**，理由见那里的长注释 ——
-   * 它在源码里有 **4 个**消费点（`aggregate-adapter.ts` 的**三处**目录/候选过滤，
-   * 加 `aggregate-expiry.ts` 的「未接入」短路），更要紧的是被**大量不调 `apply()`
-   * 的既有测试**消费（实测：在 `tests/unit` 里 grep「临期探针工厂名 + 左括号」共
-   * 36 处，减去 `expiry-runtime-parity.spec.ts` 自己的 7 处 ⇒ **既有 29 处**；
+   * 它在源码里有 **5 个**消费点（`aggregate-adapter.ts` 的**四处**过滤，
+   * 加 `aggregate-expiry.ts` 的「未接入」短路 —— **后者才是轮换候选的闸门**），
+   * 更要紧的是被**大量不调 `apply()` 的既有测试**消费（实测：在 `tests/unit` 里
+   * grep「临期探针工厂名 + 左括号」共 36 处，减去 `expiry-runtime-parity.spec.ts`
+   * 自己的 7 处 ⇒ **既有 29 处**；
    * grep「`new` + `AggregateAdapter` + 左括号」共 **86 处**。⚠️ 注释刻意不写出
    * 左括号，否则注释自己会被下一次 grep 计进去），而本表要到 `apply()` 才填充 ⇒
    * 派生版本在那些场景下**恒为空数组**，会把**所有虚拟模型过滤掉**
@@ -597,6 +634,32 @@ export interface ProviderCredits {
     run: GrowthRunOptions,
     call: ProviderCallContext,
   ): Promise<RpcBuddyGrowthAccountResult | undefined>
+  /**
+   * 签到收尾的**附加提示**（可选）。
+   *
+   * 与 {@link afterClaim} 的区别：`afterClaim` **只在 `runTasks === true` 时**运行
+   *（成长中心一轮 90~270s，默认关闭）；本钩子**每次签到都会跑**，语义是
+   *「签到之后顺带做一件小事，并给用户一句话说明」。
+   *
+   * ## 为什么需要它（2026-10-20 用户报障）
+   *
+   * TRAE 的「1024 打卡抽奖」应在**点签到按钮**时触发。挂在 `claim` 内部会
+   * **几乎永不触发**：本家 `precheckStatus: true`，今天已签到就直接回
+   * `already-claimed`、根本不调 `claim`（而「已签到」恰恰最该抽奖）。
+   *
+   * ## 契约
+   * - 返回字符串 ⇒ 追加到该账号 `outcome.message`；返回 `undefined` ⇒ 不加任何东西
+   *  （**不该做的事必须回 `undefined`**，报出来是噪声）；
+   * - **永不抛**：失败不得影响签到结果（本仓库有两轮「登录成功却因记账失败被报成
+   *   失败」的事故史）。
+   *
+   * ⚠️ 只有 trae 注入；其余 provider 不传 ⇒ 行为逐字不变。
+   */
+  afterClaimNote?(
+    credential: unknown,
+    entry: ProviderAccountEntry,
+    call: ProviderCallContext,
+  ): Promise<string | undefined>
 }
 
 /**
@@ -718,6 +781,38 @@ export function runtimeOf(provider: string): ProviderRuntime | undefined {
 }
 
 /**
+ * **共享余额读数缓存**的进程级注册位（2026-10-15，规格 §5.7）。
+ *
+ * ## ⚠️ 为什么走全局注册表而不是给 `registerJetHubRpc` 加形参
+ *
+ * 那个函数的签名有**成文不变式**：只剩 **4 个形参**（`ctx, pool, auths, modelAdapters`），
+ * 且 `tests/unit/zcode-wiring.spec.ts` 有一组「不占形参位的是谁」的守卫。
+ * 加第 5 个可选形参正是那条注释记录的**复发 6 次**的错位形态（在它之前插入任何
+ * 可选形参都会让调用点静默错位）。
+ *
+ * ⇒ 与本文件既有的 `runtimeOf` / 全局注册表同一取向：「拿不到形参的跨模块消费点」
+ * 走注册表（`ProviderRuntime.credits` 的先例就在本文件）。
+ *
+ * ## 生命周期
+ *
+ * ⚠️ 由 `src/index.ts` 的 `apply()` 在建缓存后**立即**注册；`dispose` 时清空
+ *（与 `clearProviderRuntimes` 同处调用，避免用例之间串味）。
+ * ⚠️ 未注册 ⇒ 消费方（`credits.balances`）**走自己的原路径**，行为与升级前一致 ——
+ * 那是刻意保留的降级路径（本仓库对「可选接线缺失」的一贯取向：不得静默改变行为）。
+ */
+let sharedBalanceCache: BalanceCache | undefined
+
+/** 注册共享余额缓存（`src/index.ts` 的 `apply()` 调用）。 */
+export function registerBalanceCache(cache: BalanceCache): void {
+  sharedBalanceCache = cache
+}
+
+/** 取共享余额缓存；未注册返回 `undefined`（调用方回退到自己的原路径）。 */
+export function balanceCacheOf(): BalanceCache | undefined {
+  return sharedBalanceCache
+}
+
+/**
  * 按 provider id 从一张 `expiry` 表里取实现。
  *
  * ⚠️ 用 `Object.hasOwn` 而非 `in` 或下标：`in`/下标会命中**原型链**上的键
@@ -740,6 +835,9 @@ export function expiryOf(
  */
 export function clearProviderRuntimes(): void {
   runtimes.clear()
+  // ⚠️ 共享缓存注册位也要清：它挂在同一张进程级表上，留着会让**下一个用例**
+  //    读到上一个用例的缓存实例（串味，且症状是「余额读数莫名命中」）。
+  sharedBalanceCache = undefined
 }
 
 /**

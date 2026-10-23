@@ -77,8 +77,12 @@ export async function readWithIdleTimeout(
  * ⚠️ **不能用 `String(name).length > 0` 代替**：`undefined` / `null` 经 `String()`
  * 会变成 `"undefined"` / `"null"` 这类**非空**字符串，于是"缺名字"被误判成
  * "有名字"，原样发给上游照样 400。判据必须落在原始值上。
+ *
+ * ⚠️ `name is string` 这个类型谓词是**纯编译期**的收窄（运行期行为逐字节不变），
+ * 它让调用方在判过之后可以直接使用 `name` 而无需再断言 —— 网关侧因此不必写
+ * `String(...)` 或 `!`，那两种写法都会把「判据」与「取值」拆成两份、进而漂移。
  */
-export function hasUsableToolName(name: unknown): boolean {
+export function hasUsableToolName(name: unknown): name is string {
   return typeof name === 'string' && name.trim().length > 0
 }
 

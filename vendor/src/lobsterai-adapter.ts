@@ -30,7 +30,7 @@ import {
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { parseRateLimitError } from './llm-adapter.js'
@@ -63,7 +63,7 @@ import { reportLedgerAccount } from './token-ledger.js'
 import { planSessionTitleThinking } from './session-title.js'
 // ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
 // `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
-import { detailFieldText } from './openai-compat.js'
+import { detailFieldText, TOOL_RESULT_IMAGE_TEXT } from './openai-compat.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -358,6 +358,15 @@ export interface LobsteraiAdapterOptions {
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
   /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   *    ⚠️ **buddy 是例外**：它的 `catalogGate` 也吃这个时钟（冷却与
+   *    「距上次尝试 ≥10 秒」判定都走它），所以别把本行当成全仓库通用口径。
+   */
+  now?: () => number
+  /**
    * 远端目录**落地后**的通知回调（issue IKJVTF）。
    *
    * 由 `registerLobsteraiLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
@@ -380,9 +389,6 @@ function contentToText(content: unknown): string {
     .map((block) => String(block.text))
     .join('')
 }
-
-/** 工具结果内嵌图片的载体文本（与 buddy / 官方 deepseek 适配器同名同义）。 */
-const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
 /**
  * 把 harness 内容块转成 OpenAI 多模态 parts。
@@ -485,14 +491,46 @@ function serializeMessages(
 
   // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
   // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
-  // 故挂起到其后的独立 user 消息统一发出（与 buddy 适配器同款处理）。
+  // 但**也不能单独成一条 user 消息**（见 flushToolImages 的实测表）⇒ 挂起，
+  // 等下一条 user 消息把它「搭车」带走。
   let pendingToolImages: Array<Record<string, unknown>> = []
-  const flushToolImages = (): void => {
-    if (pendingToolImages.length === 0) return
-    wire.push({
-      role: 'user',
-      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
-    })
+  // 含工具结果而被延后的那条 user 消息的内容（排在 `role:'tool'` 之后发出）。
+  let pendingOwnParts: Array<Record<string, unknown>> | undefined
+  /**
+   * 发出挂起的工具结果图片；`own` 是**同一轮要发的那条 user 消息**的内容。
+   *
+   * ⚠️⚠️ **图片必须与提问同在一条 user 消息里**（Issue IKLIFH，真实报障
+   * 「codebuddy hy4 不支持识别图片」，本函数与 buddy 适配器同型）。
+   *
+   * 实测（2026-10-14，直连 `copilot.tencent.com`，hy4-preview，同一张
+   * 1024x768 双色图，问「左右分别什么颜色」）：
+   *
+   * | wire 形态                                     | 上游行为           |
+   * |-----------------------------------------------|--------------------|
+   * | 图与提问**同一条** user                        | ✅ 「左白右蓝」    |
+   * | 图与提问**同一条**，且前面已存在 tool 消息     | ✅ 「左白右蓝」    |
+   * | 图单独一条 user（有提示句），问在下一条       | ❌ 「图像已被过滤」|
+   * | 图单独一条 user（**无**提示句），问在下一条   | ❌ 「不支持图片识别」|
+   * | 图并入 `role:'tool'` 消息本身                 | ❌ 「不支持读取图片」|
+   *
+   * ⇒ 触发条件是**图片与提问不在同一条 user 消息**；与提示句无关，也与 hy4 无关
+   * （同一张图换 `deepseek-v4-flash` 同样答「已被过滤」，而它远端同样是
+   * `supportsImages: true`）。
+   *
+   * ⚠️ 症状极具误导性：wire 上**确实有图**（抓包可见 `image_url` data URL）、
+   * 上游也**不报错**（HTTP 200 + 正常流），只是模型**看不见**并自称
+   * 「当前模型不支持图片输入」⇒ 用户会误判成模型能力问题、反复换模型。
+   *
+   * ⚠️ 无挂图且 `own` 为空时**什么都不发**：凭空造一条 parts 消息会让纯文本
+   * 会话被上游 400（反向验证实测）。
+   */
+  const flushToolImages = (own?: Array<Record<string, unknown>>): void => {
+    const ownParts = own ?? []
+    if (pendingToolImages.length === 0 && ownParts.length === 0) return
+    // 图与提问**同条**：图在前、own 的文本在后（两种顺序实测都能被看到）。
+    const ownImages = ownParts.filter((part) => part.type !== 'text')
+    const ownText = ownParts.filter((part) => part.type === 'text')
+    wire.push({ role: 'user', content: [...pendingToolImages, ...ownImages, ...ownText] })
     pendingToolImages = []
   }
 
@@ -521,8 +559,9 @@ function serializeMessages(
         .join('')
       const text = contentToText(content)
       // 挂起的工具结果图片必须在 assistant 之前发出，否则会漂到这条
-      // assistant 之后，与产生它们的工具调用脱节。
-      flushToolImages()
+      // assistant 之后，与产生它们的工具调用脱节。延后正文一并带上。
+      flushToolImages(pendingOwnParts)
+      pendingOwnParts = undefined
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（OpenAI 规范）。
@@ -533,7 +572,8 @@ function serializeMessages(
       continue
     }
     if (message.role === 'system') {
-      flushToolImages()
+      flushToolImages(pendingOwnParts)
+      pendingOwnParts = undefined
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -546,12 +586,36 @@ function serializeMessages(
     const regular = content.filter((block) =>
       !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
     const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
-    if (parts !== undefined) {
-      flushToolImages()
-      wire.push({ role: 'user', content: parts })
-    } else if (text.length > 0 || toolResults.length === 0) {
-      flushToolImages()
-      wire.push({ role: 'user', content: text })
+    // ⚠️⚠️ **两条互斥分支**（Issue IKLIFH 的落点，与 buddy 适配器同型）：
+    //
+    // | 本条形态               | 处置                                                |
+    // |------------------------|-----------------------------------------------------|
+    // | 无工具结果             | **立刻**发出，并把挂起的工具结果图片**搭车**并入本条 |
+    // | 含工具结果（deferred） | 本条内容也留到**下一条** user 消息，与挂图合并发出   |
+    //
+    // ⚠️ 含工具结果时**整条延后**：OpenAI 兼容协议要求 tool 消息**紧跟**其
+    // assistant `tool_calls`，中间插任何 user 消息都会 400。
+    const deferred = toolResults.length > 0
+    // ⚠️ 本条同时是上一条延后内容的「搭车机会」：`pendingOwnParts` 里的正文
+    // 必须与本条内容、挂起图片**一起**发出一条。
+    //
+    // ⚠️⚠️ **无挂图且本条无图时必须保持「字符串」形态**（旧行为逐字节不变）：
+    // 纯文本若被包装成 `[{type:'text',…}]`，上游会以 `model_param_invalid` 400
+    // 拒收整个请求（实测）。
+    const hasImage = parts !== undefined
+    const combined: Array<Record<string, unknown>> | undefined = pendingToolImages.length > 0 || hasImage
+      ? [
+        ...(pendingOwnParts ?? []),
+        ...(parts ?? (text.length > 0 ? [{ type: 'text', text }] : [])),
+      ]
+      : undefined
+    pendingOwnParts = undefined
+    if (deferred) {
+      pendingOwnParts = combined ?? (text.length > 0 ? [{ type: 'text', text }] : undefined)
+    } else if (combined !== undefined || toolResults.length === 0) {
+      // ⚠️ 核心修复：挂起图片与本条内容**同一条**发出，而非让图片单独成一条。
+      flushToolImages(combined)
+      if (combined === undefined) wire.push({ role: 'user', content: text })
     }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 的结果同样会让后端 400。
@@ -566,7 +630,14 @@ function serializeMessages(
             .filter((part) => part.type === 'text')
             .map((part) => String(part.text))
             .join('')
-          if (joined.length > 0) resultText = joined
+          // ⚠️⚠️ **有图无文时绝不能落到 `(no output)`**（Issue IKLSB8，与
+          // `openai-compat.ts` 同一处同义修复）。`resultParts !== undefined`
+          // 的含义是「该工具结果里有内容」，只是内容**不是文本**；原先只在
+          // `joined` 非空时改写 `resultText`，纯图片型工具结果于是保留初值
+          // `(no output)` ⇒ 模型答「Read 没有返回内容」，用户误判成模型没有
+          // 视觉能力。判据用 `resultParts !== undefined`（**有内容**）而不是
+          // 「有图」：`[image unavailable]` 占位符也走这条腿，它同样不是没有输出。
+          resultText = joined.length > 0 ? joined : TOOL_RESULT_IMAGE_TEXT
         } else {
           resultText = contentToText(result.content) || '(no output)'
         }
@@ -579,8 +650,13 @@ function serializeMessages(
         content: resultText,
       })
     }
+  // ⚠️⚠️ **这里刻意不 flush**（Issue IKLIFH 的关键时序）：图片此刻刚由上面
+    // 的 `pendingToolImages.push` 入队，若在此发出就会**单独成一条** user
+    // 消息，而提问在再下一条 ⇒ 上游让模型「看不见」。留给下一条 user 消息搭车。
   }
-  flushToolImages()
+  // 历史末尾的残留：图片与延后正文**必须同一条**，否则上游看不见。
+  flushToolImages(pendingOwnParts)
+  pendingOwnParts = undefined
   return wire
 }
 
@@ -728,6 +804,13 @@ export class LobsteraiAdapter extends LlmAdapter {
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: LobsteraiRemoteModel[] | undefined
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -761,6 +844,17 @@ export class LobsteraiAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+         * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
         // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`：
         // 「宁可少报能力，也不要报一个服务端不认的模态」）。
         unknownModelInputModalities: () => ['text'] as const,
@@ -782,20 +876,33 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   /**
-   * 懒加载远端模型目录（仅拉取一次）。
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
    *
    * `listModels` 与 `resolveModel` 共用：`resolveModel` 可能先于 `listModels`
    * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
+    if (fetchRemote === undefined) return
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    // ⚠️ **入口用 `isCatalogFreshFor`**：用户在 Jet Hub 改开关后要**立即**重拉
+    //    （规格 §6 的正确性要求，见 `invalidateCatalogCache`）。本方法只有这一处
+    //    判据，且它在 gate **之前**（拉不到就用旧值），故整条路径都安全。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       if (models.length === 0) return false
       this.remoteModels = models
       this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       return true
     })
   }
@@ -889,6 +996,21 @@ export class LobsteraiAdapter extends LlmAdapter {
    * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
    * `src/model-catalog.ts`，此处只剩委托。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }

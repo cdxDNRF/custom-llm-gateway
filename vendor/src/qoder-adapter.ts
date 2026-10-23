@@ -23,13 +23,23 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { randomUUID } from 'node:crypto'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
+// ⚠️ 原生搜索的契约来自**契约文件**（不是工具层 `web-native.ts`）：
+//    避免「渠道层 import 工具层」的反向依赖，见 `native-search-contract.ts` 模块头。
+import { classifyNativeAbort, NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
+// ⚠️ `errorMessage` 只留**一份**实现（`openai-compat.ts`）：本仓库原有 6 份同义
+//    实现，PR95 审计时确认为「该腿的唯一实现」，新代码一律从这里取
+//    （与 `detailFieldText` 同一条铁律，见 `buddy-adapter.ts` 的同款注释）。
+import { errorMessage } from './openai-compat.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
@@ -128,7 +138,12 @@ export const PROVIDER = 'qoder'
  *
  * ⚠️ DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化），
  * 所以这里给中文就是中文界面 —— 与 Qoder IDE 逐字一致。
- * ⚠️ `minimal` 当前目录未下发，但白名单 `Qj` 里有，保留以备上游启用。
+ *
+ * ⚠️ **`minimal` 是「有显示名、但不在线上白名单里」的一格**（2026-10-20 复核）：
+ * 官方产物里 i18n 有 `minimal:最小`，而**档位白名单 `k3` 只有 6 个值、不含它**
+ * （见 `qoder-catalog.ts` 的 `EFFORT_WHITELIST`）。本表保留它只为「万一上游
+ * 真下发时别显示成裸 id」；**不要**据此把它加回白名单 —— 那会让 UI 渲染出一个
+ * 官方客户端会静默丢弃的档位。
  */
 const QODER_EFFORT_NAMES: Readonly<Record<string, string>> = {
   none: '关闭思考',
@@ -384,6 +399,16 @@ function resolveChunkTimeoutMs(): number {
   return Number.parseInt(process.env.DSH_QODER_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
 }
 
+/**
+ * 单次原生搜索请求的预算（毫秒）。
+ *
+ * ⚠️ **与 `buddy-adapter.ts` 的 `NATIVE_SEARCH_TIMEOUT_MS` 同值同义**（两边各写
+ * 一份是刻意的：两者的模块依赖方向不同，且都属「渠道层自己的预算」；
+ * 共享会诱使渠道层去 import 工具层 —— 见 `native-search-contract.ts` 模块头）。
+ * 20s 与官方客户端 `WEB_SEARCH_TIMEOUT_MS = 2e4` 对齐。
+ */
+const NATIVE_SEARCH_TIMEOUT_MS = 20_000
+
 /** `QoderAdapter` 的构造选项。 */
 export interface QoderAdapterOptions {
   /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
@@ -449,38 +474,120 @@ export interface QoderAdapterOptions {
    * 「等了几次、每次多久」，并在毫秒级完成。
    */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  /**
+   * 「远端模型目录已落地」的回调。
+   *
+   * ⚠️ **必须由接线层注入 `broadcastCatalogChanged(ctx)`**（`registerQoderLlm`
+   * 已代劳）：DSH 客户端把目录缓存在 `status === 'ready'` 即短路的 store 里，
+   * 只有收到 `llm/adapters-updated` 才重读 ⇒ 远端目录异步落地后不广播，
+   * 模型选择器会**永久**停留在冷启动那份兜底表上（`catalog-broadcast.ts` 记着
+   * 这条真实症状：设置页 5 个模型、对话框只剩 2 个）。
+   */
+  onCatalogLoaded?: () => void
+  /**
+   * 目录读取失败的告警出口（缺省静默）。
+   *
+   * ⚠️ 与「失败即回退兜底表」配套：回退是**静默**的，没有这条日志就没有
+   * 任何证据表明上游目录取不到（只剩「倍率不更新」这种无信息的症状）。
+   */
+  warn?: (message: string) => void
+  /** 注入的时钟（测试用；缺省 `Date.now`）。 */
+  now?: () => number
+  /**
+   * 拉取**远端模型目录**（由接线层注入 `QoderAuth.fetchModels(pool)`）。
+   *
+   * ## ⚠️ 为什么是「注入一个取数函数」而不是适配器自己解析凭据
+   *
+   * 适配器手上的取凭据入口是 `resolveCredential`，而它**有副作用**：
+   * 选中账号时会 `reportAccount(id)`（接线层据此维护「本次实际使用的账号」，
+   * 供额度报错时标记）。目录请求是**周期性**的 —— 20 分钟刷新器可能在一次
+   * 聊天请求选号之后跑到，把那个记录**改写成目录用的账号** ⇒ 额度标记落到
+   * 无辜账号上（真实后果见 `index.ts` 的 `activeQoderAccountId` 注释）。
+   *
+   * 故与其余 11 家同形：由 auth 服务做**只读**取号 + 拉取，适配器只拿结果。
+   *
+   * 省略时**不发远端请求**（恒用兜底表）—— 纯测试/未接线场景的安全默认。
+   */
+  fetchRemoteModels?: () => Promise<readonly QoderFallbackModel[]>
 }
 
 /** Qoder 模型适配器。使用 Bearer access_token 鉴权，仅支持 SSE。 */
 export class QoderAdapter extends LlmAdapter {
   private readonly product: QoderProduct
   private readonly fetchImpl: typeof fetch
-  /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
-  private readonly fallbackIndex: ReadonlyMap<string, QoderFallbackModel>
   /**
    * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
    * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
    * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据 + 倍率格式）。
    */
   private readonly catalog: ModelCatalog
+  /**
+   * **远端**模型目录缓存（成功拉取后保留 20 分钟）。
+   *
+   * ⚠️ 2026-10-20 前本家**恒用编译期兜底表**（一次远端请求都不发），
+   * 上游改价/改免费额度/上下架模型都不会反映 —— 用户报障
+   * 「DeepSeek-Flash 上游已经 0×（免费）了，插件还显示 0.1」。
+   * 现在远端优先、兜底表只作回退（见 `src/qoder-catalog.ts`）。
+   */
+  private remoteModels: QoderFallbackModel[] | undefined
+  /**
+   * 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：前者存「有哪些模型」，
+   * 本字段存「何时读到的」（只有前者的目录永不刷新）。
+   */
+  private catalogAt = 0
+  /** 目录加载闸门：并发去重 + 失败/空结果冷却。 */
+  private readonly catalogGate: RemoteCatalogGate
+  /**
+   * **静态兜底表专用**的第二套骨架（只在 `resolveModel` 的并集回退里用）。
+   *
+   * ⚠️ 存在的唯一理由：`resolveModel` 与 `listModels` 共用 `loadCatalog()`，
+   * 而前者要「远端 ∪ 静态表」、后者要「远端独占」。故把静态表也包成一套
+   * `ModelCatalog`，让**骨架自己的装配逻辑**（裸名/context/reasoning）
+   * 复用到回退路径上，而不是在适配器里重写一遍。
+   * `loadCatalog` / `syncCatalog` 都是同步静态表 ⇒ 零网络。
+   */
+  private readonly fallbackCatalog: ModelCatalog
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
     this.product = options.product ?? QODER
     this.fetchImpl = options.fetchImpl ?? fetch
-    this.fallbackIndex = new Map(
-      (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
     )
     // ⚠️ 共享骨架（Task 7b）：门控 → 读目录 → 黑名单 → 回填 → 三态。
-    // ⚠️ 本家恒用**本地兜底表**（不发网络请求）⇒ 两个取数回调是同一份。
+    // ⚠️ `loadCatalog` 走**远端优先**（内有新鲜度判据），`syncCatalog` 是**同步**
+    //    视图（远端未落地时回退兜底表）—— 两者分工见 `ModelCatalogConfig` 的注释。
     this.catalog = createModelCatalog(
       { accountPool: options.accountPool },
       {
         product: this.product,
-        loadCatalog: () => this.catalogEntries(),
+        loadCatalog: () => this.loadCatalogEntries(),
         // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
         unknownModelInputModalities: () => ['text'] as const,
-        syncCatalog: () => this.catalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（后台 20 分钟刷新器 + 「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者自带新鲜度判据 ⇒ 新鲜时**不拉**；
+         * 本回调要的是「无视新鲜度，强制拉一次」。故先清时刻再调同一方法
+         * —— **不另写一份拉取逻辑**（两条路的上游行为才不会分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
+      },
+    )
+    this.fallbackCatalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.fallbackEntries(),
+        syncCatalog: () => this.fallbackEntries(),
+        unknownModelInputModalities: () => ['text'] as const,
       },
     )
   }
@@ -508,6 +615,237 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
+   * 复用本适配器**同一套**选号编排解析凭据（供插件内部的原生搜索使用）。
+   *
+   * ## 为什么需要这个转发方法
+   *
+   * `options` 是构造器的 `private readonly`，插件其余模块从外部读
+   * `adapter.options.resolveCredential` 会**编译失败**（`strict: true`）。
+   * 而原生搜索**必须**与聊天链路用同一个 `resolveCredential` 实例 ——
+   * 另建一份会让「enabled 过滤 / 模型级限流 / 免费判定 / 余额分档 / 池兜底 /
+   * 账本回报」这六步在两条链路上漂移（与 `BuddyAdapter.resolveCredentialFor`
+   * 同款理由）。
+   *
+   * ⚠️ `modelId` **必须透传**：它同时决定模型级限流过滤与免费判定，
+   * 吞掉会让搜索选到聊天链路不会选的号（例如正在限流期的号）。
+   *
+   * @param modelId - 本次请求的模型 id（取自当前会话路由）。
+   * @returns 选中账号的凭据；无可用账号时为 `undefined`。
+   */
+  async resolveCredentialFor(modelId: string | undefined): Promise<QoderCredential | undefined> {
+    return await this.options.resolveCredential(modelId)
+  }
+
+  /**
+   * 原生搜索：执行**一次单 query**，返回投影成官方 `sources[]` 形态的结果。
+   *
+   * ## 协议（全部来自官方客户端源码 + 真机实测，2026-10-14）
+   *
+   * | 项 | 值 |
+   * |---|---|
+   * | host | 本产品的 `encryptedInferBase`（CN `gateway.qoder.com.cn`；国际实测 `center.qoder.sh` / `api2.qoder.sh` 均可） |
+   * | path | `/api/v1/webSearch/oneSearch` |
+   * | body | `{ payload: JSON.stringify({query, timeRange:'NoLimit', contents:{...}}), encodeVersion:'1' }` |
+   * | 信封 | body 由 **WASM 加密**；请求头由 `prepareRequest` 生成（含 `Authorization: Bearer COSY.<载荷>.<签名>`） |
+   * | 响应 | `{ requestId, pageItems: [{title, link, snippet, publishedTime, hostname, hostLogo}], searchInformation }` |
+   *
+   * 官方客户端对应实现（`qoder-worker-runtime` 的 `tPl` / `APl` / `$rA`）：
+   * ```js
+   * let n = i.prepareRequest(A, e, "POST", "auth", t, void 0)
+   * return { url: n.url, headers: kc(n.headers), body: n.body ?? t, free: () => n.free() }
+   * ```
+   *
+   * ## ⚠️ 三个必须遵守的点
+   *
+   * 1. **`QoderEncryptedInfer` 每次建、每次 `dispose()`**：`gluePromise` 是进程级
+   *    单例，`QoderContext` 是 wasm 堆上的 Rust 对象，不释放会让堆只增不减，
+   *    长上下文会话最终以裸 `RuntimeError: unreachable` 暴毙（真实事故史见
+   *    `qoder-wasm.ts` 文件头）。用 `try/finally` 而非顺序调用。
+   * 2. **`publishedTime` / `hostname` / `hostLogo` 一律丢弃**：官方 output schema
+   *    有 `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
+   *    `ToolOutputError`，**整条调用失败**（不是少一条结果）。
+   *    ⚠️ **但 `publishedTime` 其实有对应字段**（PR95 审计修正）：官方
+   *    `dsh-tool-web` 的 output schema 与 seam 的 `WebSearchSource` **都**声明了
+   *    可选的 `publishedAt?: string`（语义就是「provider 给的发布时间戳」）。
+   *    原注释把三个字段一锅端说成「schema 不允许」，那对 `hostname` /
+   *    `hostLogo` 成立，对 `publishedTime` **不成立**。
+   *    ⚠️ **本次仍照原样丢弃**：接它需要先确认 Qoder 的 `publishedTime` 确实是
+   *    ISO-8601 字符串（seam 的类型注释如此声明，但我们**没有真机取证**），
+   *    而接错的后果是整条调用失败（`ToolOutputError`）—— 收益（多一列时间）远
+   *    小于风险。**待办**：取一次真实响应确认格式后再接。
+   * 3. **`X-Session-ID` 用随机 UUID**：实测不传也能 200，但官方客户端会带；
+   *    这里跟随官方行为。它与账号无关，只是会话标识。
+   * 4. **自己 arm 一份 20s 预算**（PR95 审计修正）：只透传 `signal` 会让
+   *    `NativeSearchCodes.timeout` / `aborted` 在本路径永不产生，而契约注释却
+   *    声称「各适配器 20s 预算小于官方 30s」⇒ 注释与实现不符。
+   *
+   * @param query - 单个查询串（已由工具层 trim + 去重）。
+   * @param credential - `resolveCredentialFor` 的返回值（本方法自己收窄）。
+   * @param signal - 取消信号（工具层传多 query 的 batch signal）。
+   */
+  async searchOnce(query: string, credential: unknown, signal: AbortSignal): Promise<NativeSource[]> {
+    const c = credential as QoderCredential | undefined
+    const accessToken = typeof c?.security_oauth_token === 'string' && c.security_oauth_token.length > 0
+      ? c.security_oauth_token
+      : (typeof c?.access_token === 'string' ? c.access_token : '')
+    if (accessToken.length === 0 || typeof c?.machine_id !== 'string' || c.machine_id.length === 0) {
+      throw new WebNativeError(
+        `${this.product.id} search has no usable account; sign in to a ${this.product.id} account `
+        + `from the Jet Hub panel first. The current route is "${this.product.id}". `
+        + 'Only the user can change accounts.',
+        NativeSearchCodes.noAccount,
+      )
+    }
+
+    const host = this.product.encryptedInferBase
+    const endpoint = `${host}/api/v1/webSearch/oneSearch`
+
+    // ⚠️ 每次新建 + `finally` 释放（理由见上方第 1 点）。
+    let client: QoderEncryptedInfer | undefined
+    try {
+      client = await QoderEncryptedInfer.create({
+        user: { uid: c.uid ?? '', securityOauthToken: accessToken },
+        machineId: c.machine_id,
+        metadata: { ...this.product.clientMetadata },
+        host,
+      })
+
+      // ① 构造 payload（照官方 `WebSearchTool` 的字段与默认值）
+      const payload = {
+        query,
+        timeRange: 'NoLimit',
+        contents: { mainText: false, markdownText: false, summary: false },
+      }
+      // ② 信封（官方的 `{ payload, encodeVersion }`）
+      const bodyJson = JSON.stringify({ payload: JSON.stringify(payload), encodeVersion: '1' })
+      // ③ 签名（WASM 生成 url + 全套 Cosy-* 头）
+      const req = client.prepareRequest(host, '/api/v1/webSearch/oneSearch', 'POST', 'auth', bodyJson, undefined)
+
+      // ④ 发送（headers 原样透传；`X-Session-ID` 跟随官方行为）
+      // ⚠️ 用 `this.fetchImpl`（可注入）而不是模块级 `fetch`：单测要拦上游，
+      //    而这一层**必须**用真 WASM 生成签名（签名无法 mock），故只能换 fetch。
+      //
+      // ⚠️⚠️ **必须自己 arm 一份预算**（PR95 审计修正的真实缺口）：本模块此前
+      //    只透传 `signal`，于是 `NativeSearchCodes.timeout` / `aborted` 在 Qoder
+      //    路径**永不产生**，而契约注释却声称「各适配器的 20s 预算小于官方 30s」
+      //    —— 注释与实现不符（buddy 有、qoder 没有）。用 `AbortSignal.any` 熔合
+      //    调用方取消、外层 deadline 与本预算三者。
+      const timeout = AbortSignal.timeout(NATIVE_SEARCH_TIMEOUT_MS)
+      const composed = AbortSignal.any([signal, timeout])
+
+      let response: Response
+      try {
+        response = await this.fetchImpl(req.url, {
+          method: 'POST',
+          headers: { ...req.headers, 'X-Session-ID': randomUUID() },
+          body: req.body,
+          signal: composed,
+        })
+      } catch (error) {
+        // ⚠️ 归因读 `signal.reason` 的形状，**不能先判 `signal.aborted`**：
+        //    外层 `tool-call-timeout-policy` 的 deadline 到期时布尔值同样为真。
+        //    判据与实测对照见 `native-search-contract.ts` 的 `classifyNativeAbort`。
+        const stop = classifyNativeAbort(composed)
+        if (stop === 'aborted') {
+          throw new WebNativeError(`${this.product.id} search aborted`, NativeSearchCodes.aborted, { cause: error })
+        }
+        if (stop === 'timeout') {
+          const budget = timeout.aborted
+            ? `after ${NATIVE_SEARCH_TIMEOUT_MS}ms`
+            : 'before this search returned (the host tool budget elapsed)'
+          throw new WebNativeError(
+            `${this.product.id} search timed out ${budget}.\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Search uses the same account as chat but a separate endpoint. '
+            + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',
+            NativeSearchCodes.timeout,
+            { cause: error },
+          )
+        }
+        // 非 abort 的传输失败（DNS / TLS / 连接重置）：归 `upstream`，
+        // 与 buddy 的 `transport error` 腿同口径。
+        throw new WebNativeError(
+          `${this.product.id} search request failed: ${errorMessage(error)}\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Search uses the same account as chat but a separate endpoint. '
+          + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.',
+          NativeSearchCodes.upstream,
+          { cause: error },
+        )
+      }
+
+      if (!response.ok) {
+        const detail = await readQoderErrorDetail(response)
+        throw new WebNativeError(
+          `${this.product.id} search request failed (HTTP ${response.status})${detail}\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Search uses the same account as chat but a separate endpoint. '
+          + "If the account's sign-in has expired, guide the user to sign in again from the Jet Hub panel; "
+          + 'the endpoint does not need changing.',
+          NativeSearchCodes.upstream,
+        )
+      }
+
+      let json: unknown
+      try {
+        json = await response.json()
+      } catch (error) {
+        throw new WebNativeError(
+          `${this.product.id} returned a non-JSON search response.\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Expected a JSON body with { pageItems: [{ title, link, snippet }] }.',
+          NativeSearchCodes.badResponse,
+          { cause: error },
+        )
+      }
+
+      // ⚠️ 响应体先过 `asRecord`：JSON `null` 时直接读 `.pageItems` 会抛
+      //    `TypeError`，而我们想要的是「响应无法解析」这条业务错误。
+      const record = asRecord(json)
+      const items = record?.pageItems ?? record?.page_items
+      if (!Array.isArray(items)) {
+        throw new WebNativeError(
+          `${this.product.id} returned an unparseable search response: "pageItems" is not an array.\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Expected { pageItems: [{ title, link, snippet }] }. '
+          + 'This usually means the upstream API changed, or the account lacks search permission.',
+          NativeSearchCodes.badResponse,
+        )
+      }
+
+      const sources: NativeSource[] = []
+      for (const raw of items) {
+        // ⚠️ 必须先挡 `null` / 非对象：`pageItems: [null]` 时读 `.link` 会抛
+        //    `TypeError`，导致**整条工具调用**失败，与本段意图（畸形条目丢弃）相反。
+        const item = asRecord(raw)
+        if (item === undefined) continue
+        // ⚠️ Qoder 的 url 字段叫 **`link`**（不是腾讯的 `url`）。
+        const url = typeof item.link === 'string' ? item.link : ''
+        // ⚠️ `url` 是官方 schema 必填项；给不出 url 的条目直接丢弃，
+        //    否则 `createSuccessResult` 会抛 `ToolOutputError`（整条调用失败）。
+        if (url.length === 0) continue
+        const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : undefined
+        const snippet = typeof item.snippet === 'string' && item.snippet.length > 0 ? item.snippet : undefined
+        sources.push({
+          url,
+          ...title === undefined ? {} : { title },
+          ...snippet === undefined ? {} : { snippet },
+        })
+      }
+      return sources
+    } catch (error) {
+      // ⚠️ wasm trap（裸 `unreachable`）必须被改写成人话（与聊天链路同款处理
+      //    见 `src/qoder-adapter.ts` 的 `buildRequest`）。
+      throw describeWasmFailure(error)
+    } finally {
+      // 🔴 **释放失败绝不能顶替 `try` 块里的原始错误**（真实缺陷，2026-10-12 审计）：
+      //    JS 的 `finally` 里 `throw` 会**无条件覆盖** `try` 里的 `throw`。
+      //    而 `dispose()` → `freePointer()` 的 catch 里确实会 rethrow。
+      try { client?.dispose?.() } catch { /* 静默：不覆盖原始错误 */ }
+    }
+  }
+
+  /**
    * 描述本适配器拥有的 provider 路由。
    *
    * 对入参做防御性归一化：DSH 会强制校验 `info.id === provider`，而模型设置页
@@ -521,16 +859,53 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
+   * 按 id 取**当前**目录条目（远端优先，回退编译期兜底表）。
+   *
+   * ⚠️ **不能用构造期的静态索引**：只存在于远端的模型（如 `fast`）查静态表会得到
+   * 「未知」，而本方法与 `stream()` 都把它当**能力判据**用 —— `accio` 记过同款教训
+   * （把「未知」当「明确不支持」会让能力**静默变窄**：图片被拒、档位消失）。
+   */
+  /**
+   * 按 id 取条目，供**能力/元数据**判据使用：**远端优先，未命中回退编译期兜底表**。
+   *
+   * ## ⚠️⚠️ 为什么必须是「两份目录的并集」，而不是只用远端
+   *
+   * 第一版把它写成 `catalogSource().find(...)`（远端落地后静态表完全不参与），
+   * 被独立审计打穿（缺陷 1，已复现）：**远端目录是「按账号」下发的**，
+   * 一个免费额度号只拿到 2 条；此时静态表里其它 15 条模型会被判成「未知」
+   * ⇒ `inputModalitiesFor` 报 `['text']` ⇒ `stream()` **硬拒图片**
+   * （`UNSUPPORTED_CONTENT`），同时 `resolveModel` 的 name 退化成裸 id、
+   * `context`/`reasoning` 消失、请求体的 `display_name`/`max_input_tokens`/
+   * `is_reasoning` 一并退化。
+   *
+   * | 场景 | 只查远端（第一版） | 并集（现行） |
+   * |---|---|---|
+   * | `dmodel` + 远端大目录 | ✅ | ✅ 远端优先 |
+   * | `dmodel` + 远端只剩 2 条（免费号） | ❌ 硬拒图片 + 元数据退化 | ✅ 回退静态表 |
+   * | `fast`（只在远端有） | ✅ | ✅ 远端命中 |
+   *
+   * ⚠️ **菜单（`listModels`）仍以远端为准** —— 这条并集只作用于
+   * 「能力/元数据判据」，不改变「有哪些模型可选」。本仓同型铁律见
+   * `docs/agent-notes/client-ui.md` 的「判『某个 id 在不在目录里』时两个目录
+   * 来源必须取并集」（Issue IKJW33）：让**能力**判据取并集，让**可选项**保持单一来源。
+   */
+  private catalogModel(id: string): QoderFallbackModel | undefined {
+    return this.catalogSource().find((model) => model.id === id)
+      ?? this.product.fallbackModels.find((model) => model.id === id)
+  }
+
+  /**
    * 模型接受的输入模态。
    *
-   * 按**模型**判定（兜底表的 `supportsImage`），不是按 provider 一刀切。
+   * 按**模型**判定（目录条目的 `supportsImage`），不是按 provider 一刀切。
    * 未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
    * 也不要报一个服务端不认的模态（请求会失败）。
    *
-   * ⚠️ 兜底表是本地估计值，不是远端权威数据 —— 见 `qoder-product.ts` 的说明。
+   * ⚠️ 判据取自 `catalogModel()`（**远端 ∪ 静态表**）—— 只取远端会让
+   * 「按账号收缩的目录」把静态表里已知的模型判成未知（见该方法的表）。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    return this.fallbackIndex.get(model)?.supportsImage === true ? ['text', 'image'] : ['text']
+    return this.catalogModel(model)?.supportsImage === true ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -547,18 +922,22 @@ export class QoderAdapter extends LlmAdapter {
    * （以「模型目录。」开头、讲「Qoder 的模型列表端点需要 WASM 签名」）——
    * 它本来是某个已被删掉的方法的文档，删方法时留下了壳。
    * 它与紧邻的本块连在一起看像「同一个方法有两套互相矛盾的文档」。
-   * 已删除；那段内容里仍然有效的部分（恒用产品兜底表、不发网络请求）
-   * 在下面 `toCatalogEntry` 的注释里。
+   * 已删除。
+   *
+   * ⚠️ **那段旧文档里「恒用产品兜底表、不发网络请求」这句已于 2026-10-20 作废**：
+   * 本家现在与其余 12 家同形 —— 远端优先（`src/qoder-catalog.ts`）、
+   * 兜底表只作回退。见 `catalogSource()` 的注释。
    */
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }
 
   /**
-   * 把本家兜底表条目转成共享骨架的中间结构。
+   * 把本家目录条目（**远端优先**，回退兜底表）转成共享骨架的中间结构。
    *
-   * ⚠️ 本家**恒用本地兜底表**（不发网络请求，见 `listModels` 的说明），
-   * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+   * ⚠️ 远端条目经 `src/qoder-catalog.ts` 归一成与兜底表**同形**的结构后才到这里
+   * ⇒ 倍率/档位/能力三条判据对两条来源**完全同源**（不会出现「远端少了某个
+   * 字段于是倍率不显示」这类分叉）。
    */
   private toCatalogEntry(model: QoderFallbackModel): CatalogEntry {
     const reasoning = this.reasoningForEntry(model)
@@ -575,6 +954,16 @@ export class QoderAdapter extends LlmAdapter {
       inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
       ...model.contextWindow > 0 ? { contextWindow: model.contextWindow } : {},
       ...reasoning !== undefined ? { reasoning } : {},
+      /**
+       * ⚠️ **必须透出**（缺陷 2，2026-10-20 审计）：Jet Hub 的「免费额度」分组
+       * **只**认 `model.isFree === true`（`plugin-src/client/model-groups.js`），
+       * 而 `cline-adapter.ts` 的成文约定也是「`isFree` 必须透出」。
+       *
+       * 改造前本家从未写这个键 ⇒ 免费模型**全被归进「按量计费」**；
+       * 改造后解析层（`qoder-catalog.ts`）已产出 `isFree`，但装配层漏了，
+       * 于是端到端仍只到「展示名里带 `· 免费`」为止。
+       */
+      ...model.isFree === true ? { isFree: true } : {},
     }
   }
 
@@ -608,8 +997,173 @@ export class QoderAdapter extends LlmAdapter {
     }
   }
 
-  private catalogEntries(): readonly CatalogEntry[] {
+  /**
+   * 目录来源：**远端优先**，未落地时回退编译期兜底表。
+   *
+   * ⚠️ 回退不是「优化」而是**必需**：纯插件用户（或上游目录接口故障时）
+   * 若目录为空，DSH 的 `buildModelCatalog` 会把该 provider 判成「没有模型」
+   * 而**整个隐藏**（`providerCatalogVisible` 之外的第二层门）。
+   */
+  private catalogSource(): readonly QoderFallbackModel[] {
+    return this.remoteModels ?? this.product.fallbackModels
+  }
+
+  /** 同步视图（`listAllModels()` 与 `CatalogEntry` 转换共用）。 */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return this.catalogSource().map((model) => this.toCatalogEntry(model))
+  }
+
+  /** 编译期兜底表的条目视图（第二套骨架专用；同步、零网络）。 */
+  private fallbackEntries(): readonly CatalogEntry[] {
     return this.product.fallbackModels.map((model) => this.toCatalogEntry(model))
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    await this.ensureRemoteModels()
+    return this.syncCatalogEntries()
+  }
+
+  /**
+   * 该模型是否**消耗 0 积分**（免费额度模型）。
+   *
+   * ## 为什么必须有这个方法（真实报障 2026-10-21）
+   *
+   * 用户开着「锁定永久积分」，用**免费模型**（CN `Qwen3.8-Flash` / `DeepSeek-Flash`、
+   * 国际版 `Qwen3.8-Max` / `Qwen3.8-Flash`）请求，却报「没有可用账号 ⋯ 当前账号的
+   * 额度都属于长期 / 永久」。
+   *
+   * 根因：`src/credential-resolver.ts:368` 的免费短路**只在 `plan.isFreeModel`
+   * 存在时**才可能命中。本家装配层（`src/index.ts` 的两处 `balance:`）**从未传
+   * `isFreeModel`** ⇒ 免费模型与付费模型走同一条余额分档路 ⇒ 锁定期间被
+   * `allowPermanent=false` 一并拦下。报出的错误还**自相矛盾**：免费模型既不扣
+   * 临时也不扣永久积分，说它「额度都是永久的」毫无意义。
+   *
+   * 这与 buddy / trae 的成文教训是同一个（`credential-resolver.ts:359-365` 的
+   * 长注释记录了 buddy 那次报障）：**保护永久积分的闸门不该拦免费模型**。
+   *
+   * ## 判据：只认目录里明确的 `isFree`
+   *
+   * - 两条来源（远端目录 / 编译期兜底表）**同源**：`src/qoder-catalog.ts` 的
+   *   `qoderRemoteModelToFallback()` 已把远端 `is_free` 归一成 `isFree` 并透出
+   *   （`:425`），与兜底表的 `isFree: true` 是同一个字段 ⇒ 不存在「远端少了字段
+   *   于是判不出免费」这种分叉。
+   * - ⚠️ **不用 `priceFactor === 0` 代替**：`priceFactor` 是「计费倍率」，它等于 0
+   *   与「这个模型免费」在本家是两条独立信号（CN `dfmodel` 就是
+   *   `priceFactor: 0` + `isFree: true`，而国际版 `qmodel_38max` 是
+   *   `isFree: true` + `priceFactor: 0.2` —— **免费但倍率非 0**）。用倍率推断免费
+   *   会漏掉后者、并把倍率解析失败（undefined）误判成免费。
+   * - **只在确定免费时返回 true**：查不到目录 / 解析失败一律 false。方向保守 ——
+   *   宁可多走一次余额门（用户至多多一次网络请求），也不要把付费模型误判成免费
+   *   （那会**真的烧掉永久积分**，是不可逆损失）。与 `BuddyAdapter.isFreeModel`
+   *   同一约定。
+   * - ⚠️ 远端目录懒加载，**必须先 `await ensureRemoteModels()`**：否则「直接进
+   *   会话」等路径尚未加载目录，会静默退回被拦截的行为（trae 的同款教训见
+   *   `TraeAdapter.isFreeModel` 的注释）。
+   *
+   * @param modelId - 模型 id（目录 key，如 `qfmodel`）。
+   * @returns true 仅当目录明确标记 `is_free`。
+   */
+  async isFreeModel(modelId: string | undefined): Promise<boolean> {
+    if (typeof modelId !== 'string' || modelId.length === 0) return false
+    await this.ensureRemoteModels()
+    // ⚠️⚠️ **必须走 `catalogModel()`（远端 ∪ 静态表），不得走 `catalogSource()`**
+    // （2026-10-21 合并审计发现，阻断级；本节实现初版就是 `catalogSource().find(…)`
+    //  —— 与 {@link catalogModel} 的注释里记过的那个「缺陷 1」**逐字同型**）。
+    //
+    // ## 为什么
+    //
+    // 远端目录是**按账号**下发的：免费额度号实测只拿到 **2 条**
+    // （`qfmodel` + `dfmodel`，见 `docs/agent-notes/providers-qoder.md`）。
+    // 而 `catalogSource()` 是 `remoteModels ?? fallbackModels` —— 远端**一旦落地
+    // 就把静态表整体顶掉** ⇒ 静态表里其余那些标了 `isFree: true` 的模型被判成
+    // 「未知 ⇒ 非免费」。
+    //
+    // ## 后果（实测复现，2026-10-21）
+    //
+    // 免费模型被判收费 ⇒ 跳过 `credential-resolver.ts` 的「免费模型不受锁定约束」
+    // 短路 ⇒ 锁定永久积分时被 `allowPermanent=false` 拦下、报出
+    // 「额度都属于永久」这类**与事实相反**的错误 —— 正是本家 2026-10-21
+    // 真实报障（`src/index.ts` 的 qoder 文案把用户推向「解锁永久积分」）
+    // **原地复发**，且**零日志**。
+    //
+    // 实测（`lib/` 重建后真跑 `isFreeModel`）：
+    // ```
+    // ①远端收缩目录（无免费） isFreeModel(qmodel_38max) = false   ★ 应为 true
+    // ①远端收缩目录（无免费） isFreeModel(qfmodel)       = false   ★ 应为 true
+    // ②远端只含 qmodel_38max isFreeModel(qfmodel)       = false   ★ 应为 true
+    // ③未接线远端            isFreeModel(qmodel_38max) = true    ✓
+    // ```
+    //
+    // ⚠️ 同一模型的两条判据自相矛盾：`resolveModel()`（走并集）会正常给出
+    //    `Qwen3.8-Flash`，而本方法说它「不是免费」。
+    //
+    // ⚠️ 方向是不对称的：判**收费**只是让用户用不上（可恢复）；
+    //    判**免费**会绕过锁定**真烧掉永久积分**（不可逆）。
+    //    故这里用并集是「远端优先、静态表兜底」——**不会**把收费模型判成免费
+    //    （兜底表的 `isFree` 是策展过的显式标记，不是推断）。
+    return this.catalogModel(modelId)?.isFree === true
+  }
+
+  /**
+   * 懒加载远端模型目录（**每 20 分钟**一次；失败/空结果走闸门冷却）。
+   *
+   * 三条口径与其余 12 家逐字同构：
+   * 1. 入口用 `isCatalogFreshFor`（多一条「用户刚改设置⇒立即失效」的正交腿）；
+   * 2. 并发去重与失败冷却交给 `RemoteCatalogGate`（同一份实现，不自己写判据）；
+   * 3. **只在成功时**记 `catalogAt`（失败也记会让一次网络抖动把 TTL 上界刷掉，
+   *    下一轮要再等满 20 分钟才发现上游没恢复）。
+   */
+  private async ensureRemoteModels(): Promise<void> {
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.nowImpl())) {
+      return
+    }
+    await this.catalogGate.run(async () => {
+      const models = await this.loadRemoteModels()
+      if (models.length === 0) return false
+      this.remoteModels = [...models]
+      this.catalogAt = this.nowImpl()
+      return true
+    })
+  }
+
+  /**
+   * 真发一次远端目录请求（失败返回空数组，由闸门记冷却）。
+   *
+   * ⚠️ **不在这里解析凭据**：取数是接线层注入的 `fetchRemoteModels`
+   *（= `QoderAuth.fetchModels(pool)`），它只做池的**只读**读取。
+   * 理由见 `QoderAdapterOptions.fetchRemoteModels` 的长注释
+   *（走 `resolveCredential` 会把「本次实际使用的账号」改写成目录用的账号）。
+   */
+  private async loadRemoteModels(): Promise<readonly QoderFallbackModel[]> {
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote === undefined) return []
+    try {
+      return await fetchRemote()
+    } catch (error) {
+      this.options.warn?.(
+        `[qoder] 模型目录读取失败，退用内置兜底表：${errorMessage(error)}`,
+      )
+      return []
+    }
+  }
+
+  private nowImpl(): number {
+    return this.options.now?.() ?? Date.now()
+  }
+
+  /**
+   * ★ **后台目录刷新入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ **必须显式转发** `catalog.refresh`：`ModelCatalog` 上的成员**不会**
+   * 自动变成适配器的成员（`dead-model-store.ts` 的 `pruned()` Proxy 只透传
+   * **适配器自己的**成员）。漏转发 ⇒ 刷新器「已武装」却对本家**空转**，
+   * 且**零日志** —— 这条陷阱在 `accio-adapter.ts` 有逐字记录（`be42b25` 踩过）。
+   * ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**续期）**不是同一件事**，
+   * 两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -617,14 +1171,29 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
-   * 解析模型元信息。
+   * 解析模型元信息（**能力/元数据的并集回退**，见 `catalogModel()` 的表）。
    *
-   * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
-   * （composer 读 `resolveModel().reasoning`）—— 该判据现在由
-   * `toCatalogEntry` 提供（见 `reasoningForEntry`）。
+   * ## ⚠️ 为什么这里要路由到两套目录
+   *
+   * `resolveModel` 与 `listModels` **共用** `loadCatalog()`，但两者的正确口径不同：
+   * - `listModels`（**菜单**）必须**只**给当前账号真能用的模型 ⇒ 远端独占；
+   * - `resolveModel`（**元数据**）必须认识「可能正在被使用、但不在当前账号菜单里」
+   *   的模型（会话开着、目录随账号收缩）⇒ 远端 ∪ 静态表。
+   *
+   * 故：远端目录认识该 id 就照旧走它（新值优先）；不认识而静态表有，就交给
+   * **静态表专用的第二个骨架实例** —— 复用骨架自己的装配逻辑（裸名 / context /
+   * reasoning 三态），**不在这里重写一遍**（那会是同一语义的第二套判据）。
    */
   async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    return this.catalog.resolveModel(provider, model, signal)
+    // ⚠️ **必须先把远端目录拉到位再判路由**（TTL 闸门内是 no-op，零额外请求）：
+    //    冷缓存下 `catalogSource()` 还是静态表，此时远端独有的模型（如 `fast`）
+    //    会被误判成「远端不认识」而路由到兜底骨架 ⇒ 名字退化成裸 id。
+    //    （第一版漏了这一步，被既有用例「远端独有的模型…」当场抓住。）
+    await this.ensureRemoteModels()
+    if (this.catalogSource().some((entry) => entry.id === model)) {
+      return this.catalog.resolveModel(provider, model, signal)
+    }
+    return this.fallbackCatalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -731,7 +1300,7 @@ export class QoderAdapter extends LlmAdapter {
     // （用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
     const tools = buildQoderTools(options.tools)
 
-    const fallback = this.fallbackIndex.get(options.model)
+    const fallback = this.catalogModel(options.model)
 
     /**
      * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
@@ -1228,9 +1797,40 @@ export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
-  const adapter = new QoderAdapter(options)
+  const adapter = new QoderAdapter({
+    ...options,
+    // ⚠️ 两项都**只在调用方没给时**兜底：`onCatalogLoaded` 必须接到广播上
+    //（远端目录异步落地后不广播 ⇒ 模型选择器永久停在冷启动那份兜底表），
+    // `warn` 接 `ctx.logger`（否则「目录读取失败」是一条零日志的静默回退）。
+    onCatalogLoaded: options.onCatalogLoaded ?? (() => { broadcastCatalogChanged(ctx) }),
+    warn: options.warn ?? ((message: string) => { ctx.logger?.warn?.(message) }),
+    product,
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
   return adapter
+}
+
+// ─────────────────────── 原生搜索的支撑（2026-10-14） ───────────────────────
+
+/**
+ * 把未知值收敛成记录；非对象（含 `null`）返回 `undefined`。
+ *
+ * ⚠️ 与「返回 `{}`」不同：原生搜索的逐项过滤需要区分「不是对象」（丢弃）
+ * 与「是空对象」。
+ */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
+/** 从非 2xx 响应里取一段可读的上游说明（截断，且不回显敏感内容）。 */
+async function readQoderErrorDetail(response: Response): Promise<string> {
+  try {
+    const text = await response.text()
+    const trimmed = text.trim().slice(0, 300)
+    return trimmed.length > 0 ? `: ${trimmed}` : ''
+  } catch {
+    return ''
+  }
 }

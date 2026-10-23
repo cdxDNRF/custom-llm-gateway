@@ -44,12 +44,14 @@ import {
 } from './opencode-product.js'
 import { listIdentitySlots, type IdentitySlot } from './opencode-auth.js'
 import { deriveRequestId, deriveSessionId, opencodeHeaders, opencodeUserAgent } from './opencode.js'
-import { buildOpencodePayload } from './opencode-messages.js'
+import { buildOpencodeRequest } from './opencode-messages.js'
+import { normalizeOpencodeResponse } from './opencode-stream.js'
 import {
   getOpencodeCapabilitiesSync, opencodeEffortName, supportsOpencodeImage,
   type OpencodeModelCapability,
 } from './opencode-capability.js'
 import { proxyFetch } from './opencode-proxy.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
@@ -85,6 +87,21 @@ export async function loadOpencodeCatalog(
   slot: IdentitySlot,
   ttlMs: number = DEFAULT_CATALOG_TTL_MS,
 ): Promise<readonly OpencodeCatalogEntry[]> {
+  // ⚠️⚠️ **必须先读能力表**（Issue IKM9LR）：下面的 `isReachableOpencodeModel`
+  //   依赖远端 `provider.api` 注入的可达性表，而注入发生在读能力表的那一刻。
+  //   不先读 ⇒ 冷启动首帧那张表是空的 ⇒ filter 退化成硬编码本地表 ⇒
+  //   远端明明下发了的新模型被挡掉（本 issue 的原症状，**完全静默**）。
+  //   代价只是一次同步读（内存或磁盘文件），不引入任何等待。
+  //
+  // ⚠️⚠️ **这一句是顺序约束的唯一起作用点**（2026-10-17 对抗审计实测澄清）。
+  //   `OpencodeAdapter.listModels` 原本也有一句同款前置读，实测证明那是**冗余**的
+  //   （单独删掉它，全仓 9078+ 条单测仍全绿）⇒ 已删除，避免「两处同款前缀」
+  //   且误导后来人以为改上面那处就够。
+  //   **守卫**（`tests/unit/models-dev-cache.spec.ts` 的端到端用例）正是靠
+  //   删掉**这一句**才变红 —— 它用本地表里没有的 `zzz-brand-new-x` 作断言，
+  //   对「远端表是否生效」敏感（⚠️ 早先那版用 `deepseek-v4.1-flash-free`
+  //   是**恒真**的：那个 id 已被收录进本地兜底表 ⇒ 顺序颠倒也照样绿）。
+  getOpencodeCapabilitiesSync()
   const cached = catalogCache.get(slot.id)
   if (cached !== undefined && ttlMs > 0 && Date.now() - cached.at < ttlMs) return cached.entries
   let entries: readonly OpencodeCatalogEntry[]
@@ -140,8 +157,17 @@ export interface OpencodeAdapterOptions {
   identitySlots: () => Promise<readonly IdentitySlot[]>
   /** 拉远端目录；缺省时直接用兜底表。 */
   fetchRemoteCatalog?: OpencodeCatalogFetcher
-  /** 用户模型黑名单。 */
-  disabledModels?: () => ReadonlySet<string>
+  /**
+   * 账号池（**黑名单、关闭意图的唯一数据源**）。
+   *
+   * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+   * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+   * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
+   *
+   * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+   * **生产接线必须传**（`index.ts` 负责，且有守卫逐家点名）。
+   */
+  accountPool?: import('./account-pool.js').AccountPool
   /** 记录受限的副作用（切槽时由接线层提供）。 */
   markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>
   /** 诊断日志。 */
@@ -208,8 +234,28 @@ export function opencodeRetryAfterMs(
 }
 
 export class OpencodeAdapter extends LlmAdapter {
+  /**
+   * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+   * 模态回填 / 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+   */
+  private readonly skeletonCatalog: ModelCatalog
+
   constructor(private readonly options: OpencodeAdapterOptions) {
     super()
+    // ⚠️⚠️ **`accountPool` 必须是真池**：骨架里 `deps.accountPool?.disabledModelsFor`
+    //    与 `providerClosedFor?.(...)` 全靠它；传 `{}` 或 `undefined` 会让
+    //    `?.` 变成静默 no-op（Gitee IKP8OF 实测过的形态）。
+    this.skeletonCatalog = createModelCatalog(
+      this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool },
+      {
+        product: OPENCODE,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id **保守报 `['text']`**：能力表查不到时把「未知」当「支持」
+        //    会让 DSH 把图片投影成上游不接受的形态（与本文件迁移前口径一致）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
   }
 
   providerInfo(provider: string): LlmProviderInfo {
@@ -244,33 +290,75 @@ export class OpencodeAdapter extends LlmAdapter {
     return OPENCODE_FALLBACK_MODELS.map((m) => ({ id: m.id, name: m.name, isFree: m.isFree }))
   }
 
+  /**
+   * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+   *
+   * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+   *
+   * 迁移前本方法**手写**了四件事：判 `providerClosed`、槽位门控、
+   * 「只有匿名身份时只给免费模型」、过滤 `disabledModels` + 手工 map。
+   * 其中「关闭意图 / 黑名单 / 模态回填 / `provider` 回填」与其余 13 家
+   * **逐字同义** ⇒ 各写一份正是 Gitee IKP8OF 那类漂移缺陷的温床。
+   *
+   * 现在那四条由骨架承担，**本家独有的两条**放进 `loadCatalog`
+   * （`loadCatalogEntries`）：
+   * - 无任何槽位 ⇒ 返回 `[]`（隐藏 provider 分组）；
+   * - **只有匿名身份时只给免费模型**（用户定稿的可见性口径）。
+   *
+   * ⚠️ 模态仍走 `inputModalitiesOf`（**远端能力表**），在 `toCatalogEntry` 里。
+   */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return await this.skeletonCatalog.listModels(_provider)
+  }
+
+  /**
+   * 异步读目录并转成骨架的中间结构。
+   *
+   * ⚠️⚠️ **本家独有门控全在这里**（迁移前它们散在 `listModels` 里）：
+   * ① 无任何槽位 ⇒ `[]`；② 只有匿名身份 ⇒ 只留免费模型。
+   *
+   * ⚠️ **顺序约束**（2026-10-17 对抗审计实测澄清）：能力表注入发生在
+   * `catalog()` 内层（经 `loadOpencodeCatalog`），故这里**不需要**再前置读一次。
+   * 若将来 `catalog()` 出现**不经过 `loadOpencodeCatalog`** 的路径，
+   * 该约束会重新失效 —— 那时必须在这里补回并同时补一条能抓住它的守卫。
+   */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     const slots = await this.options.identitySlots()
-    // 无任何槽 = 连匿名槽都没了（异常态）：返回空数组隐藏 provider 分组，
+    // 无任何槽 = 连匿名槽都没了（异常态）：空目录隐藏 provider 分组，
     // **不抛错**（抛错会多一条 provider 级报错，UI 表现为「供应商加载失败」）。
     if (slots.length === 0) return []
     const all = await this.catalog()
     // ⚠️ 可见性口径（用户定稿）：只有匿名身份时**只给免费模型**。
-    // 免费判定以**远端 models.dev 的 cost** 为准（见 opencode-capability.ts）。
+    // 免费判定以**远端 models.dev 的 cost** 为准（由上面那次读取注入）。
     const hasAccountSlot = slots.some((s) => s.kind === 'account')
-    const visible = hasAccountSlot ? all : all.filter((m) => m.isFree)
-    const disabled = this.options.disabledModels?.() ?? new Set<string>()
-    // ⚠️ **同步**读能力表（不 await）：渲染路径上等网络会让模型选择器一直空白
-    // （真机事故 2026-10-02）。拿不到就按纯文本兜底，后台补齐后会重渲染。
+    const visible = hasAccountSlot ? all : all.filter((m) => isFreeOpencodeModel(m.id))
+    return visible.map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * **同步**全量目录（`listAllModels()` 用）。
+   *
+   * ⚠️ 与 `loadCatalogEntries` 同一套转换口径（否则「设置页看到的」与
+   * 「选择器看到的」会分叉）；差别只在不打网络：这里用兜底表。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return OPENCODE_FALLBACK_MODELS.map((m) => this.toCatalogEntry(m))
+  }
+
+  /** 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。 */
+  private toCatalogEntry(m: OpencodeCatalogEntry): CatalogEntry {
     const capabilities = getOpencodeCapabilitiesSync()
-    return visible
-      .filter((m) => !disabled.has(m.id))
-      .map((m) => ({
-        provider: OPENCODE.id,
-        id: m.id,
-        name: m.name,
-        // ⚠️ 模态以**远端能力表**为准，不再一律 text（用户报障
-        // 「space-bunny-free 发图提示不支持」：该模型实测接受图片，
-        // 而我们硬编码 ['text'] 让 DSH 在本地就把图投影成了文字占位符）。
-        // ⚠️ 能力表拿不到时**保守回退 text**（`inputModalitiesOf` 的实现）——
-        // 声明支持就必须真支持，这是本仓库的硬约定。
-        inputModalities: inputModalitiesOf(capabilities, m.id),
-      }))
+    return {
+      id: m.id,
+      name: m.name,
+      // ⚠️ 模态以**远端能力表**为准，不再一律 text（用户报障
+      // 「space-bunny-free 发图提示不支持」：该模型实测接受图片，
+      // 而我们硬编码 ['text'] 让 DSH 在本地就把图投影成了文字占位符）。
+      // ⚠️ 能力表拿不到时**保守回退 text**（`inputModalitiesOf` 的实现）——
+      // 声明支持就必须真支持，这是本仓库的硬约定。
+      inputModalities: inputModalitiesOf(capabilities, m.id),
+      ...(m.isFree === true ? { isFree: true } : {}),
+    }
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -417,21 +505,16 @@ export class OpencodeAdapter extends LlmAdapter {
         }
         return
       } catch (error) {
+        if (options.signal?.aborted) throw options.signal.reason ?? error
         if (delivered) throw error
-        if (error instanceof LlmError && error.code === 'QUOTA_EXCEEDED') throw error
+        if (error instanceof LlmError && (error.code === 'QUOTA_EXCEEDED' || error.code === 'PERMISSION_DENIED')) throw error
 
         const info = classifyOpencodeFailure(error)
         if (info.kind === 'free_tier') {
-          // ⚠️⚠️ 根因是 **session id 形状**，不是「伪装不被认可」（真实报障
-          // 2026-10-01 定位）。证据：尾段写成 38 字符（12hex + 26 base62）时
-          // 一律 403；改成官方真实的 26 字符（12hex + 14 base62）后**同样的
-          // 请求立刻成功**（`tests/unit/opencode-identity.spec.ts` 有形状回归锁）。
-          //
-          // ⇒ 若这里还收到 FreeTierError，说明形状又错了（或上游加了新门禁）。
-          // **换槽/换 key 无用**（每槽发的形状完全相同），故不重试，
-          // 直接把「形状」这条线索写进文案，便于一眼定位。
+          // V2 同时校验 session 算法、UA/关联头、工具描述与 schema。
+          // 换槽不改变这些协议字段；不得把拒绝原因写死为 session 外形。
           this.options.warn?.(
-            `opencode: 免费通道被 FreeTierError 拒绝 —— 检查 session id 形状（应为 ses_ + 12hex + 14base62）：${info.detail}`,
+            `opencode: 免费通道被 FreeTierError 拒绝 —— 检查 V2 端点、session 算法、UA 与工具 schema：${info.detail}`,
           )
           // ⚠️⚠️ **错误码绝不能取 `AUTH`**（真实缺陷，Gitee issue IKLBSH 归位）。
           //
@@ -456,7 +539,7 @@ export class OpencodeAdapter extends LlmAdapter {
           // 与 `buddy` 的 11140（同样从 `AUTH` 改成 `PERMISSION_DENIED`）同款裁决。
           throw new LlmError(
             `opencode: 免费通道被上游拒绝（FreeTierError）。`
-            + '该错误由请求形状触发（session id 形状不对时出现），换 API key 或换出口都无效。',
+            + '该错误由请求协议门禁触发，请检查 V2 端点、session 算法、请求头及工具描述/schema；换 API key 或换出口都无效。',
             'PERMISSION_DENIED',
             { status: 403 },
           )
@@ -554,7 +637,7 @@ export class OpencodeAdapter extends LlmAdapter {
       declaredEfforts: getOpencodeCapabilitiesSync().find((c) => c.id === options.model)?.efforts ?? [],
       maxTokens: options.maxTokens,
     })
-    const payload = buildOpencodePayload({
+    const request = buildOpencodeRequest({
       model: options.model,
       messages,
       ...options.system !== undefined && options.system.length > 0 ? { system: options.system } : {},
@@ -577,14 +660,28 @@ export class OpencodeAdapter extends LlmAdapter {
     const init: RequestInit = {
       method: 'POST',
       headers,
-      body: JSON.stringify(payload),
+      body: JSON.stringify(request.payload),
       ...options.signal !== undefined ? { signal: options.signal } : {},
     }
     // ⚠️ 走 `proxyFetch` 而不是裸 `fetch`：有代理时它会把请求交给**与
     // dispatcher 同源**的 undici fetch。用全局 fetch 会造成跨实例 handler
     // 契约冲突（Node 22/24 上恒失败），详见 `opencode-proxy.ts` 的 `proxyFetch`。
     // 它内部处理「无代理时退回全局 fetch」，故这里不再自行分支。
-    const response = await proxyFetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init, slot.proxy)
+    // 只约束响应头等待；头到达即撤销定时器，不能误杀长回答。
+    const headerController = new AbortController()
+    const headerTimer = setTimeout(() => headerController.abort(new LlmError('opencode: 等待响应头超时', 'TIMEOUT')), OPENCODE.chatHeaderTimeoutMs)
+    let response: Response
+    try {
+      response = await proxyFetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, {
+        ...init,
+        signal: options.signal === undefined ? headerController.signal : AbortSignal.any([options.signal, headerController.signal]),
+      }, slot.proxy)
+    } catch (error) {
+      if (headerController.signal.aborted) throw headerController.signal.reason
+      throw error
+    } finally {
+      clearTimeout(headerTimer)
+    }
     if (!response.ok) {
       // ⚠️ **必须先读体**：Zen 的限流语义（`GoUsageLimitError`）在响应体里，
       // 而 body 只能读一次 —— 读了不传下去，轮换层就只能按状态码猜，
@@ -606,12 +703,20 @@ export class OpencodeAdapter extends LlmAdapter {
         },
       )
     }
-    yield* consumeOpenAiSse(response, options.signal !== undefined ? { signal: options.signal } : {}, {
-      label: 'opencode',
-      firstTokenTimeoutMs: OPENCODE.chatHeaderTimeoutMs,
-      chunkTimeoutMs: OPENCODE.chatChunkTimeoutMs,
-      ...options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {},
-    })
+    // ⚠️ 传 `warn`：响应层剔除未知/保留/残缺工具名时必须在宿主日志留痕，
+    // 否则「模型不再调工具」会变成一条查不出原因的静默退化。
+    const normalized = normalizeOpencodeResponse(response, request, this.options.warn)
+    try {
+      yield* consumeOpenAiSse(normalized, options.signal !== undefined ? { signal: options.signal } : {}, {
+        label: 'opencode',
+        firstTokenTimeoutMs: OPENCODE.chatHeaderTimeoutMs,
+        chunkTimeoutMs: OPENCODE.chatChunkTimeoutMs,
+        ...options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {},
+      })
+    } finally {
+      // 共享消费器只 releaseLock；提前结束、取消与抛错都由本渠道释放前置流/上游。
+      await normalized.body?.cancel().catch(() => {})
+    }
   }
 }
 

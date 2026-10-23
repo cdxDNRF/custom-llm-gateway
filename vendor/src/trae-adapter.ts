@@ -23,7 +23,7 @@ import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, ReasoningEffortId }
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { reasoningRankOf } from './reasoning-ladder.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -314,6 +314,15 @@ export interface TraeAdapterOptions {
   /** 产品配置；默认 {@link TRAE}。 */
   product?: TraeProduct
   /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   *    ⚠️ **buddy 是例外**：它的 `catalogGate` 也吃这个时钟（冷却与
+   *    「距上次尝试 ≥10 秒」判定都走它），所以别把本行当成全仓库通用口径。
+   */
+  now?: () => number
+  /**
    * 远端目录**落地后**的通知回调（issue IKJVTF）。
    *
    * 由 `registerTraeLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
@@ -491,6 +500,11 @@ function serializeTraeMessages(
 
   for (const message of normalized) {
     if (message.role === 'assistant') {
+      // ⚠️ 2026-10-19 修（4027 第三例，多工具调用场景）：
+      // 进入新的 assistant 之前，上一批工具结果**已经全部下发完毕**（tool 消息只会
+      // 紧跟其 assistant），此时 flush 图片是安全的。若不在这里 flush，图片会一直
+      // 挂到整个循环结束，被挤到更后面。
+      flushToolImages()
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
       // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
@@ -582,8 +596,27 @@ function serializeTraeMessages(
       flushToolImages()
       wire.push({ role: 'user', content: parts ?? text })
     }
-    flushToolImages()
+    // ⚠️⚠️ 2026-10-19 修（4027 真实缺陷 · 多工具调用漏网场景）：
+    // **这里绝不能无条件 flush**。原实现在每条 user 消息末尾都调 `flushToolImages()`，
+    // 而 DSH 0.1.7 起工具结果是**一等 `role:'tool'` 消息**（`normalizeHarnessMessages`
+    // 把每条都转成**独立的** `role:'user'` + 内嵌 tool-result 块）⇒ 当一个 assistant
+    // 发了 **≥2 个 tool_call**、且**不是最后一个**的结果内嵌图片时，图片会在处理第一条
+    // 工具结果的消息末尾就被 flush 成一条 user 消息，**插到下一条 `role:'tool'` 之前**
+    // ⇒ assistant(tool_calls) 与 tool 之间插了 user ⇒ 上游恒定回
+    // `code=4027 Messages with role 'tool' must be a response to a preceding message
+    // with 'tool_calls'`。
+    //
+    // 旧回归用例（trae-adapter.spec.ts「工具结果内嵌图片不得插在 role:tool 之前」）
+    // 只覆盖了 **1 个** tool_call，故这条路径从未被测到 —— 实测在模型一次并发发出
+    // `read_image` + `read` 时即触发，且坏报文落库后会话**永久卡死**。
+    //
+    // 修法：图片挂起**跨消息累积**，只在两处落地 ——
+    //   ① 进入下一条 assistant 之前（`flushToolImages()` 已在循环顶部）；
+    //   ② 整个循环结束后（见函数末尾）。
+    // 这样保证同一批工具结果的全部 `role:'tool'` 消息**紧密相邻**，图片统一排在其后。
   }
+  // 循环收尾：把最后一批挂起的图片发出去（此时所有 tool 消息已下发完毕）。
+  flushToolImages()
   return wire
 }
 
@@ -696,6 +729,13 @@ export class TraeAdapter extends LlmAdapter {
   /** 动态模型缓存。 */
   private remoteModels: TraeRemoteModel[] | undefined
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -734,6 +774,17 @@ export class TraeAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+         * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
         // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
         unknownModelInputModalities: () => ['text'] as const,
       },
@@ -745,10 +796,24 @@ export class TraeAdapter extends LlmAdapter {
     return { id, name: this.product.displayName }
   }
 
-  /** 懒加载远端模型目录（仅拉取一次）。 */
+  /**
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
+   */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
+    if (fetchRemote === undefined) return
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    // ⚠️ **入口用 `isCatalogFreshFor`**：用户在 Jet Hub 改开关后要**立即**重拉
+    //    （规格 §6 的正确性要求，见 `invalidateCatalogCache`）。本方法只有这一处
+    //    判据，且它在 gate **之前**（拉不到就用旧值），故整条路径都安全。
+    // ⚠️ **不是**照抄 aggregate-adapter.ts 那条 —— 那边另有两处本家没有的前提
+    //    （`force` 与 `options.catalogTtlMs` 覆盖的 60s TTL），本家用 20 分钟默认周期。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
     // Trae 的目录超时上限 30s（src/trae.ts），失败不冷却会被 buildModelCatalog
     // 放大成「每模型一次」。
@@ -757,6 +822,9 @@ export class TraeAdapter extends LlmAdapter {
       if (models.length === 0) return false
       this.remoteModels = models
       this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       return true
     })
   }
@@ -928,6 +996,21 @@ export class TraeAdapter extends LlmAdapter {
    * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
    * `src/model-catalog.ts`，此处只剩委托。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }

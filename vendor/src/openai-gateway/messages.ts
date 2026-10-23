@@ -9,6 +9,10 @@ import {
   type ImageLimits,
 } from './images.js'
 import { isThinkingOffEffort, translateReasoningEffort } from '../reasoning-ladder.js'
+// ⚠️ 复用 `src/sse.ts` 的**同一份**「工具名是否可用」判据（各适配器的
+// `resolveToolPairing` 用的是它）。自己再写一条 `length > 0` 必然漂移 —— 那正是
+// 本仓库首条红线「同一语义两套判据」，也正是 issue IKLRIK 的成因。
+import { hasUsableToolName } from '../sse.js'
 import { rewriteTencentContentFingerprints } from './tencent-fingerprint.js'
 
 export class OpenAiGatewayError extends Error {
@@ -355,19 +359,111 @@ export function createGatewayMessage(
   return { id: randomUUID() as Message['id'], role, content, source } as Message
 }
 
+/**
+ * 工具调用 id 是否可用（非空字符串）。
+ *
+ * ⚠️ **必须只有这一份判据**（本仓库首条红线：同一语义不得有两套判据）。
+ * issue IKLRIK 的修法要在**两处**判断同一个调用「坏不坏」—— 主转换
+ * （{@link convertToolCalls}）与预扫（{@link collectUnusableCallIds}）——
+ * 若两处各写一遍 `typeof id === 'string' && id.length > 0`，改一处忘另一处就会
+ * **静默漂移**：预扫认为「这条 id 可用、要进剔除集合」，而主转换认为「id 不可用、
+ * 直接 400」⇒ 用户既看到 400 又留着孤儿结果，两个缺陷同时复发。
+ *
+ * ⚠️ 与 `hasUsableToolName` 的**区别是刻意的**：工具名要 `trim` 后判（空白名上游
+ * 也拒，见 `src/sse.ts`），而 id 是**不透明标识符**，`" call_1 "` 与 `"call_1"`
+ * 是两个不同的 id，**绝不能 trim** —— trim 会让「配对」找错对象而静默丢结果。
+ */
+export function isUsableToolCallId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+/**
+ * Chat 形状的 `assistant.tool_calls` → DSH 的 `tool-call` 块。
+ *
+ * ## ⚠️ 名字不可用的调用是**剔除**，不是 400（Issue IKLRIK）
+ *
+ * 历史里 `function.name` 为空串的调用**不是参数错误，而是可剔除的坏数据**：
+ * 下游每一层（`sse.ts` 的 `resolveToolPairing`，九个适配器都调它）对同一份坏数据
+ * 都是「剔除并继续」，判词见 `src/sse.ts`：「宁可丢失一轮工具上下文，也好过整条
+ * 会话死亡」。而网关原先站在所有这些剔除防线**之前**，直接回 400
+ * （`assistant.tool_calls contains an invalid function call`）—— 坏块被客户端
+ * 每轮原样重放 ⇒ **整条会话永久不可用**。
+ *
+ * 位置决定了取舍：网关是最后一道防线（消费者是「把历史全部回传」的 Codex /
+ * Claude 系客户端，它们没法自愈），故这里必须与下游同取「剔除」。
+ *
+ * ⚠️ **只剔除名字不可用的那一条，同批其余调用不受影响**（与
+ * `resolveToolPairing` 的「一批里可用的那些各自独立」同款）。
+ *
+ * ⚠️ `id` / `arguments` 缺失**仍报错**：那两样是真·形状错误，且剔除一条
+ * **名字可用**的调用会静默丢掉模型真实发起的工具调用（用户看不到任何提示）。
+ * 判据只放宽「名字」这一格 —— 它正是本缺陷里客户端反复重放的那个字段。
+ *
+ * ⚠️ **本函数不负责「剔除集合」**（故**没有** `dropped` 参数）：哪些 id 因坏调用
+ * 而失去配对，由 {@link collectCallAvailability} **预扫**统一算出 —— 配对的
+ * `role:'tool'` 消息可能排在本条之后，此处无从知道。两处共用
+ * {@link isUsableToolCallId} 与 `hasUsableToolName`，故判据只有一份。
+ */
 function convertToolCalls(raw: unknown): ContentBlock[] {
   if (!Array.isArray(raw)) throw new OpenAiGatewayError('assistant.tool_calls must be an array')
-  return raw.map((value) => {
+  const blocks: ContentBlock[] = []
+  for (const value of raw) {
     if (!value || typeof value !== 'object') throw new OpenAiGatewayError('tool call must be an object')
     const call = value as OpenAiToolCall
-    const id = typeof call.id === 'string' && call.id.length > 0 ? call.id : undefined
-    const name = typeof call.function?.name === 'string' && call.function.name.length > 0
-      ? call.function.name
-      : undefined
+    const id = isUsableToolCallId(call.id) ? call.id : undefined
     const args = typeof call.function?.arguments === 'string' ? call.function.arguments : undefined
-    if (!id || !name || args === undefined) throw new OpenAiGatewayError('assistant.tool_calls contains an invalid function call')
-    return { type: 'tool-call' as const, id: id as never, name, arguments: args }
-  })
+    // ⚠️ 判据用共享的 `hasUsableToolName`（trim 后非空），**不**自己写
+    // `length > 0`：后者会把空白名放过去，而上游同样拒它。
+    if (!hasUsableToolName(call.function?.name)) continue
+    // 名字**原样**保留（不 trim）：它必须与 `tools` 侧声明的名字逐字符一致，
+    // 而 `convertTools` 不 trim（见 `responses.ts` 的 `normalizeToolName` 注释
+    // 里同一类事故）。判据与取值分开，是刻意的。
+    const name = call.function.name
+    if (id === undefined || args === undefined) throw new OpenAiGatewayError('assistant.tool_calls contains an invalid function call')
+    blocks.push({ type: 'tool-call' as const, id: id as never, name, arguments: args })
+  }
+  return blocks
+}
+
+/**
+ * 预扫历史，按 id 分出工具调用的可用性。
+ *
+ * ## ⚠️ 为什么必须同时给出 `kept`（真实回归，对抗审计实测打穿）
+ *
+ * 第一版只收集**坏**调用的 id，再按「结果 id 在该集合里」剔除结果。当**同一个
+ * `call_id` 上既有坏调用、又有好调用**时，该判据无法区分两者 ⇒ 好调用的回执被
+ * **连带剔掉** ⇒ 留下**孤儿 `tool-call`**（上游照样拒）。实测
+ * `tool-calls = ["dup"]`、`results = []`。
+ *
+ * ⇒ 剔除条件必须是「**该 id 上没有任何可用调用**」（`dropped && !kept`），与下游
+ * `resolveToolPairing` 的既有语义**同一份**（它先算 `keepCallIds`，结果「只在对应
+ * 调用被保留时才保留」）。故这里同时算两个集合。
+ *
+ * ⚠️ 必须在转换**之前**扫一遍：配对的 `role:'tool'` 消息可能排在后面，
+ * 单条转换时已经无从知道前面哪些调用被剔除了。
+ *
+ * ⚠️ 本函数与 {@link convertToolCalls} **共用** {@link isUsableToolCallId} 与
+ * `hasUsableToolName` 两个判据 —— 「坏不坏」的定义只有一份，故两处不可能对同一条
+ * 调用给出不同结论（那正是修法本身最容易引入的静默缺陷）。
+ */
+function collectCallAvailability(messages: unknown): { dropped: Set<string>; kept: Set<string> } {
+  const dropped = new Set<string>()
+  const kept = new Set<string>()
+  if (!Array.isArray(messages)) return { dropped, kept }
+  for (const raw of messages) {
+    if (!raw || typeof raw !== 'object') continue
+    const value = raw as OpenAiChatMessage
+    if (value.role !== 'assistant' || value.tool_calls === undefined) continue
+    if (!Array.isArray(value.tool_calls)) continue
+    for (const call of value.tool_calls) {
+      if (!call || typeof call !== 'object') continue
+      const record = call as OpenAiToolCall
+      if (!isUsableToolCallId(record.id)) continue
+      if (hasUsableToolName(record.function?.name)) kept.add(record.id)
+      else dropped.add(record.id)
+    }
+  }
+  return { dropped, kept }
 }
 
 /**
@@ -375,6 +471,10 @@ function convertToolCalls(raw: unknown): ContentBlock[] {
  *
  * ⚠️ **异步**：`user` 消息的 content 可能是多模态数组，图片要经附件服务落盘
  * （`saveImage` 是异步的），故这里整体异步化，由 {@link toGenerateOptions} 串行 await。
+ *
+ * ⚠️ 返回 `undefined` = **该条整条剔除**（目前唯一的来源是「配对的 tool_call
+ * 名字不可用」且**该 id 上没有别的可用调用**，见 {@link convertToolCalls}）。
+ * 调用方必须 filter 掉它。
  */
 async function convertMessage(
   raw: unknown,
@@ -382,7 +482,10 @@ async function convertMessage(
   model: string,
   bridge: AttachmentBridge | undefined,
   limits: ImageLimits,
-): Promise<Message> {
+  // 工具调用的可用性（按 id 分「有可用调用的」与「只被坏调用引用的」）。
+  // 判据见 {@link collectCallAvailability}；本参数**只读**。
+  callIds: { readonly dropped: ReadonlySet<string>; readonly kept: ReadonlySet<string> },
+): Promise<Message | undefined> {
   if (!raw || typeof raw !== 'object') throw new OpenAiGatewayError('messages entries must be objects')
   const value = raw as OpenAiChatMessage
   const role = value.role
@@ -406,12 +509,44 @@ async function convertMessage(
     const text = rewriteTencentContentFingerprints(textFromContent(value.content), provider)
     // ⚠️ 先累积再构造（0.2.0 的 content 是 readonly，不能事后 push）。
     const content: ContentBlock[] = text.length > 0 ? [{ type: 'text', text }] : []
-    if (value.tool_calls !== undefined) content.push(...convertToolCalls(value.tool_calls))
+    if (value.tool_calls !== undefined) {
+      const calls = convertToolCalls(value.tool_calls)
+      content.push(...calls)
+      // ⚠️⚠️ **tool_calls 全被剔光 ⇒ 整条 assistant 消息也剔除**（独立审计实测指出）。
+      //
+      // 历史里只有坏调用时，「剔除坏调用」会把这条 assistant 留成 **content 为空的
+      // 助手消息**。它会被送到上游、成为 wire 上的**开头发言**（实测：经
+      // `openai-compat.serializeMessages` 产出 `[{"role":"assistant","content":""}]`，
+      // 且**没有任何 user 消息**）—— 这类形状对 OpenAI 兼容端点是典型的
+      // `model_param_invalid` 400 ⇒ **400 只是从网关挪到了上游**，问题没解决。
+      //
+      // ⚠️ 判据必须同时看 `text.length === 0`：**正文非空**的 assistant（模型的
+      // 真实发言）即使调用被剔光也要留下 —— 那是用户在界面上真的看到的内容，
+      // 剔掉会让助手的话从历史里消失。
+      //
+      // ⚠️ 边界如实标注：**无** `tool_calls` 的空 assistant（`content:''`）在改前
+      // 也产出同形，故这**不是本次引入的回归**；但本次修法把它从「罕见」变成
+      // 「坏块会话的必经路径」（坏块会话一定会走到这里），故一并堵上。
+      if (calls.length === 0 && text.length === 0) return undefined
+    }
     return createGatewayMessage('assistant', content, { kind: 'model', provider, model })
   }
   if (role === 'tool') {
     if (typeof value.tool_call_id !== 'string' || value.tool_call_id.length === 0) {
       throw new OpenAiGatewayError('tool messages require tool_call_id')
+    }
+    // ⚠️ 配对的调用已被剔除（名字不可用）⇒ 这条工具结果成了**孤儿**，必须一并
+    // 剔除：上游对没有对应 `tool_calls` 的 `role:'tool'` 消息同样 400，而这条
+    // 结果是坏块的**产物**（客户端对 `name:""` 的调用回的是「没有这个工具」）。
+    // 两侧都管是 issue IKLRIK 明确要求的，也是 `resolveToolPairing` 的既有口径。
+    //
+    // ⚠️ 返回 `undefined` = **整条不发**（调用方 filter 掉）。绝不能改发一条空的
+    // user 消息充数：那会给上游留下一条凭空的 user 轮次，且与「剔除」语义不符。
+    // ⚠️ 该结果的 id **只**因坏调用而失去配对时才剔除；同一 id 上还有可用调用
+    // 时必须照常保留（否则好调用变孤儿，上游照样拒）。判据见
+    // {@link collectCallAvailability}。
+    if (callIds.dropped.has(value.tool_call_id) && !callIds.kept.has(value.tool_call_id)) {
+      return undefined
     }
     // ⚠️ 工具结果的 content **同样支持图片**（2026-10-04 修，真实报障）。
     // 早先这里走 `textFromContent`，而它对 `image_url` 一律抛错 ⇒
@@ -528,11 +663,17 @@ export async function toGenerateOptions(
     ? reasoningEffortOverride
     : (body.reasoning_effort === undefined ? undefined : String(body.reasoning_effort))
   const limits = images.limits ?? DEFAULT_IMAGE_LIMITS
+  // ⚠️ 必须在转换**之前**预扫一次：被剔除的调用所配对的 `role:'tool'` 消息可能
+  // 排在其后，逐条转换时已无从知道该剔除谁（见 `collectCallAvailability`）。
+  // ⚠️ 必须同时拿到 `dropped` **与** `kept` 两个集合（见该函数的注释）。
+  const callIds = collectCallAvailability(body.messages)
   // ⚠️ **串行**而非 Promise.all：多张图会并发打附件服务，串行既让限额累计
   // 判定准确（`used` 是逐张累加的），也避免一次性压垮附件服务的并发额度。
   const messages: Message[] = []
   for (const message of body.messages) {
-    messages.push(await convertMessage(message, provider, model, images.bridge, limits))
+    const converted = await convertMessage(message, provider, model, images.bridge, limits, callIds)
+    // 整条剔除（配对的 tool_call 名字不可用）—— 绝不 push 一条空消息充数。
+    if (converted !== undefined) messages.push(converted)
   }
   return {
     provider,

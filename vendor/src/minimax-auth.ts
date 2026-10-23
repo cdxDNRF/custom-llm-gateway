@@ -22,11 +22,15 @@ import {
   MINIMAX_REQUEST_TIMEOUT_MS,
   type MinimaxProduct,
 } from './minimax-product.js'
+import { fetchMinimaxUserIdentity } from './minimax-identity.js'
 import {
   fallbackToEntry,
   isMinimaxRefreshable,
   minimaxCredentialExpiresAtMs,
+  describeMinimaxGeoRoute,
+  minimaxFetch,
   minimaxHeaders,
+  minimaxHeadersFor,
   normalizeMinimaxModel,
   type MinimaxCredential,
   type MinimaxModelEntry,
@@ -178,18 +182,55 @@ export class MinimaxAuth extends Service {
    * 落盘凭据（登录成功后调用）。
    *
    * ⚠️ 返回 `accountId` 供调用方构造展示名。
+   *
+   * ## ⚠️⚠️ 2026-10-23（Gitee IKP8UA）：这里**补查一次账号身份**
+   *
+   * MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、0 个点），
+   * 登录响应体也**不含任何身份字段** ⇒ 原昵称判据（`decodeJwtSub`）恒 undefined
+   * ⇒ 账号卡片恒显示插件内部 id（`minimax-6395cf64`），多账号无法分辨。
+   *
+   * ⇒ 落盘前查一次 `GET /v1/api/user/info`（见 `minimax-identity.ts`），
+   *   把读到的 `name` 写进**凭据**（供自愈路径读）并**返回**给调用方写进账号池。
+   *
+   * ## 为什么收口在这里，而不是 RPC 分支
+   *
+   * 登录路径与**启动自愈**（`repairAccountNicknames`）都要身份 —— 若只写在 RPC
+   * 那一段，自愈就得再写一份（「同一语义两套判据」）。收口在凭据落盘处，
+   * 两条路径共用一份实现。
+   *
+   * ## 三条纪律
+   *
+   * 1. **查不到不影响登录**：身份是展示信息，失败一律 `undefined`
+   *    （与 qoder 的 `fetchQoderUserNickname` 同原则）；
+   * 2. **显式传入的 `nickname` 优先**（调用方可能有更权威的来源）；
+   * 3. **国际站必须带池里的 XFF**：`agent.minimax.io` 对大陆出口恒 307 到
+   *    `agent.minimaxi.com`，跨 origin 跟随会剥掉 `Authorization` ⇒ 401
+   *    （真机实测：无 XFF 时国际站身份**永远**拿不到）。
    */
   async persistLogin(
     credential: MinimaxCredential,
     options: { refName: string; nickname?: string },
-  ): Promise<{ accountId?: string }> {
+  ): Promise<{ accountId?: string; nickname?: string }> {
+    // ⚠️ 与 `fetchModels` 同一份 XFF 取法（`typeof` 判一下：单测/旧接线可能传
+    //    只实现部分方法的池替身，直接 `.minimaxXff()` 会抛 TypeError）。
+    const pool = this.ctx.accountPool
+    const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined
+    // ⚠️ 查不到（含抛错、401、非 JSON、空 name）一律 `undefined`，不阻塞登录。
+    const identity = options.nickname === undefined
+      ? await fetchMinimaxUserIdentity(credential, this.fetchImpl, this.product, xff)
+      : undefined
+    const nickname = options.nickname ?? identity?.name
+
     const payload: MinimaxCredential = {
       ...credential,
-      ...options.nickname === undefined ? {} : { nickname: options.nickname },
+      ...nickname === undefined ? {} : { nickname },
     }
     await this.ctx.credentials.set(credentialRef(options.refName), JSON.stringify(payload))
     this.lastRefreshError = undefined
-    return { ...credential.account_id === undefined ? {} : { accountId: credential.account_id } }
+    return {
+      ...credential.account_id === undefined ? {} : { accountId: credential.account_id },
+      ...nickname === undefined ? {} : { nickname },
+    }
   }
 
   /** 解析默认单凭据。 */
@@ -377,11 +418,49 @@ export class MinimaxAuth extends Service {
       const url = new URL(`${this.product.apiHost}${MINIMAX_MODELS_PATH}`)
       url.searchParams.set('region', this.product.region)
       url.searchParams.set('buildEnv', this.product.buildEnv)
-      const response = await this.fetchImpl(url.toString(), {
-        headers: minimaxHeaders(credential),
-        signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
-      })
-      if (!response.ok) return undefined
+      /**
+       * ⚠️ **带传输级重试 + 保凭据跟随重定向**（两个真实缺陷的修法）。
+       *
+       * 传输级重试（2026-10-15）：「模型连接测试失败，显示 `fetch failed`」。
+       * 本机实测环境里的 HTTPS 检查代理约 **50%** 概率打断到本家的请求
+       *（`fetch failed ← SELF_SIGNED_CERT_IN_CHAIN`）⇒ 一次偶发中断就整轮失败。
+       *
+       * 保凭据跟随 3xx（2026-10-17，issue IKMEVG）：`agent.minimax.io` 恒 307 到
+       * `agent.minimaxi.com`，而 fetch 跨 origin 跟随会**剥掉 `Authorization`**
+       * ⇒ 第二跳无凭据 ⇒ 目录也拿不到（连带让 provider 在模型选择器里消失）。
+       *
+       * ⚠️ 两者合并在 `minimaxFetch` 一处，与推理 / 签到积分路径**共用同一份**
+       *（`src/minimax.ts`）—— 本文件不另写判据（同义判据分两处必然漂移）。
+       * `buildInit` 每跳重建头，保证跟随后的请求仍带凭据。
+       *
+       * ⚠️ 国际站另需附用户设置的 `X-Forwarded-For`（绕开 Akamai 按出口 IP
+       * 的地理分流）。没有它，大陆出口的用户连目录都拿不到 ⇒ provider 在模型
+       * 选择器里整个消失（这是本 issue 的另一个症状面）。
+       */
+      // ⚠️ 用 `typeof` 判一下：单测/旧接线可能传只实现部分方法的池替身，
+      //    直接 `.minimaxXff()` 会在那种替身上抛 `TypeError`（`?.` 挡不住）。
+      const pool = this.ctx.accountPool
+      const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined
+      let geoRouted = false
+      const response = await minimaxFetch(
+        url.toString(),
+        () => ({
+          headers: minimaxHeadersFor(credential, xff, this.product.id),
+          signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
+        }),
+        {
+          fetcher: this.fetchImpl,
+          onGeoRoute: () => { geoRouted = true },
+        },
+      )
+      if (!response.ok) {
+        // ⚠️ 地理路由必须留**可操作**的日志：否则用户只看到「模型列表变空」，
+        //    而真因（出口 IP 被判定为中国大陆）完全不可见。
+        if (geoRouted) {
+          this.ctx.logger?.warn?.(`[${this.product.id}] ${describeMinimaxGeoRoute()}`)
+        }
+        return undefined
+      }
       const body: unknown = await response.json().catch(() => undefined)
       const entries = parseMinimaxModelsPayload(body)
       // ⚠️ 远端成功但解析出 0 条时也回退兜底表（避免空列表让整个 provider 消失）
@@ -443,6 +522,89 @@ export class MinimaxAuth extends Service {
     const credential = await this.resolveModelsCredential(pool)
     if (credential === undefined) return []
     return (await this.fetchRawModels(credential)) ?? []
+  }
+
+  /**
+   * ★★ **启动自愈：补齐存量账号的显示名**（Gitee issue IKP8UA 修法 ③）。
+   *
+   * ## 为什么必须有这条
+   *
+   * 只改登录路径**不会自愈存量账号** —— 用户已有的账号（本机实测 7 条）
+   * 昵称早已是插件内部 id 且已落盘。不给这条腿，用户要**删号重登**才看得到真名。
+   *
+   * ## 形态照 `gemini-auth.ts` 的同名方法（那是本仓库最规范的一份）
+   *
+   * | 纪律 | 理由 |
+   * |---|---|
+   * | 逐账号 `try/catch` | 单账号失败不得拖住其余（本方法是启动期循环，一个挂住会连累后面全部） |
+   * | **只在确实变化时**写池 | `updateAccount` 是整体 replace，每次启动都写 = 平白落盘 |
+   * | 失败**不告警**（只用 debug） | 老账号 token 可能早已过期，拿不到是常态，不该刷 warn |
+   * | 查不到就**保持原样** | 绝不退回用池 id 重算昵称（那是本 issue 的缺陷本身） |
+   *
+   * ⚠️ **国际站必须带池里的 XFF**：否则恒 307 → 401（真机实测），
+   *    自愈对国际站账号将**永远**失败且看起来「和国内站一样在跑」。
+   *
+   * @returns 被修复的账号 id（供接线层记日志/计数）。
+   */
+  async repairAccountNicknames(pool: AccountPool): Promise<string[]> {
+    const repaired: string[] = []
+    let entries: Awaited<ReturnType<AccountPool['listAccounts']>>
+    try {
+      entries = await pool.listAccounts(this.product.id)
+    } catch {
+      // ⚠️ 读不到池绝不当成「没有账号」—— 但这是启动期的尽力而为，
+      //    下一次启动还会重试，故这里只静默返回（不删任何东西）。
+      return repaired
+    }
+
+    // ⚠️ 与 `fetchModels` / `persistLogin` **同一份** XFF 取法。
+    const xffPool = this.ctx.accountPool
+    const xff = typeof xffPool?.minimaxXff === 'function' ? xffPool.minimaxXff() : undefined
+
+    for (const entry of entries) {
+      try {
+        const ref = credentialRef(entry.credentialRef)
+        const resolved = await this.ctx.credentials.resolve(ref)
+        if (!resolved) continue
+        const credential = parseMinimaxCredential(resolved.value)
+        if (credential === undefined) continue
+
+        // 查一次身份（只读 GET；失败返回 undefined，不抛错）。
+        const identity = await fetchMinimaxUserIdentity(
+          credential,
+          this.fetchImpl,
+          this.product,
+          xff,
+        )
+        if (identity === undefined) {
+          // 拿不到就保持原样（绝不退回用池 id 重算昵称 —— 那正是本 issue 的缺陷）。
+          this.ctx.logger?.debug?.(
+            `[${this.product.id}] 账号 ${entry.id} 补拉账号身份失败（昵称保持原样）`,
+          )
+          continue
+        }
+
+        // ⚠️ 只在**确实变化**时写：`updateAccount` 是整体 replace。
+        if (identity.name !== entry.nickname) {
+          await pool.updateAccount(entry.id, { nickname: identity.name })
+          repaired.push(entry.id)
+        }
+        // 顺带把身份写进凭据（`persistLogin` 的读取侧约定见该方法注释）。
+        if ((credential as { nickname?: string }).nickname !== identity.name) {
+          await this.ctx.credentials.set(
+            ref,
+            JSON.stringify({ ...credential, nickname: identity.name }),
+          )
+        }
+      } catch (error) {
+        // 单账号失败不得中断其余（与 gemini 同纪律）。
+        this.ctx.logger?.debug?.(
+          `[${this.product.id}] 修复账号 ${entry.id} 的显示名失败（不影响使用）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return repaired
   }
 }
 

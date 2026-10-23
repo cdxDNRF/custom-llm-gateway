@@ -361,12 +361,99 @@ function flattenText(content: unknown): string {
 }
 
 /**
+ * 把一条 user 消息的 content 转成 Accio 的 `parts`（**含图片**）。
+ *
+ * ## 上游形状（2026-10-14 真机实测，issue IKLR7V）
+ *
+ * 图片放在 **Gemini 风格的 `parts[].inline_data = { mime_type, data }`** ——
+ * 与既有 `contents` 信封**同构**，且实测四象限色块图**四色全对**。
+ * 本函数产出 camelCase 形态，由 `buildAccioBody` 的 `accioToSnake` 转成上游认的
+ * `inline_data`（⚠️ **不要**改走 `properties` 子树 —— 那棵子树刻意不参与 snake 转换）。
+ *
+ * ## 三态判据（缺一不可）
+ *
+ * | 情形 | 行为 |
+ * |---|---|
+ * | 无图 | 返回 `undefined` ⇒ 调用方走**原来的纯文本路径**（线上格式逐字节不变，不破坏前缀缓存） |
+ * | 有图、字节已内联 | 产出 `{ inlineData: { mimeType, data } }` |
+ * | 有图、拿不到字节 | **抛错**（绝不静默丢弃；静默丢弃会让用户以为模型看到了图） |
+ *
+ * ⚠️ **`tool-result` 分支必须递归**，与 `collectImages`（`src/openai-compat.ts`）
+ * 的递归深度**对称**：收集侧是任意深度，序列化侧只走一层的话，深层图片会被
+ * 收进 refs 却在序列化时**静默丢弃**（连占位符都没有）。本仓库其余适配器
+ * （buddy / trae / lobsterai）都按同一口径递归。
+ *
+ * @param content - 消息的 content（数组形状）。
+ * @param images - `attachmentId → 已内联字节`。`undefined` 表示**本请求无图**
+ *   （调用方未接线或未收集到）；此时不产出图片 part。
+ */
+export function accioUserParts(
+  content: readonly unknown[],
+  images: ReadonlyMap<string, { mediaType: string; data: string }> | undefined,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (raw === null || typeof raw !== 'object') continue
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text !== '') parts.push({ text })
+      continue
+    }
+    if (block.type === 'image') {
+      hasImage = true
+      const attachmentId = block.attachment?.attachmentId
+      const inline = typeof attachmentId === 'string' ? images?.get(attachmentId) : undefined
+      if (inline === undefined) {
+        // ⚠️ 显式抛错，不静默丢弃（与 gemini-messages.ts 同一口径）。
+        throw new LlmError(
+          'accio: 图片未能内联（附件服务不可用或读取失败），拒绝发出缺少图片的请求',
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      parts.push({ inlineData: { mimeType: inline.mediaType, data: inline.data } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      const inner = accioUserParts(block.content, images)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = flattenText(block.content)
+        if (text !== '') parts.push({ text })
+      }
+    }
+  }
+  return hasImage && parts.length > 0 ? parts : undefined
+}
+
+/**
  * 把 harness 消息序列化成 Accio 的 `contents` + `systemInstruction`。
  *
  * ⚠️ 调用方**必须**先走 `normalizeHarnessMessages(...)`（DSH 0.1.7 的一等
  * `role:'tool'` 消息）—— 本函数按 0.1.5 形状实现，与其余适配器同口径。
+ *
+ * ## 图片（`images`）
+ *
+ * `images` 为 `undefined` 表示**本请求没有图片**（未接线 / 未收集到）⇒ user 消息
+ * 走**原来的纯文本路径**，线上格式逐字节不变（不破坏前缀缓存）。
+ * 非 `undefined`（**含空 Map**）时才可能把带图的 user 消息升级为多模态 `parts`。
+ *
+ * ⚠️ 图片的实际提取由 {@link accioUserParts} 负责（含 `tool-result` 递归）；
+ * 本函数只决定「哪条消息要用它」。
  */
-export function serializeAccioMessages(messages: readonly unknown[]): {
+export function serializeAccioMessages(
+  messages: readonly unknown[],
+  images?: ReadonlyMap<string, { mediaType: string; data: string }>,
+): {
   contents: unknown[]
   systemInstruction: string
 } {
@@ -420,6 +507,20 @@ export function serializeAccioMessages(messages: readonly unknown[]): {
     }
 
     // user（以及任何未识别的角色，按最安全的 user 处理）
+    //
+    // ⚠️ **含图时走 `accioUserParts`**（它把文本与图片合成同一条 parts 序列）：
+    // 图片必须与文本**同一条消息**（分成两条会让模型看到「第一句是问题、
+    // 第二句是一张没有上下文的图」）。
+    const outer = Array.isArray(message?.content)
+      ? (message.content as readonly unknown[])
+      : undefined
+    const parts = outer === undefined || images === undefined
+      ? undefined
+      : accioUserParts(outer, images)
+    if (parts !== undefined) {
+      contents.push({ role: 'user', parts })
+      continue
+    }
     const text = flattenText(message?.content)
     if (text !== '') contents.push({ role: 'user', parts: [{ text }] })
   }

@@ -55,21 +55,32 @@ import { CLINE } from './cline-product.js'
 import { GEMINI } from './gemini.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { LOOMY } from './loomy-product.js'
-import { MINIMAX } from './minimax-product.js'
+import { MINIMAX, MINIMAX_INTL } from './minimax-product.js'
 import { RACCOON } from './raccoon-product.js'
 import { TRAE } from './trae-product.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import { claimCodeArtsDailyCheckin, fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js'
-import { fetchGeminiCreditBalance } from './gemini-credits.js'
+import { fetchGeminiCreditBalance, type GeminiCreditOptions } from './gemini-credits.js'
 import { claimLobsteraiDailyCheckin, fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { claimLoomyDailyQuota, fetchLoomyCreditBalance } from './loomy-credits.js'
 import {
   claimMinimaxDailyCheckin,
-  fetchMinimaxCreditBalance,
+  fetchMinimaxCreditBalanceDetailed,
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额原语。
+import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
+import type { ModelscopeCredential } from './modelscope.js'
+import { MODELSCOPE } from './modelscope-product.js'
+// ⚠️ **本 fork 独有**（Codely/Unity，2026-10-19）：积分余额原语。
+// 2026-10-20 起接每日签到（`/api/points/check-in`，实测 200）。
+import { claimCodelyDailyCheckIn, fetchCodelyBalanceDetailed } from './codely-credits.js'
+import type { CodelyCredential } from './codely-auth.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
+import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
+import { AUTOCLAW_INTL } from './autoclaw-product.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
@@ -85,6 +96,8 @@ import {
 import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
 import type { AccioCredential } from './accio.js'
+import type { AstudioCredential } from './astudio.js'
+import type { AutoclawCredential } from './autoclaw.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
 import type { LobsteraiCredential } from './lobsterai.js'
@@ -92,6 +105,7 @@ import type { LoomyCredential } from './loomy.js'
 import type { MinimaxCredential } from './minimax.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { TraeCredential } from './trae.js'
+import { participateTraeLottery } from './trae-lottery.js'
 import type { ZcodeCredential } from './zcode.js'
 
 /**
@@ -123,6 +137,27 @@ export interface ProviderCreditsDeps {
    * 里的常量会让「缓存过期后拿到新版本」失效 —— 而它是签到接口的**必填** query 参数。
    */
   readonly lobsteraiClientVersion?: () => Promise<string>
+  /**
+   * MiniMax **国际站**绕地理分流用的 `X-Forwarded-For` 值（issue IKMEVG）。
+   *
+   * ⚠️ 必须**惰性**读（`() => pool.minimaxXff()`），不能注册时固化成字符串：
+   * 用户随时可能在面板里改这个设置，固化会让「改了却不生效」变成静默失效。
+   *
+   * ⚠️ 省略等价于「不附头」（与修复前行为逐字节一致）。**只对
+   * `minimaxintl` 生效** —— 判据在 `minimaxHeadersFor` 里按 product id 分流。
+   */
+  readonly minimaxXff?: () => string | undefined
+  /**
+   * Gemini 的**按账号 fetcher**（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ Gemini 的配额端点（`retrieveQuotaSummary`）在墙外，而积分行是**用户
+   * 点一下就等**的主路径：不接代理时它恒报「配额查询网络失败：fetch failed」，
+   * 且**零线索**指向代理。
+   *
+   * ⚠️ 与其余各家同理，必须**惰性**调用（按 `accountId` 现取），不能在注册时
+   * 固化成一份 fetcher —— 账号可能随时在面板里改代理。
+   */
+  readonly geminiFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -178,6 +213,45 @@ export function buildZcodeBalance(result: ZcodeBalanceResult): CreditBalance {
         : '',
     })
   }
+  /**
+   * ★★ 「**已领、但还没到生效时刻**」的计划 —— 单独成一个包（2026-10-23 实测）。
+   *
+   * ## 为什么必须显示（用户报障）
+   *
+   * 领完 1024 活动后签到显示「+500.00MToken 领取成功」，**但额度查询仍是 0**
+   * ⇒ 用户以为白领了（实测上游：`balances` 桶为空、`plans[]` 里 `status: active`
+   * 且 `effective_at` = 23:00 ⇒ 额度**已锁定**、只是还没建桶）。
+   *
+   * ## 为什么不并进 `remaining`
+   *
+   * `remaining` 是「**现在就能用**」的额度；并进去会让折算层
+   * （`aggregate-expiry.ts` 的 `zcodeExpiry`）判成「有额度」⇒
+   * **在生效前就把渠道派发出去**（必然失败：额度还不存在）。
+   * ⇒ 独立成包，且 `remaining/total` 都给 0（此刻确实不能用），
+   *   只用 `expiredTime` 之外的 `cycleStartTime` 携带**生效时刻**。
+   *
+   * ⚠ `active: false` —— 它**不是**当前可用额度（前端据此不计入可用合计）。
+   */
+  for (const pending of result.pendingPlans ?? []) {
+    packages.push({
+      name: pending.name ?? 'ZCode 活动额度（待生效）',
+      unit: pending.unitType ?? 'token',
+      remaining: 0,
+      total: pending.grantUnits ?? 0,
+      used: 0,
+      active: false,
+      // ⚠ **生效时刻**放在 cycleStartTime（前端「待生效/生效倒计时」读它）。
+      cycleStartTime: pending.effectiveAt !== undefined
+        ? new Date(pending.effectiveAt * 1000).toISOString()
+        : '',
+      cycleEndTime: pending.endsAt !== undefined
+        ? new Date(pending.endsAt * 1000).toISOString()
+        : '',
+      expiredTime: pending.endsAt !== undefined
+        ? new Date(pending.endsAt * 1000).toISOString()
+        : '',
+    })
+  }
   return {
     // 仍是**全桶汇总**，与 `packages` 逐项之和一致（`fetchZcodeBalance` 就是这么累加的）。
     total: result.remaining,
@@ -195,6 +269,41 @@ function ok(balance: CreditBalance): { balance: CreditBalance } {
 /** 组装一条「查不到」的带原因结果（`error` 必须是可读原因，不是 0）。 */
 function fail(error: string): { balance: null; error: string } {
   return { balance: null, error }
+}
+
+/**
+ * TRAE：在**签到收尾**参与 1024 打卡抽奖，并把结果压成**一句话提示**。
+ *
+ * ## ⚠️⚠️ 三条纪律（每条对应一次真实事故或实测）
+ *
+ * 1. **绝不影响签到成败**：抽奖是不可逆写操作，且会因「今日已参与」「不在活动期」
+ *    「无资格」失败 —— 那些都**不是**签到失败。故本函数**永不抛**，只回提示或 `undefined`。
+ *    （本仓库有两轮「登录成功却因记账失败被报成失败」的事故史。）
+ * 2. **不该抽时零请求、零提示**：判定为 `skipped`（已抽过 / 窗口外 / 无资格）时
+ *    返回 `undefined` ⇒ 调用方不追加任何文案（那是「本来就不该抽」，报出来是噪声）。
+ * 3. **奖品如实转述**：真机抽到的是**券**（`prize_text: "AI Build 专属抵扣券"`
+ *    + `coupon_face_amount_fen: 1000`），**没有** `credits` 字段 ⇒ 只用积分数会让
+ *    「抽到券」退化成「所得未知」，把已知信息白丢。
+ *
+ * ⚠️ 内部三道闸门见 `trae-lottery.ts`（先读状态 → 只对 `participate` 发请求 → **不重试**）。
+ */
+async function runTraeLotteryForUi(credential: TraeCredential): Promise<string | undefined> {
+  try {
+    const result = await participateTraeLottery(credential, TRAE)
+    if (result.kind === 'ok') {
+      if (result.prizeText !== undefined) return `1024 打卡抽奖：${result.prizeText}`
+      if (result.credits !== undefined) return `1024 打卡抽奖：${result.credits} 积分`
+      return '1024 打卡抽奖：已参与（所得以 IDE 面板为准）'
+    }
+    if (result.kind === 'failed') {
+      // ⚠️ 服务端文案如实透传（「今日已参与」之类是唯一线索，不得替换成通用话术）。
+      return `1024 打卡抽奖未成功：${result.message ?? result.reason ?? '未知原因'}`
+    }
+    return undefined
+  } catch {
+    // 抽奖的任何异常都不得上抛（见纪律 1）。
+    return undefined
+  }
 }
 
 /**
@@ -296,7 +405,73 @@ export function createProviderCredits(
           call.accountPool.traeCheckinDeviceGenerationFor(entry.id),
           (next) => call.accountPool.updateTraeCheckinDeviceGeneration(entry.id, next),
         ),
+      /**
+       * ★★ **签到收尾顺带参与 1024 打卡抽奖**（2026-10-20 用户指定：
+       *    「点签到按钮时触发」）。
+       *
+       * ## ⚠️⚠️ 为什么**不能**挂在 `claim` 里（第一版就是这么写的，实测失效）
+       *
+       * 本家 `precheckStatus: true` ⇒ `credits.claimAll` 会**先查状态**，
+       * 今天已签到就直接回 `already-claimed`、**根本不调 `claim`**。
+       * 而「已签到」恰恰是最该抽奖的时机（签到后才解锁抽奖）
+       * ⇒ 挂在 claim 内等于**几乎永不触发**。
+       * 用户实测：4 个账号全显示「今天已签到」，一条抽奖信息都没有。
+       *
+       * ⇒ 改挂 `afterClaimNote`：它对 `claimed` **与** `already-claimed` 都会跑。
+       */
+      afterClaimNote: (credential) => runTraeLotteryForUi(credential as TraeCredential),
       precheckStatus: true,
+    },
+
+    /**
+     * ModelScope（魔搭）：**本 fork 独有**（2026-10-17 接入魔粒余额）。
+     *
+     * ⚠️⚠️ **这一条推翻了 PR 的核心前提**。PR（及本仓库一度）判定「魔搭没有额度
+     * 查询 API」并把 `credits.balance` 登记为 `false`、还写进了豁免表。**那是错的**：
+     * 真端点是 `GET https://www.modelscope.cn/openapi/v1/magicubes/balance`，
+     * **带 API Key 直接返 200**（实测 281 → 发 2 次推理 → 277，恰好 -4）。
+     * ⇒ 不需要网页登录态、不需要 cookie、不需要起浏览器。
+     *
+     * ⚠️ 用 {@link ProviderCredits.fetchBalanceDetailed}：三种失败的**用户动作**
+     * 完全不同（Key 失效 → 重生成；端点侧拒绝 → 多半是账号未实名，换 Key 无用；
+     * 缺字段 → 上游改版该报「读数格式变了」），压成笼统的「查询失败」会误导。
+     */
+    modelscope: {
+      fetchBalanceDetailed: async (credential) =>
+        fetchModelscopeBalanceDetailed(credential as ModelscopeCredential, MODELSCOPE),
+    },
+
+    /**
+     * Codely（Unity 团结引擎）：**本 fork 独有**（2026-10-19 接入积分余额）。
+     *
+     * 真端点 `GET /api/user/usage/summary`（Bearer + X-User-Agent），实测 200
+     * 返回 `remaining_points:"2400"` —— ⚠️ 数字是**字符串**，解析在
+     * `fetchCodelyBalanceDetailed` 内（string | number 双形态）。
+     *
+     * ⚠️ registry 里 `channel:false` 但 `balance:true` —— 这是全仓第一例
+     * 「有余额能力、无 auth 服务」的组合：登录走设备码纯函数（无 XxxAuth）、
+     * 余额原语是自由函数，二者都不需要 auth 实例。它**不**违反
+     * `provider-runtime-wiring.spec.ts` 那条「balance ⇒ runtime.credits」守卫 ——
+     * 该守卫只检查**已注册 runtime** 的渠道，codely 没有 runtime（无 adapter）
+     * 而被跳过；端点侧的表（`jet-hub-rpc.ts` 的 `createProviderCredits`）
+     * 不依赖 runtime。
+     */
+    codely: {
+      fetchBalanceDetailed: async (credential) =>
+        fetchCodelyBalanceDetailed(credential as CodelyCredential),
+      /**
+       * 每日签到（2026-10-20 实测接通）：两步端点
+       * `POST /api/points/check-in/init` → `POST /api/points/check-in`，
+       * 幂等判据在 `init` 的 `can_check_in`，**内部自带状态预检** ⇒
+       * `precheckStatus: false`（与 autoclaw / codearts 同因：外部再查一次
+       * 属于重复请求，且骨架默认的 buddy 式 `fetchCheckinStatus` 打它的端点
+       * 必然失败 —— 那是一次发错端点的真实上游请求）。
+       *
+       * ⚠️ 网页 dashboard 同款流程；官方 CLI 二进制里没有签到调用（它只管
+       * 推理/余额），端点来源是网页 SPA bundle —— 见 `codely-credits.ts`。
+       */
+      claim: (credential) => claimCodelyDailyCheckIn(credential as CodelyCredential),
+      precheckStatus: false,
     },
 
     /**
@@ -396,9 +571,69 @@ export function createProviderCredits(
      *    客户端按能力矩阵（`dailyCheckin: false`）根本不会渲染「一键领取积分」，
      *    与 raccoon 同形。给它一句文案反而会让面板多出一个永远点不动的入口。
      */
+    autoclaw: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
+      claim: async (credential) =>
+        await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      precheckStatus: false,
+    },
+    /**
+     * **AutoClaw 国际版**（`autoclawintl`）。
+     *
+     * ⚠️⚠️ **必须显式传 `product: AUTOCLAW_INTL`** —— 不传会走默认的国内基址，
+     *    用户的国际账号余额恒查不到（表现为 `410000 用户未登录`）。
+     *    这是「同一实现两个实例」最容易踩的一处：`fetchAutoclawBalanceDetailed`
+     *    的默认参数是 `AUTOCLAW`（国内），漏传会**静默**查错站。
+     *
+     * 实测（2026-10-20）：国际站返回 `code=0`、`total_balance=13000`，
+     * 两个批次包（`AutoClaw Weekly Perks` 3000 / `New-user credits` 10000）。
+     */
+    autoclawintl: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAutoclawBalanceDetailed(
+          credential as AutoclawCredential,
+          { product: AUTOCLAW_INTL },
+        ),
+      claim: async (credential) =>
+        await claimAutoclawDailyQuota(
+          credential as AutoclawCredential,
+          { product: AUTOCLAW_INTL },
+        ),
+      precheckStatus: false,
+    },
     accio: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAccioBalanceDetailed(credential as AccioCredential),
+    },
+
+    /**
+     * AStudio（讯飞 AstronStudio）：额度来自账号后端
+     * `GET /xingchen-studio/points/balance`，只认 Cookie 的 ssoSessionId。
+     *
+     * ⚠️ 同样**必须用 `fetchBalanceDetailed`**（不是 `fetchBalance`）：三类失败的
+     * 用户动作完全不同 —— 会话失效（HTTP 恒 **200** + `code=80000`，唯一出路是去
+     * 客户端**人工重登**，实测无程序化续期接口）/ 服务不可用（可重试，**不得**报成
+     * 需重登，那会让用户白重登一次）/ 响应里没有 `totalBalance`（上游形状变了）。
+     * 查不到时由 `astudio-credits.ts` 返回 `null` + 原因，**绝不写成 0**。
+     *
+     * ⚠️ **签到已接入**（2026-10-16 推翻早期「AStudio 无签到端点」的推论）：
+     * `client-popups/pending` 取待领弹窗（`DAILY_REWARD_DIALOG` / `NEW_USER_DIALOG`）
+     * → `client-popups/complete` 领取，实现在 `astudio-credits.ts` 的 `claimDaily`，
+     * 事实登记见 `docs/agent-notes/providers-astudio.md` §3。
+     * 能力矩阵因此是 `dailyCheckin: true`（`provider-registry.ts:460`），
+     * 客户端**会**渲染「一键领取积分」。
+     *
+     * ⚠️ 本条曾写作「**刻意不提供 `claim`**……能力矩阵里 `dailyCheckin: false`
+     * ⇒ 客户端根本不渲染」——那是被本 PR 自己的文档 §3 推翻的**旧结论残留**，
+     * 与紧邻的实现（下面的 `claim`）**逐字相反**。2026-10-18 审计订正。
+     */
+    astudio: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAstudioBalanceDetailed(credential as AstudioCredential),
+      claim: async (credential) =>
+        await claimDaily(credential as AstudioCredential),
+      precheckStatus: false,
     },
 
     /**
@@ -421,16 +656,33 @@ export function createProviderCredits(
     },
 
     /**
-     * MiniMax：`GET /minimax-cloud/api/v1/credit/details`。
+     * MiniMax Code **中国版**：`GET /minimax-cloud/api/v1/credit/details`。
      *
      * ⚠️ 该端点是**平铺响应**（`total_count` 与 `base_resp` 同级、没有 `data` 键），
      * `fetchMinimaxCreditBalance` 内部已兼容两种形状。
      * ⚠️ 查不到时（null）由共享骨架统一补「余额查询失败」—— 卡片显示原因而非 0
      *（本机实测 `total_count: 0` 且 `details` 缺失正是「真的为 0」）。
+     *
+     * ⚠️ 第二个实参传 `undefined`（**不是** `fetch`）：三个原语的签名是
+     * `(credential, fetcher = fetch, product = MINIMAX)`，传 `undefined` 会触达
+     * 同一个默认参数 ⇒ 与「不传」逐字节等价，只把**站点**显式钉住。
      */
     minimax: {
-      fetchBalance: (credential) =>
-        fetchMinimaxCreditBalance(credential as MinimaxCredential),
+      /**
+       * ⚠️⚠️ **必须走 `fetchBalanceDetailed`**（真实缺陷，2026-10-17 审计打穿）。
+       *
+       * `fetchBalance` 的 `null` 会被共享骨架统一补一句写死的「余额查询失败」，
+       * 于是 `requestEnvelope` 辛苦构造的地理路由两条出路 / `invalid signature` /
+       * `凭据已失效` **一行都到不了 UI** —— 用户报障的那句话修复后逐字未变。
+       * ⇒ 本家正式加入 `fetchBalanceDetailed` 那一批（codearts / gemini / cline…），
+       * 原因由实现自己给。
+       */
+      fetchBalanceDetailed: async (credential) => {
+        const { balance, error } = await fetchMinimaxCreditBalanceDetailed(
+          credential as MinimaxCredential, undefined, MINIMAX,
+        )
+        return { balance, ...error === undefined ? {} : { error } }
+      },
       // ⚠️ **有**独立的签到状态端点，与「如实返回 null」的那几家不同。
       // 判据是 `is_today && status===3`（见 `minimaxPanelToCheckinStatus`），
       // 不是「没有 Claimable」。`active` 恒 true（拿到响应即 true）。
@@ -438,8 +690,10 @@ export function createProviderCredits(
       // ⚠️ 它同时是**领取预检**的数据源（`precheckStatus` 缺省 true，见下）——
       //    预检与面板读数是同一个端点，故**只声明一次**（不再写 `claimStatus`：
       //    两处声明同一实现会漂移）。
+      //
+      // ⚠️ 预检只需要「能不能判」，不需要原因 ⇒ 用无原因的简单变体即可。
       fetchStatus: (credential) =>
-        fetchMinimaxSigninStatus(credential as MinimaxCredential),
+        fetchMinimaxSigninStatus(credential as MinimaxCredential, undefined, MINIMAX),
       /**
        * ⚠️ **必须开启状态预检**（`precheckStatus` 缺省 true，不要传 false）。
        *
@@ -449,7 +703,52 @@ export function createProviderCredits(
        * `todayCheckedIn` 先挡住，避免把「今天已领」报成「+积分」。
        * 反之传 false 会让已签到账号走到 claim 请求（多发一次 POST）。
        */
-      claim: (credential) => claimMinimaxDailyCheckin(credential as MinimaxCredential),
+      claim: (credential) =>
+        claimMinimaxDailyCheckin(credential as MinimaxCredential, undefined, MINIMAX),
+    },
+
+    /**
+     * MiniMax Code **国际版**（`minimaxintl`）—— 与上面的中国版**同形**，
+     * 只把 `product` 换成 {@link MINIMAX_INTL}（主机 `agent.minimax.io`、
+     * ref 前缀 `MINIMAXINTL_*`）。
+     *
+     * ⚠️ **必须各占一条**：三个原语都用 `product.apiHost` 构造 URL —— 共用一条
+     * 会让国际站账号的签到/余额打到 `agent.minimax.cn`，而两站**账号不互通**
+     * ⇒ 必然 401，症状是「国际站账号的积分永远查询失败」，且**不报错到面板以外**。
+     *
+     * ⚠️ **验证状态如实标注**（2026-10-16 合并审计修正 —— 原文写「三项未真机验证」
+     * 并指向一个**并不存在**的「未实测清单」，与 `src/minimax-product.ts`
+     * 文件头的「✅ 已真机验证」互相否定）：**签到 / 积分三个入口已真机验证通过**
+     * （2026-10-15，真实国际站账号返回 200；见 `src/minimax-product.ts` 文件头与
+     * `tests/e2e/minimaxintl-probe.e2e.spec.ts`）。**未验证的只有兜底模型表**
+     * （与国内站共用同一份，仅远端失败时兜底）。
+     *
+     * ⚠️ **`X-Forwarded-For` 必须传**（issue IKMEVG，2026-10-17 真机实测）：
+     * `agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，而
+     * 跟到中国站后国际站 token 只会得到 `401 invalid access token`
+     *（与「凭据失效」逐字同形）。用户可在面板里填一个海外 IP 绕开这个分流；
+     * 不填则行为与修复前完全一致（不附该头）。
+     *
+     * ⚠️ 每次调用**现读** `deps.minimaxXff()`（用户随时可能改设置）。
+     */
+    minimaxintl: {
+      // ⚠️ 走 Detailed（理由同中国版）：否则「地理分流 / 凭据失效 / 网关签名」
+      //    这些**唯一能指路**的原因会被压成一句「余额查询失败」。
+      fetchBalanceDetailed: async (credential) => {
+        const { balance, error } = await fetchMinimaxCreditBalanceDetailed(
+          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+        )
+        return { balance, ...error === undefined ? {} : { error } }
+      },
+      fetchStatus: (credential) =>
+        fetchMinimaxSigninStatus(
+          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+        ),
+      // 预检与幂等理由同中国版（见上）。
+      claim: (credential) =>
+        claimMinimaxDailyCheckin(
+          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+        ),
     },
 
     /**
@@ -463,9 +762,20 @@ export function createProviderCredits(
      * 面板不渲染那一行（**不是错误**）。
      */
     gemini: {
-      fetchBalanceDetailed: async (credential) => {
+      fetchBalanceDetailed: async (credential, call) => {
+        const accountId = call?.accountId
+        // ⚠️ **省略 fetcher 时恒直连**（缺 `geminiFetchFor` 的单测与兜底），
+        // 这里只在解析器在场且拿到了账号 id 时传 —— 保持「三者都没传时逐字
+        // 等价」的既有约定（不少单测只注入 credential）。
+        // ⚠️ 必须**先建对象再展开**：三元里的条件表达式直接展开会得到
+        // `{} | {fetcher}` 联合类型，tsc 判它不可迭代（TS2488）。
+        const creditOptions: GeminiCreditOptions = (
+          deps.geminiFetchFor === undefined || accountId === undefined || accountId === ''
+            ? {}
+            : { fetcher: deps.geminiFetchFor(accountId) }
+        )
         const { balance, error, tier } = await fetchGeminiCreditBalance(
-          credential as GeminiCredential, GEMINI,
+          credential as GeminiCredential, GEMINI, creditOptions,
         )
         const extra: RpcCreditsBalanceExtra | undefined = tier === undefined
           ? undefined

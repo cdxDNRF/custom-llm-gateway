@@ -1275,7 +1275,10 @@ export async function createOpencodeProvider(
     markLimited: async (slotId: string, modelId: string, resetAtMs: number) => {
       await pool.updateModelRateLimit(slotId, modelId, resetAtMs).catch(() => {})
     },
-    disabledModels: () => new Set(), // 黑名单由账号池侧统一处理（与其它家一致）
+    // ⚠️ 2026-10-24 上游把「黑名单 / 关闭意图」收敛进共享骨架
+    //    （`model-catalog.ts` 从 `accountPool` 读走），`disabledModels` 回调
+    //    **已删除**。这里不再传；传了是编译错误，且会重现「同一语义两套判据」。
+    //    上游明确要求：不要把它加回来。
   }) as LlmAdapter
 
   return new GenericImpl({
@@ -1458,7 +1461,9 @@ export async function createOfficeAceProvider(
     // ⚠️ 续期**必须注入**（上游注释明确）：漏接的症状是账号永不过期、
     //    重新登录后旧凭据仍被沿用，且日志里一个字都没有。
     refresh: async () => { await refreshStoredCredential() },
-    disabledModels: () => new Set(),
+    // ⚠️ 2026-10-24 上游迁移：`disabledModels` 回调已删除，改由共享骨架从
+    //    `accountPool` 读取。这里传 `pool` 才能保留「关闭供应商 / 黑名单」语义。
+    accountPool: pool,
   }) as LlmAdapter
 
   return new GenericImpl({

@@ -33,8 +33,7 @@ export const GEMINI_USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v2/us
 export const GEMINI_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke'
 
 /** 上游 Cloud Code 客户端的公开 client（env 可覆盖，用于自建凭据的场景）。 */
-export const GEMINI_DEFAULT_CLIENT_ID =
-  ''
+export const GEMINI_DEFAULT_CLIENT_ID = ''
 export const GEMINI_DEFAULT_CLIENT_SECRET = ''
 
 /** 回调路径（与 client 注册值逐字一致，改了就 redirect_uri_mismatch）。 */

@@ -1,4 +1,4 @@
-import { isGatewayEnabled } from './config.js'
+import { isGatewayEnabled, isGatewayHostFromEnv, WILDCARD_GATEWAY_HOST } from './config.js'
 import type { ApiKeySource } from './auth.js'
 import type { OpenAiGateway } from './server.js'
 
@@ -36,6 +36,15 @@ type GatewayFactory = () => OpenAiGateway | undefined
 
 /** 期望状态（来自持久化）。`true` = 希望网关在运行。 */
 let desiredEnabled = true
+/**
+ * 期望状态（来自持久化）：「允许局域网访问」开关。
+ *
+ * `true` = 希望网关绑 `0.0.0.0`（局域网可达）；`false` = 只绑回环/env 配置的
+ * 本机地址。默认 `false`：老用户升级后行为不变。⚠️ 与 `desiredEnabled` 同一
+ * 取向——它只是**期望**，实际收敛见 {@link applyGatewayDesiredState}；env 显式
+ * 给了 `DSH_OPENAI_GATEWAY_HOST` 时它不生效（env 优先，见 config.ts）。
+ */
+let desiredAllowLan = false
 /** 由 `mountOpenAiGateway` 注册，用于按需创建网关实例。 */
 let factory: GatewayFactory | undefined
 /** 当前正在运行的实例；`undefined` 表示未在监听。 */
@@ -74,6 +83,16 @@ export function setGatewayDesiredEnabled(enabled: boolean): void {
   desiredEnabled = enabled
 }
 
+/** 读取「允许局域网访问」的期望状态。 */
+export function gatewayDesiredAllowLan(): boolean {
+  return desiredAllowLan
+}
+
+/** 记录「允许局域网访问」的期望状态（**不**重建实例，由收敛完成换绑）。 */
+export function setGatewayDesiredAllowLan(allowLan: boolean): void {
+  desiredAllowLan = allowLan
+}
+
 /** 网关当前是否真的在监听端口。 */
 export function isGatewayRunning(): boolean {
   return running !== undefined
@@ -105,27 +124,43 @@ export function gatewayApiKey(): ApiKeySource | null {
  * 启动失败（端口冲突等）只记日志并把 `running` 复位，**不抛**——调用方是
  * 设置页的同步 handler，抛错会变成用户可见的报错弹窗，而网关失败本来就不该
  * 影响 Jet Hub 其它功能。
+ *
+ * ⚠️ **host 也是期望状态的一部分**（v7，2026-10-20）：「允许局域网访问」开关
+ * 翻转会改变监听地址，而 `listen()` 的绑定地址在创建时定格——改绑只能**关闭
+ * 旧实例再重建**。收敛判据必须与工厂**同源**（`isGatewayHostFromEnv` 参与
+ * 计算）：env 显式给了 host 时开关不生效，期望通配恒为 `false`，此时若拿
+ * `desiredAllowLan` 裸比较，会因「重建后仍绑 env 地址」而**永远失配、反复重建**。
  */
 export async function applyGatewayDesiredState(): Promise<void> {
   const shouldRun = isGatewayEnabled(process.env) && desiredEnabled
-  if (shouldRun) {
-    if (running !== undefined || factory === undefined) return
-    // 工厂按契约不抛，但仍兜一层：单例模块级的代码不能因为调用方的疏漏
-    // 把异常带进设置页的同步 handler。
-    const gateway = factory()
-    if (gateway === undefined) return
-    running = gateway
-    try {
-      await gateway.start()
-    } catch {
-      running = undefined
-    }
+  if (!shouldRun) {
+    if (running === undefined) return
+    const gateway = running
+    running = undefined
+    await gateway.close()
     return
   }
-  if (running === undefined) return
-  const gateway = running
-  running = undefined
-  await gateway.close()
+  // 期望通配 = 开关打开 **且** env 没有显式给 host（与工厂的配置解析同一条件）。
+  const desiredWildcard = desiredAllowLan && !isGatewayHostFromEnv(process.env)
+  const runningWildcard = running?.address()?.host === WILDCARD_GATEWAY_HOST
+  if (running !== undefined && runningWildcard === desiredWildcard) return
+  // 需要（重）建：先关旧实例（换绑必须重建——listen 的地址创建时定格）。
+  if (running !== undefined) {
+    const stale = running
+    running = undefined
+    await stale.close()
+  }
+  if (factory === undefined) return
+  // 工厂按契约不抛，但仍兜一层：单例模块级的代码不能因为调用方的疏漏
+  // 把异常带进设置页的同步 handler。
+  const gateway = factory()
+  if (gateway === undefined) return
+  running = gateway
+  try {
+    await gateway.start()
+  } catch {
+    running = undefined
+  }
 }
 
 /** 插件卸载时调用：停掉网关并清空工厂，避免热重载后残留旧实例的引用。 */

@@ -125,6 +125,22 @@ export interface ProviderAccountEntry {
    * 缺省/0 = 用凭据里派生的初始指纹。
    */
   opencodeFingerprintGeneration?: number
+  /**
+   * **Gemini** 账号的出口代理（空/缺省 = 直连，Gitee issue IKLTZ2）。
+   *
+   * ⚠️ Gemini 全部端点（`oauth2.googleapis.com/token`、userinfo、
+   * `cloudcode-pa.googleapis.com`）都在墙外，而 undici **既不读 Windows WinINET
+   * 系统代理、也不读 `HTTP(S)_PROXY`**（除非额外开 `NODE_USE_ENV_PROXY`）⇒
+   * 「浏览器能授权、面板里账号一直不出现」正是本字段存在的理由。
+   *
+   * ⚠️ 与 `opencodeProxy` **刻意分成两个字段**而不是共用一个：两者的
+   * **语义不同**（opencode 是「多账号要分份额度」，Gemini 是「单账号能不能连通」），
+   * 共用会让「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   */
+  geminiProxy?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -155,6 +171,16 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
    * `src/zcode.ts` 的 `phoneFromUserId`。
    */
   phone?: string
+  /**
+   * ⚠️ **本 fork 独有**（modelscope，2026-10-17）：**打码后**的访问令牌
+   * （`ms-…62f3`），供账号卡片展示与「编辑」入口。
+   *
+   * ⚠️⚠️ **绝不下发明文**：凭据经 RPC 明文下发等于把它摊到客户端 devtools、
+   * 日志与崩溃上报里。取不到合法打码时**不设该字段**（宁可不显示）。
+   * 打码由**宿主**的 `maskModelscopeKey()` 完成 —— 两端各写一份必然漂移，
+   * 且客户端那份一旦漏判形状就会回显原文。
+   */
+  modelscopeKeyMask?: string
 }
 
 /** Jet Hub 在 ctx.settings 中的 schema */
@@ -210,6 +236,30 @@ export interface RpcCreateAccountRequest {
    * 同因，issue IKJLK3 E2）。
    */
   accioRegion?: 'cn' | 'global'
+  /**
+   * 出口代理（**仅 Gemini 需要**；Gitee issue IKLTZ2 审计 P2-1）。
+   *
+   * ## ⚠️ 为什么登录载荷要带它（真实缺陷：死锁）
+   *
+   * Gemini 的换 token 请求发生在**凭据落盘之前**，而出口代理是**账号维度**的
+   * ⇒ 它只能从池里那条**占位条目**读。于是顺序是：
+   *
+   * 1. 客户端 `account.create`（此时账号还不存在）；
+   * 2. 占位条目入库；
+   * 3. 换 token（**此刻才读代理**）。
+   *
+   * 若占位条目不带代理，墙外环境下第 3 步恒直连 ⇒ **登录恒失败**；而用户
+   * **没法给一个还不存在的账号配代理**（面板的「代理」按钮按 `accountId` 打开）
+   * ⇒ **死锁**：唯一出路是导出 `HTTPS_PROXY` 环境变量。
+   *
+   * ⚠️ 实际触发路径很常见：refresh_token 失效时用户的既定动作是
+   * 「删号重登」（面板就是这么建议的，见 `plugin-src/client/jet-hub.js`），
+   * 而重登会造一个**全新 id** ⇒ 旧号上的代理配置必然丢失。
+   *
+   * ⚠️ **只对 Gemini 有意义**，其余 provider 忽略（它们的端点不在墙外）。
+   * ⚠️ 缺省 = 空串 = 直连，与既有行为**逐字一致**。
+   */
+  geminiProxy?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string
@@ -583,6 +633,41 @@ export interface RpcBuddyGrowthTasksResponse {
 /** RPC: 查询某 provider 下全部账号的积分余额请求 */
 export interface RpcCreditsBalancesRequest {
   provider: string
+  /**
+   * 只查这些账号（**可选**；省略 = 全部账号，即积分面板的语义）。
+   *
+   * ## ⚠️ 存在的理由（用户 2026-10-15 的性能诉求）
+   *
+   * 用量徽标只需要**启用账号**的读数（停用账号既不进合计、也不渲染明细）⇒
+   * 让它传启用账号的 id 列表，能**少查**几个号（每次渲染省 N 个顺序上游请求）。
+   *
+   * ⚠️ **它不影响自愈**：`credits.balances` 入口的 `healExpiredAccounts` 仍对
+   * **全部**账号跑（AGENTS.md 的成文铁律：「续期不得按 `enabled` 过滤」——
+   * 停用只影响自动选号，与凭据是否需要保持新鲜无关）。本字段只裁剪**余额查询**
+   * 那一批。
+   * ⚠️ 省略时**逐字节**保持既有行为（含停用账号 —— 积分面板的现状语义）。
+   * ⚠️ 传空数组 = 一条都不查（而不是「查全部」）：那是最容易被写成反义的一格，
+   * 故有一条用例专门锁它。
+   */
+  accountIds?: string[]
+  /**
+   * `true` = **绕过共享读数缓存**（含陈旧兼顶），强制回源（面板「刷新积分」按钮）。
+   *
+   * ## ⚠️ 为什么必须有它（2026-10-16 审计 P1-1，实测确认的回归）
+   *
+   * 引入共享缓存（`balance-cache`）后 `credits.balances` 会吃缓存，于是面板的
+   * 「刷新积分」按钮**在 120 秒内点了等于没点** —— 而该按钮的 `title` 写着
+   * 「余额由服务端实时计算，点此可刷新」，此时是**假的**。
+   *
+   * ⚠️ 更隐蔽的一档是**陈旧兼顶**：上游已挂 10 分钟时，点「刷新」仍返回
+   * 15 分钟兼顶上限内的旧值 +「本次查询失败」。用户的诉求是「给我新数据」，
+   * 实现给「再读一次旧数据」—— **比报错更糟**，因为它看起来成功了。
+   *
+   * ⚠️ **省略时行为不变**（吃缓存，与引入缓存前一致）。
+   *
+   * @see BalanceCache.readStale 的 `force` 语义（`force` 下**不兼顶**）
+   */
+  force?: boolean
 }
 
 /**
@@ -701,7 +786,19 @@ export interface RpcCreditsBalancesResponse {
    * 「提示说只烧 15 天内的、实际按 31 天筛号」。
    * Loomy / Raccoon **不带**该字段：它们的积分由服务端按语义分成多个池下发
    * （其中有「每日刷新」池），走的是**池名分桶**（`formatPoolSplitLine`），
-   * 不是到期时间分桶。Qoder 虽有包到期字段但未接入分桶展示（仅 hover 明细）。
+   * 不是到期时间分桶。
+   *
+   * ⚠️ **Qoder（`qoder` / `qodercn`）2026-10-20 起已接入分桶展示** ——
+   * 此前那句「虽有包到期字段但未接入分桶展示（仅 hover 明细）」是上一版实现的
+   * **失实**表述（既低估了能力，也漏了 `windowDays` 这个渲染闸门；
+   * 缺口本体与修复见 `jet-hub-rpc.ts` 里 qoder 分支的长注释）。
+   *
+   * ⚠️ 但**如实标注其实际分档形态**，勿读成「面板一定是三行数字」：
+   * Qoder 的**逐包到期上游拿不到**（`addOnQuota` 只给聚合标量；逐包明细端点
+   * 只对浏览器登录态开放；`dedicatedResourcePackages` 是唯一带真实 `expiresAt`
+   * 的字段，本机账号实测为 `undefined`）⇒ `packages[]` 全员进
+   * **永久（未知到期）**桶 ⇒ **临期桶只在真有 `dedicatedResourcePackages`
+   * 的账号上才非 0**。这不是缺陷，是「上游不下发 ⇒ 不编造」的如实结果（本仓库红线）。
    */
   windowDays?: number
 }
@@ -721,6 +818,53 @@ export interface RpcCreditsBalancesResponse {
  * 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分
  * （见 `src/cline-quota.ts` 的模块头注释）。
  */
+
+/** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
+/** RPC: 查询某账号的 **CodeBuddy 限时补偿积分**状态（2026-10-16 新增）。
+ *
+ * ⚠️ 这是**一次性限时活动**，不是每日签到能力 ⇒ **不接 `credits.claimAll`**。
+ * ⚠️ 端点走 buddy 的 **`webBase`** —— `src/product.ts` 里该值是
+ * `https://www.workbuddy.cn`；`www.codebuddy.cn` 只是三个实测可达 host 之一，
+ * **不是 `webBase` 本身**（PR !106 初版把两者混为一谈，2026-10-16 审计更正）。
+ * 三个 host 均可达这件事见 `src/buddy-compensation.ts` 模块头。
+ *
+ * ⚠️⚠️ **客户端契约**：`rpcCall` 成功时返回的是**解包后的 `value`**（**没有
+ * `ok` 字段**），失败时**抛错**（`plugin-src/management-rpc.mjs` 的
+ * `unwrapRpcResult`）⇒ 消费方**判 `res.ok` 恒假**，必须走字段判据 + try/catch。
+ * 见 `plugin-src/client/compensation-panel-logic.js` 模块头。
+ */
+export interface RpcBuddyCompensationStatusRequest {
+  /** 目前只有 `'buddy'`（CodeBuddy 中国版）。 */
+  provider: string
+  /** 目标账号 id（补偿是**按账号**的，不是全局）。 */
+  accountId: string
+}
+
+/** RPC: CodeBuddy 补偿状态响应。字段名**逐字对应上游**，不做重命名。 */
+export interface RpcBuddyCompensationStatusResponse {
+  /** 本账号是否已领取。 */
+  claimed: boolean
+  /** 活动是否仍在进行。 */
+  active: boolean
+  /** 可领取的积分数（上游 `credit_num`）。 */
+  creditNum: number
+  /** 上游 `validity_period`，含义未说明，**原样透传**。 */
+  validityPeriod?: number
+  /** 截止时间（上游原样字符串，如 `"2026-10-22 23:59:59"`）。 */
+  endTime?: string
+}
+
+/** RPC: 领取某账号的 CodeBuddy 补偿积分（**写操作，只能成功一次**）。
+ *
+ * ⚠️ **只由面板按钮显式触发**，不得接进定时器 / 自动签到（见模块头）。
+ */
+export interface RpcBuddyClaimCompensationRequest {
+  provider: string
+  accountId: string
+}
+
+/** RPC: 领取响应。成功即空对象（领取后由调用方重新查询状态刷新展示）。 */
+export interface RpcBuddyClaimCompensationResponse {}
 
 /** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
 export interface RpcClineQuotaRequest {
@@ -1014,8 +1158,29 @@ export interface RpcAggregateCandidate {
   price: number
   /** 是否靠**显式补丁**归一（面板标 `⚠️补丁` 供人工核查）。 */
   viaPatch: boolean
-  /** 是否被用户拒绝参与该模型的轮换。 */
+  /**
+   * 该候选当前**是否参与轮换**（= `state === 'allowed'`）。
+   *
+   * ⚠️ 语义已**收窄**（用户 2026-10-15）：升级前它等于「用户显式拒绝」，现在等于
+   * 「当前不参与轮换」—— 含**新增的**「未接入临期折算 ⇒ 默认不参与」这一态。
+   * 保留本字段是为了不动既有客户端渲染与既有用例；新代码一律读 `state`。
+   */
   rejected: boolean
+  /**
+   * 三态门控结果（**权威**，由宿主 `resolveCandidateGate` 判定）：
+   * `'allowed'` 参与 / `'rejected'` 用户显式拒绝 / `'default-rejected'` 未接入折算的默认不参与。
+   *
+   * ⚠️ 客户端**只渲染、不判定**（本仓库「同一语义两套判据」的红线）。
+   */
+  state: 'allowed' | 'rejected' | 'default-rejected'
+  /**
+   * 该渠道是否**已接入临期折算**（`WIRED_EXPIRY_PROVIDERS`）。
+   *
+   * ⚠️ 客户端读它是「读宿主下发的**事实**」，不是「自己重算接入状态」⇒ 不违反红线。
+   * 它唯一的用途是决定「关掉一条候选时该写拒绝表还是白名单」（未接入渠道的「不参与」
+   * 与「拒绝」同义 ⇒ 写白名单回到默认态，而不是往拒绝表里堆无作用的条目）。
+   */
+  expiryWired: boolean
 }
 
 /** 聚合设置面板的一个虚拟模型（`aggregate.catalog` 的条目）。 */
@@ -1023,11 +1188,25 @@ export interface RpcAggregateModel {
   canonicalId: string
   name: string
   candidates: RpcAggregateCandidate[]
+  /**
+   * 该模型的**手工顺序**（元素 = `` `${provider}\u0000${realId}` ``）。
+   *
+   * ⚠️ 宿主已**按当前候选集过滤**（id 漂移的脏键不会下发）⇒ 客户端渲染与拖拽
+   * **不需要第二个读端点**。空数组 = 未自定义（展示与轮换都回落临期序）。
+   */
+  order: string[]
 }
 
-/** RPC: 列出聚合目录（虚拟模型 + 各自候选 + 拒绝状态）响应 */
+/** RPC: 列出聚合目录（虚拟模型 + 各自候选 + 三态门控）响应 */
 export interface RpcAggregateCatalogResponse {
   models: RpcAggregateModel[]
+  /**
+   * 当前排序模式（`'expiry'` = 按临期，升级前行为；`'manual'` = 按手工顺序）。
+   *
+   * ⚠️ 权威在宿主：客户端进入面板时用它初始化，**不得**自己推导（例如「顺序表非空就是手工」——
+   * 用户可以切到手工模式却一条都没拖过）。
+   */
+  orderMode: 'expiry' | 'manual'
 }
 
 /** RPC: 设置某条候选是否拒绝参与轮换请求 */
@@ -1038,15 +1217,69 @@ export interface RpcAggregateSetRejectedRequest {
   rejected: boolean
 }
 
+/**
+ * RPC: 设置某条候选是否**显式允许**参与轮换（用户 2026-10-15 的「手工打开」）。
+ *
+ * ⚠️ 与 {@link RpcAggregateSetRejectedRequest} 是**同一枚开关的两个方向**，但落在
+ * **两张不同的表**上：本端点的目标域是「未接入临期折算」的候选（默认不参与），
+ * 那个端点的目标域是「已接入」的候选（默认参与）。**两表不做互斥归一**
+ *（用户 2026-10-15 的修正：键域天然不相交，写一侧不得改另一侧）。
+ */
+export interface RpcAggregateSetAllowedRequest {
+  canonicalId: string
+  provider: string
+  realId: string
+  allowed: boolean
+}
+
+/** RPC: 写入某虚拟模型的**手工顺序**（`order` 必须整体提交，碎片化追加不在设计内） */
+export interface RpcAggregateSetOrderRequest {
+  canonicalId: string
+  order: string[]
+}
+
+/** RPC: 手工顺序写入后的响应（回传**服务端过滤后**的权威数组，客户端据此校正本地状态） */
+export interface RpcAggregateSetOrderResponse {
+  canonicalId: string
+  order: string[]
+}
+
+/** RPC: 切换排序模式请求 */
+export interface RpcAggregateSetOrderModeRequest {
+  mode: 'expiry' | 'manual'
+}
+
+/** RPC: 排序模式切换后的响应 */
+export interface RpcAggregateSetOrderModeResponse {
+  orderMode: 'expiry' | 'manual'
+}
+
+/**
+ * RPC: 一键「拒绝非临期」响应（把所有**未接入**折算渠道的手工打开恢复为默认不参与）。
+ *
+ * ⚠️ `cleared === 0` 也要回 `ok: true`（幂等点击不是错误），面板据计数决定文案：
+ * 0 ⇒ 「没有需要恢复的候选」，>0 ⇒ 「已把 N 条候选恢复为…」。
+ */
+export interface RpcAggregateRejectNonExpiringResponse {
+  cleared: number
+  aggregateAllowed: Record<string, Record<string, Record<string, boolean>>>
+}
+
 /** RPC: 清空拒绝表请求（`canonicalId` / `provider` 都可省略；都省略 = 清空全部） */
 export interface RpcAggregateClearRejectedRequest {
   canonicalId?: string
   provider?: string
 }
 
-/** RPC: 拒绝表变更后的统一响应（回传写入后的完整拒绝表，便于前端校验） */
+/**
+ * RPC: 聚合路由表变更后的统一响应（回传写入后的**两张表**，便于前端一次校正）。
+ *
+ * ⚠️ 必须同时回两张表：面板的逐条开关要按三态显示，只回拒绝表会让白名单条目
+ * 在下一次点击前一直是陈旧值（与 `rejectionsFromCatalog()` 的既有回填机制同款）。
+ */
 export interface RpcAggregateRejectionsResponse {
   aggregateRejections: Record<string, Record<string, Record<string, boolean>>>
+  aggregateAllowed: Record<string, Record<string, Record<string, boolean>>>
 }
 
 /**
@@ -1113,6 +1346,33 @@ export interface RpcModelClearDeadResponse {
 export interface RpcModelSetAllDisabledRequest {
   provider: string
   disabled: boolean
+  /**
+   * 是否**同时**落「供应商整体关闭」意图（默认 `true`，保持既有语义）。
+   *
+   * ## ⚠️⚠️ 为什么需要这个开关（2026-10-21 合并审计发现，阻断级）
+   *
+   * 关闭方向原本**无条件**落意图（`writeModelsWithProviderClosed(…, true)`），
+   * 而意图的三个后果是：
+   * ① `provider.status` 报 `closed: true` ⇒ 左侧分组变成「已关闭」；
+   * ② 各适配器的 `listModels` 直接返回 `[]` ⇒ 该家模型在选择器里**一个都没有**；
+   * ③ **打开任意一个模型会顺带把整个供应商打开**（`setModelDisabled` 的打开
+   * 方向会清意图）。
+   *
+   * ⇒ 用户在「模型列表」屏点一次「全关」（只想关这家模型），
+   * 却把**整个供应商**也关了；再打开**任意一个**模型，供应商又被顺带打开。
+   * 两头都与用户的意图相反，且**零提示**。
+   *
+   * ## 两个方向的取值
+   *
+   * - `true`（默认）：维持既有语义 —— 「关闭全部模型」**等价于**「关闭该供应商」
+   *   （既有供应商级开关 `provider.setEnabled(false)` 走的是同一条路径）。
+   * - `false`：**只**改模型黑名单，**不**落意图 ⇒ 供应商仍「已打开」、账号仍可用、
+   *   只是这些模型从选择器里消失。
+   *
+   * ⚠️ **缺省即 `true`**：既有调用方（`provider.setEnabled(false)` 与既有的
+   * 「模型列表」屏的「关闭全部」）的语义**逐字不变**。
+   */
+  closeProvider?: boolean
 }
 
 /** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
@@ -1287,6 +1547,19 @@ export interface RpcGatewayStatusResponse {
   running: boolean
   /** 是否被 `DSH_OPENAI_GATEWAY_ENABLED` 显式停用（此时设置页改开关无效）。 */
   blockedByEnv: boolean
+  /**
+   * 「允许局域网访问」开关（持久化状态，2026-10-20）。
+   *
+   * `true` = 用户选择绑 `0.0.0.0`；`false` = 只绑回环/env 地址。⚠️ 与
+   * {@link hostFromEnv} 同看：env 显式给了 host 时本开关不生效，UI 必须明说。
+   */
+  allowLan: boolean
+  /**
+   * env 是否显式给了 `DSH_OPENAI_GATEWAY_HOST`（运维口径，优先于上面的开关）。
+   * 为 `true` 时设置页应禁用局域网开关并说明原因——「打开了却没生效」比
+   * 「禁用并解释」更让人困惑（与 `blockedByEnv` 禁用主开关的同一取舍）。
+   */
+  hostFromEnv: boolean
   /** 实际监听地址；未运行或被 env 停用时为 `null`。 */
   address: { host: string; port: number } | null
   /**
@@ -1378,6 +1651,83 @@ export interface RpcGatewayModel {
 /** RPC: 本机 OpenAI 网关开关写入请求。 */
 export interface RpcGatewaySetEnabledRequest {
   enabled: boolean
+}
+
+/** RPC: 「允许局域网访问」开关写入请求（响应 = 整份 {@link RpcGatewayStatusResponse}）。 */
+export interface RpcGatewaySetAllowLanRequest {
+  allowLan: boolean
+}
+
+/** RPC: 「渠道原生搜索」开关的读取响应。 */
+export interface RpcNativeSearchGetEnabledResponse {
+  /** `true` = 支持原生搜索的渠道走自己后端的搜索接口；`false` = 全部回官方搜索。 */
+  enabled: boolean
+}
+
+/** RPC: 「渠道原生搜索」开关写入请求。 */
+export interface RpcNativeSearchSetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「渠道原生搜索」开关写入响应。
+ *
+ * ⚠️ 回传的是**落盘后重读的值**，不是请求里的值 —— 与 `gateway.setEnabled`
+ * 同取向：客户端一律以后端回传为准，不做乐观更新。
+ */
+export interface RpcNativeSearchSetEnabledResponse {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「侧栏入口」开关的读取响应（Jet Hub 页头的「侧栏」开关）。
+ *
+ * 语义：`true` = 在**主导航**里显示「Jet Hub」入口（点它把 Jet Hub 页渲染进
+ * 中央主面板）；`false` = 只保留「设置 → Jet Hub」这一条进入路径。
+ *
+ * ⚠️ 为什么这个偏好住**宿主**（`state.json`）而不是浏览器 `localStorage`：
+ * 本插件的三条进入路径（Web / 桌面 / headless）共用同一份 `~/.dsh` 状态，
+ * 而 Web 侧的 origin 是 `127.0.0.1:<随机端口>` —— **每次启动端口都变**，
+ * `localStorage` 会随旧 origin 一起被抛弃，表现为「关掉的入口下次启动又回来了」。
+ */
+export interface RpcSidebarEntryGetEnabledResponse {
+  enabled: boolean
+}
+
+/** RPC: 「侧栏入口」开关写入请求。 */
+export interface RpcSidebarEntrySetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「侧栏入口」开关写入响应。
+ *
+ * ⚠️ 与 `nativeSearch.setEnabled` 同取向：回传的是**落盘后重读的值**，
+ * 客户端一律以后端回传为准，不做乐观更新（宿主侧可能因为脏文档把值归一）。
+ */
+export interface RpcSidebarEntrySetEnabledResponse {
+  enabled: boolean
+}
+
+/**
+ * RPC: MiniMax 国际站 `X-Forwarded-For` 设置的读取响应（issue IKMEVG）。
+ *
+ * ⚠️ `xff` 是**归一后的实际值**，空串表示「未设置 / 不附头」。
+ * 客户端照它渲染输入框 —— 不要用用户输入的原文（非法值会被归一成空）。
+ */
+export interface RpcMinimaxXffResponse {
+  /** 当前生效的 `X-Forwarded-For`；`''` = 不附头（走真实出口 IP）。 */
+  xff: string
+}
+
+/**
+ * RPC: MiniMax 国际站 `X-Forwarded-For` 设置的写入请求。
+ *
+ * ⚠️ **空串表示清除**（回到「不附头」），不是「设成空值头」——
+ * 空值的 `X-Forwarded-For` 在 Akamai 侧与不附头等价，但会污染上游日志。
+ */
+export interface RpcMinimaxXffRequest {
+  xff: string
 }
 
 /**

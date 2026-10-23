@@ -115,6 +115,23 @@ export function userContentParts(
         : { type: 'image_url', image_url: { url } })
       continue
     }
+    // ⚠️⚠️ **已经拼好的 `image_url` 块必须原样透传**（2026-10-22 真实缺陷）。
+    //
+    // 背景：`analyzeImage` 的识图请求由**插件自己**构造（不是 harness 派生历史），
+    // 它把图片直接拼成上游要的 `{type:'image_url', image_url:{url}}` 形态后交给
+    // `adapter.stream()`。而本函数此前**只认 harness 原生** `{type:'image',
+    // attachment}`（`imageUrls` 里查字节），对 `image_url` **零命中** ⇒ 该块被
+    // **静默丢弃** ⇒ VL 模型只收到文字 ⇒ 回答「我看不到图片」。
+    // 症状极具误导性：HTTP 200、正文正常、上游无报错，只有答案是错的。
+    // ⇒ 修法：认到 `image_url` 就原样放进 parts（它已经是目标形态，无需再转）。
+    if (block.type === 'image_url') {
+      const url = (block as { image_url?: { url?: unknown } }).image_url?.url
+      if (typeof url === 'string' && url.length > 0) {
+        hasImage = true
+        parts.push({ type: 'image_url', image_url: { url } })
+      }
+      continue
+    }
     if (block.type === 'tool-result' && Array.isArray(block.content)) {
       const inner = userContentParts(block.content, imageUrls)
       if (inner !== undefined) {
@@ -171,12 +188,31 @@ export function serializeMessages(
   const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
   let pendingToolImages: Array<Record<string, unknown>> = []
-  const flushToolImages = (): void => {
-    if (pendingToolImages.length === 0) return
-    wire.push({
-      role: 'user',
-      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
-    })
+  // 含工具结果而被延后的那条 user 消息的内容（排在 `role:'tool'` 之后发出）。
+  let pendingOwnParts: Array<Record<string, unknown>> | undefined
+  /**
+   * 发出挂起的工具结果图片；`own` 是**同一轮要发的那条 user 消息**的内容。
+   *
+   * ⚠️⚠️ **图片必须与提问同在一条 user 消息里**（Issue IKLIFH，与 buddy /
+   * lobsterai 适配器同型）。实测（2026-10-14，直连 `copilot.tencent.com`，
+   * hy4-preview，同一张 1024x768 双色图）：图与问**同条** ✅「左白右蓝」；
+   * 图单独成一条（无论带不带提示句）❌「图像已被过滤」/「不支持图片识别」；
+   * 图并入 `role:'tool'` ❌「不支持读取图片」。
+   *
+   * ⚠️ 症状极具误导性：wire 上**确实有图**、上游也**不报错**（HTTP 200），
+   * 只是模型**看不见**并自称「当前模型不支持图片输入」⇒ 用户会误判成模型
+   * 能力问题、反复换模型。
+   *
+   * ⚠️ 无挂图且 `own` 为空时**什么都不发**：凭空造一条 parts 消息会让纯文本
+   * 会话被上游 400（反向验证实测）。
+   */
+  const flushToolImages = (own?: Array<Record<string, unknown>>): void => {
+    const ownParts = own ?? []
+    if (pendingToolImages.length === 0 && ownParts.length === 0) return
+    // 图与提问**同条**：图在前、own 的文本在后（两种顺序实测都能被看到）。
+    const ownImages = ownParts.filter((part) => part.type !== 'text')
+    const ownText = ownParts.filter((part) => part.type === 'text')
+    wire.push({ role: 'user', content: [...pendingToolImages, ...ownImages, ...ownText] })
     pendingToolImages = []
   }
 
@@ -205,8 +241,9 @@ export function serializeMessages(
         .join('')
       const text = contentToText(content)
       // 挂起的工具结果图片必须在 assistant 之前发出，否则会漂到这条
-      // assistant 之后，与产生它们的工具调用脱节。
-      flushToolImages()
+      // assistant 之后，与产生它们的工具调用脱节。延后正文一并带上。
+      flushToolImages(pendingOwnParts)
+      pendingOwnParts = undefined
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（OpenAI 规范）。
@@ -217,7 +254,8 @@ export function serializeMessages(
       continue
     }
     if (message.role === 'system') {
-      flushToolImages()
+      flushToolImages(pendingOwnParts)
+      pendingOwnParts = undefined
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -229,13 +267,37 @@ export function serializeMessages(
     // 工具结果之外的常规内容（含顶层图片）。
     const regular = content.filter((block) =>
       !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
-    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
-    if (parts !== undefined) {
-      flushToolImages()
-      wire.push({ role: 'user', content: parts })
-    } else if (text.length > 0 || toolResults.length === 0) {
-      flushToolImages()
-      wire.push({ role: 'user', content: text })
+    // ⚠️⚠️ **不能只在 `imageUrls !== undefined` 时才走多模态**（2026-10-22 真实缺陷）：
+    // 插件自己构造的识图请求（`analyzeImage`）把图**直接拼成 `image_url` 块**，
+    // 且**没有** `imageUrls` 映射表 ⇒ 若这里仍按「有表才升级」，那些块永远走不到
+    // `userContentParts` ⇒ 被当成纯文本消息发出 ⇒ **图被静默丢弃**。
+    // ⇒ 判据改为「有映射表 **或** 内容里本来就带 `image_url` 块」。
+    const carriesInlineImage = regular.some((block) =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image_url')
+    const parts = imageUrls === undefined && !carriesInlineImage
+      ? undefined
+      : userContentParts(regular, imageUrls ?? new Map())
+    // ⚠️⚠️ **两条互斥分支**（Issue IKLIFH 的落点）：
+    // 无工具结果 → 立刻发出并让挂起图片搭车；含工具结果 → 整条延后到下一条
+    // user 消息（tool 消息必须紧跟其 assistant `tool_calls`，中间插消息会 400）。
+    const deferred = toolResults.length > 0
+    // ⚠️⚠️ **无挂图且本条无图时必须保持「字符串」形态**（旧行为逐字节不变）：
+    // 纯文本若被包装成 `[{type:'text',…}]`，上游会以 `model_param_invalid` 400
+    // 拒收整个请求（实测）。
+    const hasImage = parts !== undefined
+    const combined: Array<Record<string, unknown>> | undefined = pendingToolImages.length > 0 || hasImage
+      ? [
+        ...(pendingOwnParts ?? []),
+        ...(parts ?? (text.length > 0 ? [{ type: 'text', text }] : [])),
+      ]
+      : undefined
+    pendingOwnParts = undefined
+    if (deferred) {
+      pendingOwnParts = combined ?? (text.length > 0 ? [{ type: 'text', text }] : undefined)
+    } else if (combined !== undefined || toolResults.length === 0) {
+      // ⚠️ 核心修复：挂起图片与本条内容**同一条**发出，而非让图片单独成一条。
+      flushToolImages(combined)
+      if (combined === undefined) wire.push({ role: 'user', content: text })
     }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 的结果同样会让后端 400。
@@ -250,7 +312,18 @@ export function serializeMessages(
             .filter((part) => part.type === 'text')
             .map((part) => String(part.text))
             .join('')
-          if (joined.length > 0) resultText = joined
+          // ⚠️⚠️ **有图无文时绝不能落到 `(no output)`**（Issue IKLSB8，真实报障）。
+          //
+          // `resultParts !== undefined` 的含义是「该工具结果里有内容」，只是内容
+          // **不是文本**（全是图片）。原先这里只在 `joined` 非空时改写 `resultText`，
+          // 于是纯图片型工具结果保留了初值 `(no output)` —— 模型收到的是
+          // **「工具没有任何输出」**，于是回答「Read 没有返回内容 / gave no output」，
+          // 用户据此以为模型没有视觉能力；真实原因是「有输出，输出是图」。
+          //
+          // 判据必须用 `resultParts !== undefined`（**有内容**）而不是「有图」：
+          // `[image unavailable]` 占位符也走这条腿，它同样不是「没有输出」。
+          // 与 `trae-adapter.ts` / `accio-adapter.ts` 逐字同义（那两家早已如此兜底）。
+          resultText = joined.length > 0 ? joined : TOOL_RESULT_IMAGE_TEXT
         } else {
           resultText = contentToText(result.content) || '(no output)'
         }
@@ -263,8 +336,13 @@ export function serializeMessages(
         content: resultText,
       })
     }
+    // ⚠️⚠️ **这里刻意不 flush**（Issue IKLIFH 的关键时序）：图片此刻刚由上面
+    // 的 `pendingToolImages.push` 入队，若在此发出就会**单独成一条** user
+    // 消息，而提问在再下一条 ⇒ 上游让模型「看不见」。留给下一条 user 消息搭车。
   }
-  flushToolImages()
+  // 历史末尾的残留：图片与延后正文**必须同一条**，否则上游看不见。
+  flushToolImages(pendingOwnParts)
+  pendingOwnParts = undefined
   return wire
 }
 
