@@ -29,8 +29,11 @@ bash scripts/status.sh       # 查看运行状态
 bash scripts/stop.sh         # 停止（不会影响 WSL 与其它程序）
 ```
 
-**Windows 用户**：`scripts/windows/` 下有现成的 `.bat`（零配置，自动识别 WSL 发行版与项目路径），
-可给它们建桌面快捷方式：
+**Windows 用户**有两套现成脚本，**按「网关跑在哪」选一套**：
+
+### A. 网关跑在 WSL 里（`scripts/windows/`）
+
+零配置，自动识别 WSL 发行版与项目路径：
 
 | 文件 | 作用 |
 |---|---|
@@ -38,6 +41,21 @@ bash scripts/stop.sh         # 停止（不会影响 WSL 与其它程序）
 | `Status-Gateway.bat` | 查看运行状态 |
 | `Stop-Gateway.bat` | 停止网关 |
 | `Autostart-Gateway.bat` | 放进启动文件夹可开机自启（可选） |
+
+### B. 网关直接跑在 Windows 上（`scripts/windows-win/`）—— 更省内存
+
+用 Windows 的 Node，**不启动 WSL 虚拟机**（约 75 MB vs WSL 端 150 MB + 虚拟机开销）：
+
+| 文件 | 作用 |
+|---|---|
+| `Start-Gateway-Win-Hidden.bat` | 后台启动（推荐，双击即用，关窗口不影响） |
+| `Start-Gateway-Win.bat` | 前台启动（窗口看日志，关窗口 = 停止） |
+| `Status-Gateway-Win.bat` / `Stop-Gateway-Win.bat` | 查看状态 / 停止 |
+
+首次双击会自动 `pnpm install`。详见 `scripts/windows-win/README.md`。
+
+> ⚠️ **两套共用同一组端口**（8790 / 3901–3918），**同时只能跑一个**。
+> 换方案前先停掉另一个，否则会 `EADDRINUSE`。
 
 > **常驻保障**：启动时会同时拉起守护进程，网关崩溃后约 5 秒自动重启。
 > 详见 [docs/how-to-run.md](docs/how-to-run.md)。
@@ -110,18 +128,36 @@ http://127.0.0.1:8790/ 提供：
 
 ## 已支持供应商
 
-| id | 显示名 | 端口 | 登录 | 签到 | 积分 | 锁定永久积分 | 协议 |
+共 **18 家**已接线（代码在 `src/providers/`），端口固定如下。「默认」列是首次启动时的
+开关状态，可在 Web 控制台逐家开关（`config.json` 的 `providers.<id>.enabled`）。
+
+| id | 显示名 | 端口 | 默认 | 登录 | 签到 | 积分 | 协议 |
 |---|---|---|---|---|---|---|---|
-| `buddy` | CodeBuddy (腾讯) | 3901 | ✅ | ✅ | ✅ | ✅ | OpenAI 兼容 |
-| `workbuddy` | WorkBuddy (国际版) | 3902 | ✅ | ❌¹ | ✅ | ✅ | OpenAI 兼容 |
-| `trae` | TRAE (字节) | 3903 | ✅ | ✅ | ✅ | — | SOLO 自定义 SSE |
-| `qoder` | Qoder | 3904 | ✅ | ✅ | ✅ | — | 加密信封 |
+| `buddy` | CodeBuddy (腾讯) | 3901 | ✅ 开 | ✅ | ✅ | ✅ | OpenAI 兼容 |
+| `workbuddy` | WorkBuddy (国际版) | 3902 | ✅ 开 | ✅ | ❌¹ | ✅ | OpenAI 兼容 |
+| `trae` | TRAE (字节) | 3903 | ✅ 开 | ✅ | ✅ | ✅ | SOLO 自定义 SSE |
+| `qoder` | Qoder | 3904 | ✅ 开 | ✅ | ✅ | ✅ | 加密信封 |
+| `qodercn` | Qoder (中国版) | 3905 | 关 | ✅ | ✅ | ✅ | 加密信封 |
+| `codearts` | CodeArts (华为云) | 3906 | 关 | ✅ | ✅ | ✅ | OpenAI 兼容 |
+| `lobsterai` | LobsterAI (有道) | 3907 | 关 | ✅ | ✅ | ✅ | OpenAI 兼容 |
+| `cline` | Cline | 3908 | 关 | ✅ | — | — | OpenAI 兼容 |
+| `loomy` | Loomy (讯飞) | 3909 | 关 | ✅ | — | ✅ | OpenAI 兼容 |
+| `raccoon` | Raccoon (商汤) | 3910 | 关 | ✅ | — | ✅ | OpenAI 兼容 |
+| `minimax` | MiniMax Code | 3911 | 关 | ✅ | — | ✅ | OpenAI 兼容 |
+| `zcode` | ZCode (智谱) | 3912 | 关 | ✅ | — | ✅ | OpenAI 兼容 |
+| `gemini` | Gemini Code Assist | 3913 | 关 | ✅ | — | — | Cloud Code |
+| `opencode` | OpenCode (Zen) | 3914 | 关 | ✅ | — | — | OpenAI 兼容 |
+| `accio` | Accio (阿里) | 3915 | 关 | ✅ | — | ✅ | OpenAI 兼容 |
+| `officeace` | OfficeAce (华为云) | 3916 | 关 | ✅ | — | — | OpenAI 兼容 |
+| `build` | AI Studio Build | 3917 | 关 | ✅ | — | — | WebSocket 中继 |
+| `aistudio` | 讯飞 AStudio | 3918 | 关 | ✅ | — | — | OpenAI 兼容 |
 
 ¹ WorkBuddy 国际版后端不提供签到接口（vendor 的 `credits.ts` 有实测证据）。
 
-> 其余脉系（LobsterAI / Loomy / Raccoon / MiniMax / Cline / CodeArts / ZCode / QoderCN）
-> 的代码已在 `vendor/` 里，增加新供应商只需照 `src/providers/buddy.ts` 写一个新文件
-> （约 200 行接线代码），**不需要改动 vendor**。
+> **加新供应商**：照 `src/providers/buddy.ts` 写一个接线文件（约 200 行），再在
+> `src/providers/catalog.ts` 登记端口与默认开关。鉴权/协议层都在 `vendor/` 里现成可用，
+> **不需要改动 `vendor/`**（`vendor/` 是从上游同步的，改动会在下次同步时丢失 ——
+> 见 [docs/model-updates.md](docs/model-updates.md)）。
 
 ### Loomy（讯飞）密钥配置
 
@@ -229,14 +265,16 @@ assistant 消息**必须带 `reasoning_content`**（缺失上游会 400）；工
 
 ---
 
-## 实测记录（2026-10-01）
+## 实测记录
+
+> 最新一次全量核对：**2026-10-27**（每次同步 vendor 后都应重跑，见文末「维护」）。
 
 | 项目 | 结果 |
 |---|---|
-| 四个供应商端点启动 | ✅ 3901–3904 全部监听，`/health` 正确返回能力声明 |
-| 上游模型目录 | ✅ buddy 17 个、trae 38 个、qoder 17 个（真实拉取） |
-| 聚合端点 | ✅ 72 个模型，`provider/model` 命名 |
-| **非流式对话** | ✅ buddy/trae/qoder 三家均返回正确内容与 usage |
+| 已启用渠道端点 | ✅ 7 家全部监听：buddy 3901 / trae 3903 / qoder 3904 / zcode 3912 / gemini 3913 / aistudio 3918 / build 3917 |
+| 上游模型目录 | ✅ buddy 16 个、trae 40 个、qoder 17 个、zcode 2 个、gemini 4 个、aistudio 3 个、build 14 个 |
+| 聚合端点 | ✅ 96 个模型，`provider/model` 命名 |
+| **非流式对话** | ✅ buddy/trae/qoder 均返回正确内容与 usage |
 | **流式对话** | ✅ SSE 分帧正确，`reasoning_content` 与 `content` 分离 |
 | 积分余额 | ✅ buddy 3970.7、trae 1941.59、qoder 100 credits |
 | 一键签到 | ✅ trae 实际领取 +100，其余返回"今日已领"（幂等） |
@@ -295,11 +333,15 @@ rsync -a --delete --exclude .git --exclude lib --exclude node_modules \
 | `scripts/ensure.sh` | 幂等启动（固定 Node 路径，见 [how-to-run](docs/how-to-run.md)） |
 | `scripts/daemon.sh` | 守护进程（崩溃自动重启） |
 | `scripts/start.sh` / `stop.sh` / `status.sh` | 启停与状态 |
-| `scripts/windows/*.bat` | Windows 侧入口（桌面快捷方式与开机启动项调用） |
+| `scripts/windows/*.bat` | Windows 入口（**网关跑在 WSL 里**时用） |
+| `scripts/windows-win/*.bat` | Windows 入口（**网关直接跑在 Windows 上**时用，更省内存） |
+| `vendor-patches/*.patch` | 本地对 `vendor/` 的增量补丁（同步后自动重放，见 `sync-vendor.sh`） |
 | `docs/how-to-run.md` | 运行方式、常驻机制、踩坑记录 |
 | `docs/architecture.md` | 架构：为什么 vendor 能零改动、协议转换、端口布局、请求路径 |
 | `docs/model-updates.md` | **模型更新机制**：远端目录 vs 静态表、两个「重拉」入口、`sync-vendor.sh` |
 | `docs/build-channel.md` | **Build 渠道**（AI Studio App 反代）：独立额度机制、用户激活前提、真假流式、额度与重置、常见问题 |
+| `docs/lan-access.md` | **手机/平板接入**：局域网直连与 Tailscale 随处访问 |
+| `docs/tencent-fingerprints.md` | **腾讯风控指纹**：buddy/workbuddy 的 11128 拦截机制、已登记的 6 条指纹、逐格实发探针表、抗版本漂移结论 |
 | `LICENSE` | MIT（含第三方代码声明） |
 | `scripts/sync-vendor.sh` | 从上游同步 `vendor/`（自动备份 + 类型检查 + 重启） |
 

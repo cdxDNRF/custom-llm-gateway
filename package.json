@@ -5,8 +5,11 @@
   "type": "module",
   "description": "本地多供应商 LLM 网关：复用 dsh-codearts-auth 的认证/协议层，把 CodeBuddy / WorkBuddy / Trae / Qoder 等包装成 OpenAI 兼容 API",
   "scripts": {
-    "start": "node src/main.js",
-    "check": "node --check src/main.js"
+    "start": "tsx src/main.ts",
+    "check": "bash scripts/typecheck.sh && bash scripts/selfcheck.sh",
+    "typecheck": "bash scripts/typecheck.sh",
+    "sync-vendor": "bash scripts/sync-vendor.sh",
+    "selfcheck": "bash scripts/selfcheck.sh"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
