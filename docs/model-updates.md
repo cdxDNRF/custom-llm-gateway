@@ -184,3 +184,73 @@ bash scripts/stop.sh && bash scripts/start.sh
 **关于 ZCode 里的模型 ID**：你填的 `qmodel`、`kmodel_latest` 这些是**上游的
 模型标识**，由服务端定义，不会因为网关更新而变。只有上游真的下线某个模型时才会失效——
 那时对话会返回明确错误，而不是静默失败。
+
+## 同步上游时，本机自有修复会不会被覆盖？（2026-10-27 核对）
+
+这是本项目最容易出**静默回归**的地方，故把结论与守卫写成可执行的。
+
+### 结论：只有落在 `vendor/src/` 的修复会被覆盖，共 5 个提交
+
+`rsync -a --delete` 只覆盖 `vendor/src`，**不碰 `src/`**。所以先按位置分类：
+
+| 位置 | 修复数 | 是否受同步影响 |
+|---|---|---|
+| `src/`（我们自有的网关代码） | 约 40 个提交 | **不受影响** |
+| `vendor/src/`（复用的上游代码） | **5 个提交** | ⚠️ 会被 `rsync --delete` 冲掉，靠补丁重放 |
+
+那 5 个提交收敛到 **3 个文件**：
+
+| 提交 | 文件 | 内容 |
+|---|---|---|
+| `eca0b0c` / `e348519` / `757ed70` / `92dd6ef` / `678ebf7` | `vendor/src/openai-gateway/tencent-fingerprint.ts` | 腾讯风控指纹（6 条） |
+| `c4bcbf1` | `vendor/src/gemini{,-adapter,-messages}.ts` | gemini 动态模型目录（3 处） |
+| `7c78109` | `vendor/src/qoder-wasm.ts` | qoder `prepareRequest` |
+
+### 现在为什么不会丢：补丁 + 重建验证
+
+两个补丁（`vendor-patches/*.patch`）承载全部本地改动，`sync-vendor.sh` 的 ④d/④f
+会自动重放，**失败即 `exit 1` 硬失败**（2026-10-24 之前只 `echo ⚠️` 就继续，
+那会导致「同步完 gemini 只剩 1 个模型 / Claude Code 又全 400」而日志看不出原因）。
+
+**最强验证**（可复跑）——拿干净上游 + 我们的补丁重建，应与本机逐字节一致：
+
+```bash
+git clone --depth 1 https://gitee.com/iJetLi/deepseek-harness-codearts.git /tmp/up
+mkdir -p /tmp/sim/vendor && cp -a /tmp/up/src /tmp/sim/vendor/src
+cd /tmp/sim && git init -q . && git add -A && git commit -qm base
+for p in ~/dsh-llm-gateway/vendor-patches/*.patch; do git apply "$p"; done
+cmp vendor/src/gemini-adapter.ts  ~/dsh-llm-gateway/vendor/src/gemini-adapter.ts
+```
+
+2026-10-27 实测：4 个目标文件**全部一致**。这说明「本地改动 = 上游 + 补丁」这条等式
+成立，同步不会丢东西。
+
+### 有一部分修复已被上游吸收（这是好事，但不等于可以删补丁）
+
+上游陆续把我们登记的指纹收进了它自己的表 —— 截至 `239a7ee`，上游有 **5 条**：
+
+| # | 指纹 | 上游有没有 | 我们的来源 |
+|---|---|---|---|
+| 1 | ZCode `Main branch…` | ✅ 原有 | `eca0b0c` |
+| 2 | Claude 身份句 | ✅ 已吸收 | `e348519` |
+| 3 | Claude 反馈句 | ✅ 已吸收 | `92dd6ef` |
+| 4 | DSH 身份句 | ✅ 已吸收 | `757ed70` |
+| 5 | DSH Web 运行面 | ✅ 已吸收 | `92dd6ef` |
+| 6 | **`x-anthropic-billing-header`** | ❌ **仍没有** | `678ebf7` |
+
+⇒ 第 6 条是**我们独有的**，也是补丁必须一直保留的唯一理由。
+⚠️ 别因为「前 5 条上游有了」就删补丁：补丁是**整文件 diff**，删了会连第 6 条一起丢。
+
+### 守卫：`bash scripts/selfcheck.sh` 第 ⑦ 项（2026-10-27 新增）
+
+把上面这张表变成**可执行断言**：14 项标记逐个检查「是否仍以**代码行**存在」
+（不是只判 `includes` —— 指纹串在文档注释里也出现，只判 includes 对「规则被删」是瞎的，
+这个坑本轮实际踩过并修掉了）。
+
+同步 vendor / 升级插件之后跑一次：
+
+```bash
+bash scripts/selfcheck.sh     # 或 npm run selfcheck
+```
+
+期望看到 `⑦ 14 项全部在位`。失败时会直接点名哪一项丢了、以及是否「只剩注释里的提及」。

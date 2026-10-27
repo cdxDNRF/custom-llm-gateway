@@ -65,6 +65,54 @@ for p in vendor-patches/*.patch; do
 done
 [ "$PATCHFAIL" -eq 0 ] && ok "补丁全部可用（含已应用的）" || bad "有补丁失效 —— 下次同步 vendor 会丢失修复"
 
+echo "⑦ 本机自有修复是否仍在（同步 vendor 后最容易被覆盖的就是这一层）…"
+node -e '
+  const fs = require("fs")
+  // 每一项 = 【修复来历, 文件, 必须存在的标记】
+  // ⚠️ 加新项时**必须写进这里**，否则下次 sync-vendor 覆盖掉也没人知道。
+  const checks = [
+    // 腾讯风控指纹：6 条。上游陆续吸收了 5 条，计费头那条至今仍是我们独有。
+    ["678ebf7 计费头指纹",      "vendor/src/openai-gateway/tencent-fingerprint.ts", "x-anthropic-billing-header"],
+    ["eca0b0c ZCode 指纹",      "vendor/src/openai-gateway/tencent-fingerprint.ts", "Main branch (you will usually use this for PRs)"],
+    ["e348519 Claude 身份句",   "vendor/src/openai-gateway/tencent-fingerprint.ts", "official CLI for Claude"],
+    ["92dd6ef Claude 反馈句",   "vendor/src/openai-gateway/tencent-fingerprint.ts", "To give feedback, users should report the issue at"],
+    ["757ed70 DSH 身份句",      "vendor/src/openai-gateway/tencent-fingerprint.ts", "You are an AI agent powered by DeepSeek Harness"],
+    ["92dd6ef DSH Web 面",      "vendor/src/openai-gateway/tencent-fingerprint.ts", "whose URL the runtime context names"],
+    // gemini 动态目录三处（上游至今仍是单模型静态表）
+    ["c4bcbf1 modelsProvider",  "vendor/src/gemini-adapter.ts", "modelsProvider?:"],
+    ["c4bcbf1 allowedModels",   "vendor/src/gemini.ts",         "allowedModels?:"],
+    ["c4bcbf1 预算抬升",        "vendor/src/gemini-messages.ts", "needsHeadroom"],
+    // 原生搜索的几处接线（这些在 src/ 里，rsync 不碰 vendor 之外的，但仍登记防手滑）
+    ["2287eb7 工具名排除",      "src/core/native-search.ts", "toolsearch"],
+    ["6346c26 服务端搜索工具",  "src/core/anthropic.ts",     "web_search"],
+    ["54d3ba3 断开中止",        "src/core/server.ts",        "client disconnected"],
+    ["df004fe remoteMeta 重置", "src/core/provider-common.ts", "target.remoteMeta = new Map()"],
+    // 插件热修（不在本仓库，但同步/升级插件后最易丢）
+    ["插件 billing-header 热修", "PLUGIN:lib/openai-gateway/tencent-fingerprint.js", "x-anthropic-billing-header"],
+  ]
+  const PLUGIN = process.env.HOME + "/.dsh/profiles/web/node_modules/dsh-providers-hub/"
+  const missing = []
+  for (const [name, file, marker] of checks) {
+    const path = file.startsWith("PLUGIN:") ? PLUGIN + file.slice(7) : file
+    let text
+    try { text = fs.readFileSync(path, "utf8") } catch { missing.push(`${name}（文件不存在: ${file}）`); continue }
+    // ⚠️⚠️ **不能只判 includes**：指纹串在文档注释里也出现（实测：删掉 `find:` 行后
+    //    注释里还剩 2 处，includes 仍为 true ⇒ 该判据对「规则被删」是瞎的）。
+    //    故判据是「**作为代码行**出现」：`find:` / 赋值 / 调用，而不是注释里的提及。
+    //    做法：去掉 // 注释行后再找。
+    const code = text.split("\n").filter((l) => {
+      const t = l.trim()
+      return !t.startsWith("//") && !t.startsWith("*") && !t.startsWith("/*")
+    }).join("\n")
+    if (!code.includes(marker)) {
+      const inCommentsOnly = text.includes(marker)
+      missing.push(`${name}（${file} 的**代码**里找不到 ${JSON.stringify(marker.slice(0,40))}${inCommentsOnly ? "；只剩注释里的提及" : ""}）`)
+    }
+  }
+  if (missing.length) { console.error("     丢失:"); for (const m of missing) console.error("       - " + m); process.exit(1) }
+  console.log(`     ${checks.length} 项全部在位`)
+' && ok "本机自有修复完整" || bad "有本机修复丢失 —— 跑 scripts/sync-vendor.sh 会重放补丁；插件热修见 .hotfix-backup/README.md"
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "✅ 自检全通过"; else echo "❌ $FAIL 项失败"; fi
 exit "$FAIL"
