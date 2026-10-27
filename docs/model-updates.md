@@ -264,3 +264,80 @@ bash scripts/selfcheck.sh     # 或 npm run selfcheck
 ```
 
 期望看到 `⑦ 14 项全部在位`。失败时会直接点名哪一项丢了、以及是否「只剩注释里的提及」。
+
+## 现在每家供应商的模型列表是动态还是静态？（2026-10-27 逐个查证）
+
+结论：**不是全都动态**。分三类，只有第一类会「上游变了我们自动跟着变」。
+
+### 判定方法：适配器里有没有接 `fetchRemoteModels`
+
+vendor 的适配器统一走这一行决定目录来源：
+
+```ts
+return this.remoteModels ?? this.product.fallbackModels
+```
+
+- 接了 `fetchRemoteModels` → `remoteModels` 有值，**远端优先**
+- 没接 → `remoteModels` 永远是 `undefined`，**永远用产品里写死的 `fallbackModels`**
+
+### 第一类：真动态（远端目录，上游变我们跟着变）
+
+| 渠道 | 接线位置 | 实测目录 | 静态兜底 |
+|---|---|---|---|
+| `buddy` | `src/providers/buddy.ts:128` `auth.fetchModels(pool)` | 32 | 16 |
+| `trae` | `src/providers/trae.ts:101` `auth.fetchModels(pool)` | 40 | 32 |
+| `lobsterai` / `loomy` / `raccoon` / `minimax` | `src/providers/extended.ts` | — | — |
+| `codearts` | `src/providers/codearts.ts` | — | — |
+| `gemini` | `src/providers/extended.ts:1003` 从 `fetchAvailableModels` 拉 + **逐个探测** | 4（受账号限） | 1 |
+
+刷新机制：**后台每 20 分钟**（`catalog-refresher.ts` 的 `DEFAULT_INTERVAL_MS`），
+外加手动「↻ 重拉」（`POST /api/p/<id>/models/refresh`）。实测 buddy 重拉返回
+`{"ok":true,"count":16}`。
+
+⚠️ `gemini` 特殊：它不只是「拉列表」，还会**逐个发请求探测可用性**（`looksDeprecated`
++ 探测），所以它的目录反映的是「你这个账号真能用哪些」，而不只是「上游有哪些」。
+
+### 第二类：静态表（上游变了，我们**不会**自动变）
+
+| 渠道 | 目录来源 |
+|---|---|
+| `qoder` | `qoder-adapter` 的 `fallbackModels`（写死在 `qoder-product.ts`，23 个） |
+| `zcode` | `ZCODE_FALLBACK_MODELS`（写死在 `zcode-product.ts`，2 个） |
+| `aistudio` | `src/providers/aistudio-adapter.ts:41` 的 `AISTUDIO_MODELS` 常量 |
+| `build` | `src/providers/build-adapter.ts:154` 的 `BUILD_MODELS` 常量 |
+
+这几家上游新增模型时，**必须改代码**（qoder/zcode 改 vendor 后要进补丁；
+aistudio/build 是我们自己的 `src/`，直接改）。
+
+⚠️ 别被「qoder 有 17 个模型」误导成动态：那 17 个是过滤掉停用项后剩下的，
+源头仍是写死的 23 个静态表。
+
+### 第三类：聚合端点
+
+`aggregate` 不自己维护目录，它把**已启用渠道的目录实时汇总**。所以它的模型数
+= 各渠道之和（当前 96），第一类渠道一变，聚合端点立刻跟着变。
+
+### 一句话回答「上游变我们会不会变」
+
+| 你关心的 | 结论 |
+|---|---|
+| buddy / trae / gemini（+ lobsterai/loomy/raccoon/minimax/codearts） | **会**，20 分钟内自动生效 |
+| qoder / zcode / aistudio / build | **不会**，要改代码/等上游补丁 |
+| 模型能力（上下文窗口、是否支持图片） | 第一类跟远端；第二类跟静态表，**可能过期** |
+
+### 想让它变（排查用）
+
+```bash
+# 1) 看某家现在暴露了什么
+curl -s http://127.0.0.1:3901/v1/models        # 单家
+curl -s http://127.0.0.1:8790/v1/models        # 聚合（provider/model）
+
+# 2) 立即重拉（仅对第一类有效；第二类会返回相同数量）
+curl -X POST http://127.0.0.1:8790/api/p/buddy/models/refresh
+
+# 3) 看保鲜器上一轮结果（哪家成功、哪家失败、失败原因）
+curl -s http://127.0.0.1:8790/api/catalog-status
+```
+
+⚠️ 重拉对**第二类是无操作**（返回同样数量）—— 若你重拉后发现数量没变，
+先确认这家是不是静态表，别误判成「拉取失败」。
