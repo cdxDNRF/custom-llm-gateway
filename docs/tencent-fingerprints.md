@@ -418,3 +418,51 @@ trae / zcode / gemini 渠道可用
 ```
 
 → 可复跑脚本思路见本节各项；建议每次同步 vendor 后跑一遍。
+
+## 2026-10-27 第三次同步上游（a777741 → 239a7ee，64 提交）
+
+用户要求「看最新的项目有什么可以跟进的」。核对后只移植**影响已启用渠道**的修复。
+
+### 移植清单
+
+| 渠道 | 修复 | 为什么必须跟 |
+|---|---|---|
+| **zcode** | `0636d55` 身份块跟上官方新版（2900→2632，`# Working style` → `### Interactive views`）<br>`3824e33` 请求头逐字对齐官方 3.16.3<br>`9893e91` 调用方 system 改注入 messages（第 4 个 system 块会 405+3012）<br>`758a20b` 405 恒不可重试<br>`f6ab88a` scoop 非默认根找不到浏览器 | 官方 2026-10-23 升级客户端后，**旧身份块在线上表现为 `405 unusual activity`** —— 风控专属码，不是「方法不允许」 |
+| **buddy** | `9f76d46` 14018 冷却终点 / 工具参数写坏归类 / 凭据异常被吞成 AUTH | 14018 与频率限流**共用 429** 但恢复机制相反（次日配额 vs 分钟窗口），且上游报文里**没有任何时间字段** |
+| **trae** | `63a5c3f` 流内 `event:error` 改走结构化码分类，修 `1005 冷却为 0ms` | 真实报障：界面只有 `trae:  (code=1005)`，message 是空串 |
+| **qoder** | `551a44b` 失败分类拆两张表（provider_error 也换号但不写冷却）<br>`fbed6d0` 报错前缀取自 product.id | 中国版不再自称国际版；失败分类错会导致该换号时不换 |
+
+### 同步方式：这次很干净
+
+两个本地补丁的**目标文件上游全部未改动**，rsync 后两个补丁都能**干净重新应用**，
+无需重建（对比 2026-10-24 那次要重建两个补丁）：
+
+```
+gemini-dynamic-models.patch        ✅ 已应用
+tencent-content-fingerprints.patch ✅ 已应用（6 条，含独有的 billing-header）
+typecheck                          ✅ 一次通过
+```
+
+### ⚠️ 又踩了同一个坑：rsync 跳过 ④c 密钥清洗
+
+推送再次被 GitHub Push Protection 拒绝（`vendor/src/gemini-oauth.ts` 的 Google OAuth
+client id/secret）。**这是第二次因为手工 rsync 而漏掉清洗步骤**。
+
+⇒ 纪律升级：**手工 rsync 后必须补跑一次清洗**，或直接用 `bash scripts/sync-vendor.sh`
+（它含 ④b/④c 清洗 + ④d/④f 补丁 + 类型检查）。
+
+### gemini 渠道的 403（**不是本次同步引入**）
+
+排查结论，如实记录：
+
+1. 同步前后 `gemini-adapter.ts` / `gemini-auth.ts` / `gemini.ts` / `gemini-messages.ts`
+   **逐字节未变** —— 不可能由本次同步引起。
+2. `gateway.err.log` 里 gemini 的 `fetch failed` **在同步之前就存在**。
+3. 用真实凭据直连上游（经 7897 代理）得到：
+   `403 You do not have a valid license of this product. Please contact your administrator`
+   —— **账号侧的许可证问题**，与代码无关。
+4. 沿途排查中发现代理本身正常（`installGeminiProxyRouting` 单独跑两个 Google 端点都通），
+   且 aistudio 报的是 `User location is not supported`（同样是账号/地区侧）。
+5. 另一条干扰项：反复测试会在 `state.json` 里写下 `modelRateLimits` 标记（每次 429 记一次），
+   表现为「所有账号均不可用（限流或额度耗尽）」，那是**测试自己造成的**，不是新故障。
+   清标记：删掉 `state.json` 里对应 `modelRateLimits` 键，或等自然解禁。
