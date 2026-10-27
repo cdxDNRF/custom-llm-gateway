@@ -1487,10 +1487,21 @@ export async function qoderExpiry(
   product: QoderProduct,
   /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
   cached?: () => Promise<CreditBalance | null | undefined>,
+  /**
+   * 该账号的出口代理 fetcher（2026-10-25 审计 A2-17）。
+   *
+   * ⚠️⚠️ **折算路径不接代理 ⇒ 墙外环境下该渠道从聚合轮换里静默消失**：
+   * 国际版整站在墙外被 SNI 阻断，只能用 per-账号代理出去。本 PR 把代理接进了
+   * 推理/搜索/选号/登录四条腿，**折算这条漏了** ⇒ 折算恒失败 ⇒ `UNUSABLE`
+   * ⇒ 被 `rankCandidates` 剔除，**零报错、零日志**，而面板看起来正常。
+   *
+   * 省略 ⇒ 回落全局 `fetch`（= 修复前的行为，供不需要代理的调用方使用）。
+   */
+  fetcher?: typeof fetch,
 ): Promise<number> {
   return sharedPackageExpiry(() => fetchBalanceWithCache(
     cached,
-    () => fetchQoderCreditBalance(credential, product),
+    () => fetchQoderCreditBalance(credential, product, fetcher),
   ))
 }
 
@@ -1583,11 +1594,29 @@ export async function minimaxExpiry(
    * 到期折算恒失败 ⇒ 该渠道在聚合轮换里被静默剔除。
    */
   xff?: string,
+  /**
+   * 该账号的出口 fetcher（**仅国际站**需要，PR !145 审计 P0 修法）。
+   *
+   * ## ⚠️⚠️ 为什么折算路径也必须换出口
+   *
+   * 本函数是**聚合轮换候选可见性的闸门**：折算拿不到读数 ⇒ `sharedPackageExpiry`
+   * 返回 `UNUSABLE` ⇒ `rankCandidates` 把该候选剔除。而
+   * `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401），
+   * ⇒ 用户配好代理、对话能用了，**该渠道仍从轮换里静默消失**，零报错。
+   *
+   * PR !145 的注释点了这个症状，但只把 fetcher 接进了选号器与适配器 ——
+   * 本函数当时仍是**裸 `fetch` 字面量**。
+   *
+   * ⚠️ 省略 ⇒ 全局 `fetch`，与修复前**逐字节等价**（中国版永远省略）。
+   */
+  fetcher?: typeof fetch,
 ): Promise<number> {
   return sharedPackageExpiry(() => fetchBalanceWithCache(
     cached,
     async () => {
-      const result = await fetchMinimaxCreditBalanceDetailed(credential, fetch, product, xff)
+      const result = await fetchMinimaxCreditBalanceDetailed(
+        credential, fetcher ?? fetch, product, xff,
+      )
       // ⚠️ 同 autoclaw / astudio：失败形态是 `balance: null + error`，
       //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
       return result.balance

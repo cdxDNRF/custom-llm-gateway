@@ -52,12 +52,20 @@ import type { ZcodeClaimablePlan } from './zcode-upstream.js'
 import {
   ZcodeCaptchaBrowser,
   ZCODE_CAPTCHA_FALLBACK,
+  isBrowserDeploymentError,
   validateCaptchaParam,
   type ZcodeCaptchaConfig,
 } from './zcode-captcha.js'
 import { CaptchaPool, captchaPoolConfigFromEnv } from './captcha-pool.js'
 import { captchaRequirementObservability } from './captcha-requirement.js'
-import { CaptchaBackoff, captchaBackoffConfigFromEnv, captchaQueueEnabledFromEnv, CAPTCHA_CONFIG_TTL_MS } from './captcha-backoff.js'
+import {
+  CaptchaBackoff,
+  CaptchaCooldownError,
+  captchaBackoffConfigFromEnv,
+  captchaQueueEnabledFromEnv,
+  isCaptchaCooldownError,
+  CAPTCHA_CONFIG_TTL_MS,
+} from './captcha-backoff.js'
 import { CaptchaCarrier, type CarrierOutcome } from './captcha-carrier.js'
 import { CarrierPageServer } from './captcha-carrier-server.js'
 import { buildCarrierPageHtml } from './zcode-carrier-page.js'
@@ -843,11 +851,29 @@ export class ZcodeAuth extends Service {
      */
     const remainMs = this.captchaBackoff.remainingMs()
     if (remainMs > 0) {
-      throw new Error(
+      /**
+       * ⚠️⚠️ **必须抛可判别的类型**（对抗审计实测的 P0，IKQ4JN 附带修）。
+       *
+       * 闸门在 `ZcodeCaptchaBrowser` 内部，而调用侧那个 catch 包住整个
+       * `mintWithOutcome` ⇒ 闸门抛的普通 `Error` 会**流回那个 catch 并
+       * `noteFailure()` 一次** ⇒ 冷却期内每点一次，`streak` +1、冷却翻倍。
+       *
+       * 实测：真失败 3 次进 60s 冷却后，用户再点 5 次（**一次 mint 都没发出**）
+       * ⇒ streak 4→8、冷却 60s → 120 → 240 → 480 → 960 → **1800s**。
+       * 用户什么也没做错，却把 1 分钟冷静期点成了 30 分钟。
+       *
+       * ⇒ 用 {@link CaptchaCooldownError} 标记它，catch 里**不再计数**
+       * （没有发出请求 = 没有伤到设备信誉，与部署错误同一条理由）。
+       */
+      throw new CaptchaCooldownError(
         `zcode: captcha 产出处于冷却中（连续 ${this.captchaBackoff.failureStreak()} 次失败），` +
         `约 ${Math.ceil(remainMs / 1000)} 秒后可重试。` +
-        '这通常意味着设备信誉不足（上游把无感验证降级为滑块），' +
+        '如果最近从未成功产出过，也可能是本机没装可用的浏览器 —— ' +
+        '此时请先按下面那条「找不到浏览器」的提示装一个（设 ZCODE_CHROME_PATH 亦可），' +
+        '而不是等冷却。' +
+        '若确实产出过、只是偶发失败，那通常是设备信誉临时降级（上游把无感验证降成滑块），' +
         '继续重试只会让信誉更差 —— 请稍后再试。',
+        remainMs,
       )
     }
 
@@ -1079,6 +1105,52 @@ export class ZcodeAuth extends Service {
           return outcome.param
         } catch (error) {
           this.captchaStats.failed += 1
+          /**
+           * ⚠️⚠️ **部署错误不计数、也不进冷却**（Gitee issue IKQ4JN 根因②）。
+           *
+           * ## 缺陷原状
+           *
+           * 原实现一视同仁 `noteFailure()`，于是「本机没装浏览器」这种
+           * **确定性、可永久复现、重试一万次也不会好**的部署问题也会累计
+           * streak，3 次后进入 60s 冷却 ⇒ 用户第 3 次点击看到的是
+           * 「captcha 产出处于冷却中…这通常意味着**设备信誉不足**」
+           * —— 把「浏览器没装」说成「设备信誉不足」，**方向完全相反**。
+           * 报障人原话：「本次排查最耗时的就是这一步：我一开始真去查了设备信誉」。
+           *
+           * ## 为什么它落在既有纪律之外
+           *
+           * `captcha-backoff.ts` 文件头的纪律是「`mintOnPage` 抛错 ⇒ **本机产出
+           * 能力**出了问题 ⇒ 计数」。而 `findBrowserExecutable() === undefined`
+           * 不是产出能力问题（那是浏览器**跑起来之后**的事），也不是上游问题，
+           * 而是**部署问题**。
+           *
+           * ## 为什么「不计数」是对的（而不是「少计数」）
+           *
+           * 设备信誉退避的存在理由是「继续请求只会让信誉更差」。
+           * 而部署错误**根本没发出任何 mint 请求** —— 没有信誉可伤，
+           * 冷却它只会挡住用户本该看到的那句可执行提示
+           *（「去装个 chromium / 设 ZCODE_CHROME_PATH」）。
+           *
+           * ⚠️ `captchaStats.failed += 1` **仍然保留**：那是纯诊断计数
+           *（`captchaStats` 只用于日志与面板展示，不参与任何闸门），
+           * 让它反映「确实失败了一次」是诚实的。
+           */
+          /**
+           * ⚠️ **冷却闸门的拒绝不再计数**（见闸门处的长注释）：
+           * 那一次请求根本没发出去 ⇒ 没有伤到信誉 ⇒ 不该加重处罚。
+           * 放在部署错误之前判（两者互斥，顺序不影响语义，但此处更直观）。
+           */
+          if (isCaptchaCooldownError(error)) {
+            throw error
+          }
+          if (isBrowserDeploymentError(error)) {
+            this.ctx.logger?.warn?.(
+              '[jet-hub] zcode captcha 无法产出：本机浏览器不可用（部署问题，'
+              + '不计入设备信誉退避、不进入冷却）—— '
+              + `${error instanceof Error ? error.message : String(error)}`,
+            )
+            throw error
+          }
           const until = this.captchaBackoff.noteFailure()
           if (until > 0) {
             this.ctx.logger?.warn?.(

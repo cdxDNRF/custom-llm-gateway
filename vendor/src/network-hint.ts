@@ -65,6 +65,151 @@ export function collectCauseCodes(error: unknown): string[] {
 }
 
 /**
+ * 一个**失败目标**（`host` + 可选 `port`）。
+ *
+ * ⚠️ 存在的理由见 {@link collectRefusedTargets}。
+ */
+export interface NetworkTarget {
+  /** 主机名或 IP（IPv6 已剥掉方括号）。 */
+  host: string
+  /** 端口；报文里没带时为 `undefined`（如 `getaddrinfo ENOTFOUND host`）。 */
+  port?: number
+}
+
+/** 报文里「码 + 目标」的形态：`connect ECONNREFUSED 127.0.0.1:7897`。 */
+const TARGET_IN_MESSAGE_RE =
+  /\b(?:ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN)\b\s+([^\s,;()]+)/i
+
+/**
+ * **目标确定**的错误码 —— 只有这些才允许参与「被拒目标」判定。
+ *
+ * ⚠️ **刻意不含** `UND_ERR_CONNECT_TIMEOUT` / `UND_ERR_SOCKET` / `ECONNRESET`：
+ * 前两者说明连接**还没建立**（对端可能只是慢，不是没人监听），`ECONNRESET`
+ * 是**已建立后**被对面切断（本地代理在跑、是它后面的节点不通）。
+ * 把这三类算进来会让「代理很慢/节点不通」被说成「代理没启动」——
+ * 与我们要修的误归因**同型、只是方向相反**。
+ */
+const TARGET_KNOWN_CODE_RE = /^(?:ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN)$/i
+
+/** 把 `host:port` / `[v6]:port` / 裸 `host` 拆成 {@link NetworkTarget}。 */
+function splitHostPort(raw: string): NetworkTarget | undefined {
+  if (raw.length === 0) return undefined
+  // 方括号形式（IPv6 字面量）：`[::1]:7897`
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']')
+    if (end === -1) return undefined
+    const withPort = /^:(\d{1,5})$/.exec(raw.slice(end + 1))
+    if (withPort === null) return { host: raw.slice(1, end) }
+    return { host: raw.slice(1, end), port: Number(withPort[1]) }
+  }
+  // 裸 IPv6（`::1:7897`）与 IPv4 / 域名（`127.0.0.1:7897`）都按**最后一个**冒号拆。
+  const colon = raw.lastIndexOf(':')
+  if (colon > 0 && /^\d{1,5}$/.test(raw.slice(colon + 1))) {
+    return { host: raw.slice(0, colon), port: Number(raw.slice(colon + 1)) }
+  }
+  return { host: raw }
+}
+
+/**
+ * 沿 `cause` 链收集**失败目标**（去重、保序）。
+ *
+ * ## ⚠️ 为什么需要一个「目标」判据，而不只是一个布尔
+ *
+ * `ECONNREFUSED 127.0.0.1:7897` 与「墙外连不上」在
+ * {@link NETWORK_BLOCKED_CODE_RE} 里是**同一类**（都算「出不去」），但**处置
+ * 完全相反**：
+ *
+ * - 被拒绝的地址是**用户自己填的代理入口** ⇒ 那个端口上根本没有程序在监听
+ *   ⇒ 该做的是「启动代理软件 / 核对地址与端口」；
+ * - 被拒绝 / 解析不到的是**目标站点** ⇒ 该做的是「换出口 / 换网络」。
+ *
+ * 只用一个布尔判据必然把两者混成同一句话。**真实报障（2026-10-22）**：
+ * 本机 Clash Verge 没启动、7897 无人监听，插件提示的却是「国际版在本机被
+ * SNI 阻断（TCP 能连、TLS 握手被丢），必须配出口代理或改用中国版」——
+ * 用户于是去查网络、换账号，而正确动作是「把代理软件打开」。
+ * ⇒ 判据（本函数）只此一份，**处置分道**在调用方（见 `qoder-rpc.ts` 的 `testProxy`）。
+ *
+ * @returns 形如 `[{host:'127.0.0.1', port:7897}]`；读不到任何目标时返回**空数组**
+ *   （不是 `undefined` —— 调用方据此区分「确实没有目标信息」与「取不到」）。
+ */
+export function collectRefusedTargets(error: unknown): NetworkTarget[] {
+  const targets: NetworkTarget[] = []
+  const remember = (target: NetworkTarget | undefined): void => {
+    if (target === undefined || target.host.length === 0) return
+    const exists = targets.some((it) => it.host === target.host && it.port === target.port)
+    if (!exists) targets.push(target)
+  }
+  let current: unknown = error
+  for (let i = 0; i < CAUSE_TRAVERSE_CAP && current !== null && current !== undefined; i += 1) {
+    const node = current as { code?: unknown; address?: unknown; port?: unknown; message?: unknown }
+    /**
+     * ⚠️ **先看这个节点自己的错误码**：只有「目标确定」的码才算「这个地址没人监听」。
+     * 连接超时 / 连接被切断的节点是**另一个故事**（对端可能只是慢，或者本地代理
+     * 正在跑、是它后面的节点不通），它的 `address` 不能当「被拒目标」。
+     */
+    const code = typeof node.code === 'string' ? node.code : ''
+    if (!TARGET_KNOWN_CODE_RE.test(code)) {
+      current = (current as { cause?: unknown }).cause
+      continue
+    }
+    /**
+     * ① **结构化字段优先**：Node 的 `ErrnoException` 一定带 `address` / `port`
+     *    （`connect ECONNREFUSED 127.0.0.1:7897` 就是它产出的），从这里取无歧义。
+     * ② 退回**报文解析**：某些包装层（自建 dispatcher、SOCKS 握手）只留 message。
+     */
+    if (typeof node.address === 'string' && node.address.length > 0) {
+      remember(typeof node.port === 'number' ? { host: node.address, port: node.port } : { host: node.address })
+    } else if (typeof node.message === 'string') {
+      const found = TARGET_IN_MESSAGE_RE.exec(node.message)
+      if (found !== null) remember(splitHostPort(found[1]))
+    }
+    current = (current as { cause?: unknown }).cause
+  }
+  return targets
+}
+
+/** `localhost` / `127.0.0.1` / `::1` 视为同一族（DNS 解析会让报文与输入不同名）。 */
+function sameHostFamily(left: string, right: string): boolean {
+  const normalize = (host: string): string => host.toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+  const a = normalize(left)
+  const b = normalize(right)
+  if (a === b) return true
+  const loopback = ['localhost', '127.0.0.1', '::1', '0.0.0.0', '::']
+  return loopback.includes(a) && loopback.includes(b)
+}
+
+/**
+ * 这次失败是否**发生在用户填的代理入口本身上**。
+ *
+ * ## ⚠️ 这个判据是「处置分道」的唯一依据
+ *
+ * 命中 ⇒ 代理软件没跑 / 地址写错（**不要**再说目标站点的事，用户会去查错的地方）；
+ * 不命中 ⇒ 代理入口是通的，失败发生在「代理 → 目标主机」那一段（换节点或回直连）。
+ *
+ * ⚠️ **端口/主机任一不匹配都返回 `false`**：宁可退回通用文案，也不能把
+ * 「目标站点连不上」误报成「你的代理没启动」—— 后者会让用户去关代理，
+ * 而关掉代理可能让另一个本来能通的渠道一起断掉（比不报还糟）。
+ *
+ * @param error 原始异常。
+ * @param proxyUrl 用户填的代理地址（**已归一化**，形如 `http://127.0.0.1:7897`）。
+ */
+export function targetsProxyEntry(error: unknown, proxyUrl: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(proxyUrl)
+  } catch {
+    // 归一化失败的地址不该走到这里；真走到了就当「不知道」，交回调用方的通用文案。
+    return false
+  }
+  if (parsed.hostname.length === 0) return false
+  const entryPort = parsed.port.length === 0 ? undefined : Number(parsed.port)
+  return collectRefusedTargets(error).some((target) => (
+    (entryPort === undefined || target.port === undefined || target.port === entryPort)
+    && sameHostFamily(target.host, parsed.hostname)
+  ))
+}
+
+/**
  * 这次失败是否属于「根本出不去」（需要代理 / 换网络）。
  *
  * @param error 原始异常。
@@ -92,8 +237,14 @@ export interface NetworkBlockedHintParams {
   /**
    * 出路说明 —— **这句话是本函数存在的理由**，必须可操作。
    *
-   * ⚠️ 不得写「请联系管理员」这类无出路的废话；也不得许诺本插件没有的能力
-   *（例如 Qoder 目前**没有**按账号配代理的按钮，就不能写「点代理按钮」）。
+   * ⚠️ 不得写「请联系管理员」这类无出路的废话；也不得许诺本插件没有的能力。
+   *
+   * ⚠️⚠️ **反过来：本插件已经有的能力必须写出来**（2026-10-25 审计 A2-10）。
+   * 这句话原先举的例子是「Qoder 目前**没有**按账号配代理的按钮」—— 而
+   * `618a090` 恰好**加了**那个按钮（`jet-hub.js` 的「代理」入口 / 弹窗）
+   * ⇒ 例子本身成了过时误导：照它写的 remedy 会把用户指向「导出 HTTPS_PROXY」
+   * 这条**全局**出路，而按账号代理正是为「只想让一家的流量走代理」才做的。
+   * ⇒ 写 remedy 前先确认该 provider **现在**有没有代理入口。
    */
   remedy: string
 }

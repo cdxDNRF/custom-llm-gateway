@@ -2,11 +2,12 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
-import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePermanentLocks, sanitizeProviderClosed, withAllowed, withoutAllowed } from './jet-hub-store.js'
-import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap, ProviderClosedMap } from './jet-hub-store.js'
+import { createJetHubStore, clearRejectionLayer, DEFAULT_PANEL_ENTRY, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePanelEntry, sanitizePermanentLocks, sanitizeProviderClosed, withAllowed, withoutAllowed } from './jet-hub-store.js'
+import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PanelEntry, PermanentLockMap, ProviderClosedMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
 import { normalizeOpencodeGeneration } from './opencode-auth.js'
+import { maskProxyPassword } from './proxy-mask.js'
 // ⚠️ `model-queue.ts` **零 import**（纯函数模块，见其模块头）⇒ 不引入环。
 import { nextUtc8DayStartMs } from './model-queue.js'
 import type {
@@ -259,6 +260,34 @@ export function asProxyText(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
+/**
+ * 写「代理已更新」日志时的**展示文本**（2026-10-25 审计 A2-02）。
+ *
+ * ## 为什么必须有它
+ *
+ * 四家 `set*Proxy` 原先都把**原始 URL** 拼进日志：
+ * `` `[jet-hub] 账号 ${id} Qoder 代理 → ${proxy}` `` —— 而代理 URL 常含
+ * `user:pass@host` ⇒ **口令明文进日志**，而日志是用户排障时会随手打包、
+ * 粘贴进 issue、上传给别人的东西。
+ *
+ * 对抗审计逐家实测：opencode / gemini / minimaxintl **早已同形**，
+ * qoder 只是第 4 个实例（不是本 PR 新增的机制）⇒ 四家一并修。
+ *
+ * ## ⚠️ 判据复用 `proxy-mask.ts`，不在这里再写一份
+ *
+ * 池**不能** import provider 实现（`opencode.ts` 在依赖图上层，会成环），
+ * 而复制一份正则到这里就正是本仓库的红线——**同一语义两套判据**。
+ * ⇒ 脱敏实现住在双方都能依赖的中立文件里。
+ *
+ * @param value 池字段原始值（可能是脏值 —— 备份文件原样透传）。
+ * @returns 空串 → `直连`；否则脱敏后的 label（保留 scheme/user/host/port）。
+ */
+export function proxyLogText(value: unknown): string {
+  const raw = asProxyText(value).trim()
+  if (raw.length === 0) return '直连'
+  return maskProxyPassword(raw)
+}
+
 export class AccountPool {
   /** 持久化后端；两个后端都不可用时是仅内存实现。 */
   private readonly store: JetHubStore
@@ -364,15 +393,16 @@ export class AccountPool {
    */
   private nativeWebSearchCache = true
   /**
-   * 「侧栏入口」开关的进程内副本（`false` = 主导航不显示 Jet Hub 入口）。
+   * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
    *
-   * 缺键语义是**显示**（与 {@link nativeWebSearchCache} 同一方向）：老文档没有
-   * 本键时保持入口可见，不会因一次读取失败而让用户以为这个功能被删掉了。
+   * 缺键语义是 `'sidebar'`「仅侧栏」（与 {@link nativeWebSearchCache} 同一方向）：
+   * 老文档没有本键时保持主导航那一行可见，不会因一次读取失败而让用户以为
+   * 这是某个被删掉的功能。
    *
    * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
-   * 唯一后果是入口回到默认显示，用户再关一次即可（可逆）。
+   * 唯一后果是入口回到默认「仅侧栏」，用户再改一次即可（可逆）。
    */
-  private sidebarEntryCache = true
+  private panelEntryCache: PanelEntry = DEFAULT_PANEL_ENTRY
   /**
    * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
    *
@@ -490,8 +520,10 @@ export class AccountPool {
       this.gatewayAllowLanCache = state.gatewayAllowLan === true
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
-      // 侧栏入口开关同理：老文档没有该键 → 保持默认显示入口。
-      this.sidebarEntryCache = state.sidebarEntryEnabled !== false
+      // 面板入口同理：老文档没有该键（或值是脏值）→ 回到默认「仅侧栏」。
+      // 过一遍 sanitize：store 层的 load 已归一，这里再判一次是因为老契约
+      // 后端可能绕过 schema 直接给出原始文档。
+      this.panelEntryCache = sanitizePanelEntry(state.panelEntry)
       // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
       this.providerOrderCache = state.providerOrder ?? []
       // MiniMax 国际站 XFF 同理：老文档没有该键 → `undefined`（不附头，
@@ -596,9 +628,9 @@ export class AccountPool {
         gatewayAllowLan: this.gatewayAllowLanCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
         // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
-        //    漏键会让用户关掉的侧栏入口在**任何**一次账号/黑名单/网关/顺序写入时
-        //    被静默清掉，重启后入口又回来了。
-        sidebarEntryEnabled: this.sidebarEntryCache,
+        //    漏键会让用户改过的面板入口在**任何**一次账号/黑名单/网关/顺序写入时
+        //    被静默清掉，重启后入口又变回默认「仅侧栏」。
+        panelEntry: this.panelEntryCache,
         providerOrder: this.providerOrderCache,
         // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
         //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
@@ -1111,31 +1143,33 @@ export class AccountPool {
   }
 
   /**
-   * 「侧栏入口」当前是否启用（`false` = 主导航不显示 Jet Hub 入口）。
+   * 「面板入口」的当前取值：Jet Hub 的唯一入口位置。
    *
-   * 缺键语义为**显示**（见 {@link sidebarEntryCache}）。
+   * 缺键语义为 `'sidebar'`「仅侧栏」（见 {@link panelEntryCache}）。
    *
-   * ⚠️ 调用方（客户端在 `apply` 里注册侧栏行前）**必须每次现读**，不能缓存
-   * 返回值：用户随时可能在 Jet Hub 面板里切换，而客户端只在启动时读一次。
+   * ⚠️ 调用方（客户端在 `apply` 里注册两处入口前）**必须每次现读**，不能缓存
+   * 返回值：用户随时可能在插件详情页的卡片里改它，而客户端只在启动时读一次。
    */
-  sidebarEntryEnabled(): boolean {
+  panelEntry(): PanelEntry {
     this.ensureLoaded()
-    return this.sidebarEntryCache
+    return this.panelEntryCache
   }
 
   /**
-   * 打开/关闭「侧栏入口」并落盘。
+   * 改「面板入口」并落盘。
    *
-   * 关闭后主导航里不再有 Jet Hub 那一行，进入路径只剩「设置 → Jet Hub」；
-   * 不影响 Jet Hub 页面本身的任何功能（它仍在 `settings.section` 里注册）。
+   * 两个取值**严格互斥**，任一时刻只有一个入口存在：
+   * - `'sidebar'`：主导航里多一行，`settings.section` 那一节注销；
+   * - `'settings'`：只剩「设置 → 插件 → Jet Hub」，主导航那一行注销。
+   * 两种情况下 Jet Hub 页面本身的功能完全不受影响（同一组件、同一份 rpcCall）。
    */
-  async setSidebarEntryEnabled(enabled: boolean): Promise<void> {
+  async setPanelEntry(entry: PanelEntry): Promise<void> {
     this.ensureLoaded()
-    if (this.sidebarEntryCache === enabled) return
-    this.sidebarEntryCache = enabled
+    if (this.panelEntryCache === entry) return
+    this.panelEntryCache = entry
     this.loaded = true
     if (this.store.kind === 'memory') {
-      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，侧栏入口开关仅本次会话有效')
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，面板入口仅本次会话有效')
       return
     }
     await this.queueStoreSave()
@@ -2773,7 +2807,7 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 账号 ${accountId} 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+      `[jet-hub] 账号 ${accountId} 代理 → ${proxyLogText(proxy)}`,
     )
   }
 
@@ -2809,7 +2843,7 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxyLogText(proxy)}`,
     )
   }
 
@@ -2826,6 +2860,104 @@ export class AccountPool {
   geminiProxyFor(accountId: string): string {
     const entry = this.readAccounts().find(a => a.id === accountId)
     return asProxyText(entry?.geminiProxy)
+  }
+
+  /**
+   * 设置/清除某 **qoder** 账号的出口代理（真实报障 2026-10-21）。
+   *
+   * ⚠️ **刻意与另外两份分开成三份实现**，理由与字段同款：三者语义不同。
+   * Qoder 这里补的是「国际版整站被 SNI 阻断」—— 在本字段之前，用户唯一出路
+   * 是启动 DSH 前导出环境变量，而那会让中国版（本来直连 160ms）也一起去挤代理。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退（与另两份同款，见 `setOpencodeProxy` 的注释）。清除时删键而非写空串。
+   */
+  async setQoderProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setQoderProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.qoderProxy
+    else entry.qoderProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      // ⚠️ **只打脱敏后的 `label`，绝不打原始 `proxy`**（2026-10-25 审计 A2-02）：
+      //    代理 URL 常含 `user:pass@host`，明文进日志等于把口令写进用户
+      //    会随手粘贴/上报的文件；而 `label` 保留 host:port 与用户名、口令打码，
+      //    排查时完全够用。
+      `[jet-hub] 账号 ${accountId} Qoder 代理 → ${proxyLogText(proxy)}`,
+    )
+  }
+
+  /**
+   * 设置/清除某 **minimaxintl**（MiniMax 国际站）账号的出口代理。
+   *
+   * ## 为什么它与 `setGeminiProxy` 形状逐字同构却不共用
+   *
+   * 三家的**存在理由各不相同**：
+   * - opencode = 多账号要**分份额度**（不设代理 = 共用一份配额）；
+   * - Gemini = 墙外**能不能连通**（不设代理 = 根本连不上）；
+   * - minimaxintl = 绕开**按出口 IP 国别的分流**（不设代理 = 被 307 到中国站）。
+   *
+   * 合成一份会让「清掉其中一家的代理」连带清掉别家的出口配置 —— 本仓库
+   * 已反复记录这类「同义判据两份实现」的漂移，故**字段与实现都分开**。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退。清除时**删键**而非写空串（空串与「未设置」在 UI 上是两种状态）。
+   */
+  async setMinimaxIntlProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setMinimaxIntlProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.minimaxIntlProxy
+    else entry.minimaxIntlProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} MiniMax 国际站代理 → ${proxyLogText(proxy)}`,
+    )
+  }
+
+  /**
+   * 读取某 qoder 账号的代理（未设置时为空串 = 直连）。
+   *
+   * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同因）：该字段来自
+   * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+   * 原样透传、不校验形状 ⇒ 池里可能存在 `"qoderProxy": 12345`。下游
+   * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+   * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**。
+   */
+  qoderProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return asProxyText(entry?.qoderProxy)
+  }
+
+  /**
+   * 读取某 minimaxintl 账号的代理（未设置时为空串 = 直连）。
+   *
+   * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同款实测缺陷）：该字段来自
+   * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}` 原样透传、
+   * 不校验形状 ⇒ 池里可能存在 `"minimaxIntlProxy": 12345`。下游 `normalizeProxy`
+   * 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛 `TypeError`，该账号
+   * **永久不可用且无自愈**（症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+   */
+  minimaxIntlProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return asProxyText(entry?.minimaxIntlProxy)
   }
 
   /**

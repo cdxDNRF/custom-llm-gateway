@@ -205,6 +205,66 @@ export interface MinimaxAdapterOptions {
    * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
    */
   onCatalogLoaded?: () => void
+  /**
+   * 按**账号 id** 取该账号的出口（MiniMax 国际站代理支持）。
+   *
+   * ## 为什么要有它
+   *
+   * `agent.minimax.io` 按**出口 IP 国别**分流：大陆来源恒被 307 到中国站
+   * `agent.minimaxi.com`，而中国站不认国际站 token ⇒ 报出与「凭据失效」
+   * **逐字同形**的 401（issue IKMEVG）。既有的 `X-Forwarded-For` 只是**声明**
+   * 一个海外 IP（上游不信任该头即失效），真正换出口要靠代理。
+   *
+   * ⚠️ 必须是**函数**而不是一份定好的 fetcher：本适配器在一轮请求内会**换号**
+   * （限流 / 额度时 `getAvailableAccount` 换人），出口必须跟着换 —— 固化一份
+   * 会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，且零报错，
+   * 属最难查的一类静默失效）。
+   *
+   * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor(accountId)` > 全局 `fetch`。
+   * 未注入时行为**逐字节不变**。
+   */
+  fetchFor?: (accountId: string) => typeof fetch
+  /** 注入的 fetch（**仅单测**；优先级最高，见 {@link fetchFor}）。 */
+  fetchImpl?: typeof fetch
+  /**
+   * **显式**指定本适配器代表哪个账号（探测路径专用）。
+   *
+   * ## ⚠️ 为什么必须有它（与 Gemini 的 `accountIdOverride` 同型缺陷）
+   *
+   * 出口代理是**账号维度**的，而「本适配器正在替哪个账号发请求」在**探测路径**
+   * 上根本查不到：`account-probe.ts` 刻意**不传 `accountPool`**（既定语义：
+   * 只测这一个账号、不写任何标记）⇒ 下面那条「按 access_token 反查账号 id」
+   * 的路**不存在** ⇒ `activeAccountId` 恒为 `''` ⇒ 解析器按「空 id = 直连」
+   * 处理 ⇒ **该账号的代理被完全绕过**。
+   *
+   * 症状与报障同形：国际站「测试 / 重测」**恒失败**，而这个失败与「账号已失效」
+   * 在 UI 上**完全同形** ⇒ 用户会去误删好号。
+   *
+   * ## ⚠️ 为什么是「显式传入」而不是「探测时也传 accountPool」
+   *
+   * 传池会把探测接进换号 / 写标记的整套编排，而探测的**既定语义**就是不写任何
+   * 东西、只测这一个账号。改 `account-probe.ts` 会破坏那套语义并波及十家适配器。
+   *
+   * ⚠️ **优先于**反查：探测时反查恰恰是拿不到的那条路；即便将来有人给探测
+   * 也挂了池，显式值也是更权威的（调用方明确说了「我代表这个账号」）。
+   */
+  accountIdOverride?: string
+  /**
+   * 显式指定 X-Forwarded-For（探测路径专用）。
+   *
+   * ## ⚠️ 为什么必须有它（2026-10-24 活体实测）
+   *
+   * 探测适配器刻意**不传 `accountPool`** ⇒ `send()` 里那份「从池读
+   * `minimaxXff()`」的取法在探测路径上**恒空** ⇒ 用户设好的 XFF 在「测试 /
+   * 重测」上不生效 ⇒ 大陆出口的探测恒 307 → 401，报错文案与「凭据失效」
+   * 同形（真机报文 `{"error":"invalid access token"}`），用户会去误删好号。
+   *
+   * ⚠️ XFF 是**只读**的展示性设置，探测带它不违反「探测不写任何状态」的
+   * 既定语义（与 `accountIdOverride` 同一条界线：显式传值，不挂编排）。
+   *
+   * ⚠️ **优先于**池读法（生产池有池可读时以显式值为准，两者一致）。
+   */
+  xffOverride?: string
 }
 
 // ── 请求级账号轮换（issue IKJW32，2026-10-11）────────────────────────────
@@ -437,6 +497,25 @@ export class MinimaxAdapter extends LlmAdapter {
   }
 
   /**
+   * 取**某个账号**该走的 fetcher（MiniMax 国际站代理支持）。
+   *
+   * ⚠️⚠️ **必须按账号现取，不能在构造 / 循环外固化**：本适配器在一轮请求内会
+   * **换号**（限流 / 额度时 `getAvailableAccount` 换人），出口必须跟着换 ——
+   * 固化一份会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，零报错）。
+   *
+   * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor(accountId)` > 全局 `fetch`。
+   * 未注入 `fetchFor`（中国站 / 旧接线）⇒ 恒走既有路径，**行为逐字节不变**。
+   *
+   * ⚠️ 空账号 id（`''`）= 直连：`fetchFor` 的解析器按「空 id = 没配代理」处理
+   * （见 `minimax-proxy.ts`）—— 拿不到账号时不该去查一个空 id。
+   */
+  private fetcherFor(accountId: string): typeof fetch {
+    if (this.options.fetchImpl !== undefined) return this.options.fetchImpl
+    if (this.options.fetchFor !== undefined) return this.options.fetchFor(accountId)
+    return fetch
+  }
+
+  /**
    * 取远端模型目录；**失败时不把兜底表写进缓存**。
    *
    * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
@@ -613,14 +692,17 @@ export class MinimaxAdapter extends LlmAdapter {
       throw new LlmError('minimax: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
     /**
-     * 本次请求实际使用的账号 id（请求级轮换的记账键）。语义与 loomy / raccoon 同款：
-     * 按 access_token 反查池内条目；单凭据回退时保持空串（无池即无「下一个号」，
-     * 轮换自然失效，不误标）。
+     * 本次请求实际使用的账号 id（请求级轮换的记账键 **且是取出口的键**）。
+     * 语义与 loomy / raccoon 同款：按 access_token 反查池内条目；单凭据回退时
+     * 保持空串（无池即无「下一个号」，轮换自然失效，不误标）。
      *
      * ⚠️ 反查的第二参是**凭据内容**而不是 ref 名（传 ref 名会恒匹配失败且**静默**）。
+     *
+     * ⚠️ `accountIdOverride` **优先于**反查：探测路径拿不到池，只能靠调用方
+     * 显式说明「我代表这个账号」（见该字段的注释）。
      */
-    let activeAccountId = ''
-    if (this.options.accountPool) {
+    let activeAccountId = this.options.accountIdOverride ?? ''
+    if (activeAccountId === '' && this.options.accountPool) {
       try {
         activeAccountId = await this.options.accountPool.findAccountIdByCredential(
           this.product.id, credential.access_token,
@@ -772,9 +854,17 @@ export class MinimaxAdapter extends LlmAdapter {
        * `this.options.accountPool?.minimaxXff()` 会在那种替身上抛 `TypeError`
        * （`?.` 只挡 `null`/`undefined`，挡不住「对象上没有这个方法」）。
        * 实测后果：`minimax-adapter.spec.ts` 的轮换组 16 条用例全红。
+       *
+       * ⚠️ **探测路径（无池）必须仍能拿到 XFF**：探测适配器刻意不传
+       * `accountPool`（既定语义：不写任何标记），那 XFF 就读不到 ⇒ 大陆出口
+       * 的「测试」恒 307→401，与「凭据失效」同形（2026-10-24 活体实测：
+       * 用户已设 XFF，`account.test` 仍报 invalid access token）。
+       * 故提供 `xffOverride`：探测槽显式传入池里的当前值 —— 它是**只读**的
+       * 展示性设置，探测带它不违反「不写状态」的语义。
        */
       const pool = this.options.accountPool
-      const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined
+      const xff = this.options.xffOverride
+        ?? (typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined)
       return minimaxFetch(
         `${this.product.apiHost}${MINIMAX_INFER_PATH}`,
         () => ({
@@ -784,6 +874,14 @@ export class MinimaxAdapter extends LlmAdapter {
           signal: options.signal,
         }),
         {
+          /**
+           * ⚠️ **推理主路径必须走该账号的出口**（国际站代理）。
+           *
+           * `send()` 会被**多次**调用（401 续期后重发、轮换换号后重发），故这里
+           * 必须**每次按当时的 `activeAccountId` 现取** fetcher —— 在闭包外固化
+           * 一份会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，零报错）。
+           */
+          fetcher: this.fetcherFor(activeAccountId),
           signal: options.signal,
           // 记下「地理路由」：跟随后 401 与「凭据失效」同形，只能在此刻判。
           onGeoRoute: () => { geoRouted = true },

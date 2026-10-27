@@ -1,6 +1,14 @@
 import type { DpopPrivateJwk } from './oauth.js'
 import type { BadgePreference } from './badge-preferences.js'
 import type { TokenLedgerSnapshot, TokenLedgerHistoryDay, TokenLedgerModelRow } from './token-ledger.js'
+/**
+ * ⚠️ 反向的类型环，但是安全的：`jet-hub-store.ts` 以 `import type` 引入本模块的
+ * `ProviderAccountEntry`，这里也以 `import type` 引入它的 `PanelEntry`。
+ * 两处都是 type-only ⇒ 编译后**完全擦除**，不产生运行时边，也没有初始化顺序问题。
+ * 定义留在 `jet-hub-store.ts`：那里同时持有该枚举的运行时取值表与 sanitize，
+ * 拆开会让「三个真源分居两个文件」，正是本仓库反复记录的漂移形态。
+ */
+import type { PanelEntry } from './jet-hub-store.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -141,6 +149,60 @@ export interface ProviderAccountEntry {
    * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
    */
   geminiProxy?: string
+  /**
+   * **Qoder**（国际版 `openapi.qoder.sh`）账号的出口代理（空/缺省 = 直连）。
+   *
+   * ## 为什么必须有（真实报障 2026-10-21）
+   *
+   * 国际版整站被阻断：DNS 正常、TCP 443 握手正常，但 **TLS ClientHello 被丢**
+   * （SNI 阻断，典型 GFW 行为）。实测两个真实账号：
+   *
+   * - 余额端点 `GET /sash/api/v2/me/usage` ⇒ 10.7–11.3s 后 `UND_ERR_CONNECT_TIMEOUT`；
+   * - 推理通道 `/api/v1/agent_chat_generation` ⇒ 同样 10.7s `TRANSPORT: fetch failed`。
+   *
+   * ⇒ 整个渠道**没有实际推理能力**，不只是「查不到余额」。中国版
+   * （`openapi.qoder.com.cn`）完全正常（余额 160ms、推理 434ms）。
+   *
+   * ## ⚠️ 为什么此前只能靠导出 `HTTPS_PROXY`
+   *
+   * 本字段存在之前，Qoder 是**唯一**有「墙外端点」却没有 per-账号代理入口的渠道
+   * （opencode 有、Gemini 有）—— 用户唯一出路是在启动 DSH 前导出环境变量，
+   * 而那会**让所有渠道一起走代理**（包括本来直连更快的中国版）。
+   *
+   * ## 作用范围：余额查询 + 推理通道（**两条腿都要**）
+   *
+   * 只接推理不接余额 ⇒ 面板照旧 10.8s 才报错、锁定时照旧判「无法确认」；
+   * 只接余额不接推理 ⇒ 面板显示正常但一发请求就超时。两者都必须过代理。
+   *
+   * ⚠️ 与 `opencodeProxy` / `geminiProxy` **刻意分成三个字段**：三者的语义不同
+   * （opencode = 多账号分份额度，Gemini = 墙外授权，Qoder = 国际版整站阻断），
+   * 共用会让「清掉 Qoder 的代理」连带清掉其它渠道的出口配置。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   *
+   * ⚠️ **中国版账号配了也照用**：没人拦着用户给 `qodercn` 配代理（他的网络
+   * 环境可能恰好相反）。判据不按 provider 分叉，只看该账号有没有配。
+   */
+  qoderProxy?: string
+  /**
+   * **minimaxintl**（MiniMax 国际站）账号的出口代理（空/缺省 = 直连）。
+   *
+   * ⚠️ `agent.minimax.io` 按**出口 IP 所在国家**分流：中国大陆来源会被 307 到
+   * 中国站 `agent.minimaxi.com`，而中国站不认国际站 token ⇒ 报出与「凭据失效」
+   * **逐字同形**的 401（issue IKMEVG）。本字段存在的理由就是换一个海外出口。
+   *
+   * ⚠️ 与既有的 `X-Forwarded-For` 设置（`pool.minimaxXff()`）**互补而非替代**：
+   * XFF 只是**声明**一个海外 IP（上游若不信任该头即失效），本字段是**真正**
+   * 改出口。两者可叠加。
+   *
+   * ⚠️ 与 `geminiProxy` / `opencodeProxy` **刻意分成三个字段**：三家语义不同
+   * （分份额度 / 能不能连通 / 绕地理分流），共用会让「清掉一家」连带清掉别家。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   */
+  minimaxIntlProxy?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -225,6 +287,21 @@ export interface RpcCreateAccountRequest {
    */
   zcodeProvider?: 'bigmodel' | 'zai'
   /**
+   * **minimaxintl** 账号的出口代理（**仅 MiniMax 国际站需要**）。
+   *
+   * ⚠️ 用途是**登录期**：换 token 那一次请求发生在凭据落盘**之前**，此时只有
+   * 池里那条**占位条目**认得这个账号 ⇒ 代理只能从载荷带（或从同 provider 的
+   * 既有账号继承，见 `jet-hub-rpc.ts` 的 minimax 分支）。不带 ⇒ 大陆网络下
+   * 国际站**登录恒失败**，而用户**没法给一个还不存在的账号配代理** ⇒ 死锁。
+   *
+   * ⚠️ 与 `ProviderAccountEntry.minimaxIntlProxy` 是**同一个语义的两个入口**：
+   * 那一个是「账号存在后」的面板设置，本字段是「账号还没建立时」的一次性输入。
+   *
+   * ⚠️ 来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+   * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）。
+   */
+  minimaxIntlProxy?: string
+  /**
    * 登录区域（**仅 Accio 需要**）。
    *
    * ⚠️ **gateway 与区域无关**（`phoenix-gw.alibaba.com` 两个区域同一个），
@@ -260,6 +337,24 @@ export interface RpcCreateAccountRequest {
    * ⚠️ 缺省 = 空串 = 直连，与既有行为**逐字一致**。
    */
   geminiProxy?: string
+  /**
+   * 出口代理（**仅 Qoder 需要**；真实报障 2026-10-21）。
+   *
+   * ## ⚠️ 为什么登录载荷要带它（与 `geminiProxy` 逐字同因的死锁）
+   *
+   * Qoder 国际版 `openapi.qoder.sh` 被 SNI 阻断，**登录的设备码端点也在同一台
+   * 主机上** ⇒ 墙外环境下没有出口就**连登录都起不来**。而出口是账号维度的，
+   * 只能从池里那条**占位条目**读 ⇒ 占位条目不带代理时第 3 步（换 token）恒直连
+   * ⇒ 登录恒失败；用户又**没法给一个还不存在的账号配代理**（面板的「代理」
+   * 按钮按 `accountId` 打开）⇒ **死锁**。
+   *
+   * 与 Gemini 那份的唯一差别：Qoder 的登录流程在拿到 `accountId` 之前就会发
+   * 设备码请求，所以 `qoder-proxy.ts` 额外有一条 `QODER_PENDING_PROXY_KEY`
+   * 兜底（见那里的注释）。本字段负责的是「`accountId` 已存在」那一半。
+   *
+   * ⚠️ 缺省 = 空串 = 直连，与既有行为**逐字一致**。
+   */
+  qoderProxy?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string
@@ -294,6 +389,70 @@ export interface RpcCreateAccountResponse {
    * 比反过来假设「空串必是错误」更稳，且不必为一次能力下线去改前端渲染分支。
    */
   reused?: boolean
+  /**
+   * MiniMax：**保证需要重新登录**的授权链接（2026-10-24）。
+   *
+   * ## 为什么 `loginUrl` 不够
+   *
+   * `loginUrl`（`/oauth-authorize?user_code=…`）**不含身份**，身份全在浏览器
+   * cookie ⇒ 带已有会话打开就直接复用上一个账号（上游不认任何 `prompt=*`
+   * 强制参数，实测五个参数全被忽略）。
+   *
+   * 本字段是上游「切换账号」按钮的等价物：`/unified-login?login_redirect=<授权页>`，
+   * 由宿主用**无 cookie** 的服务端请求换来，登录完自动回到授权页放行**新**账号。
+   *
+   * ## 三条纪律
+   *
+   * 1. **可选**：拿不到时**不填**（客户端退回 `loginUrl`，行为与从前逐字节相同）；
+   * 2. 客户端判据必须是 `typeof === 'string' && length > 0`（老宿主 `undefined`）；
+   * 3. 它**不消耗凭据**（纯 GET，无 `Authorization`）⇒ 与
+   *    「诊断脚本不得对真实凭据发起 refresh」那条铁律不冲突。
+   */
+  forcedLoginUrl?: string
+  /**
+   * MiniMax：打开 `forcedLoginUrl` **之前**应当先访问一次的上游**登出**地址
+   * （2026-10-24，方案 A：「登出 → 授权页」两跳）。
+   *
+   * ## 为什么有了 `forcedLoginUrl` 还需要它
+   *
+   * `forcedLoginUrl` 只保证「这条链接**要求**登录」（我实测：全新浏览器打开它
+   * 会显示登录表单 —— 微信扫码 / 手机号 / 账号密码，无「授权」按钮）。
+   * 但它**不主动注销**浏览器里已存在的会话：
+   *
+   * - 若用户浏览器里已有 `account.minimax.cn` 的 `_sid`，统一登录页可能**直接
+   *   放行**（实测未能覆盖这一半 —— 我没有用户账号，无法构造合法的旧会话）；
+   * - 更糟的是**登录完成后的新会话会覆盖旧的**，用户下次又带着「上一个号」。
+   *
+   * 用户的实际症状正是这个：「要手动清理浏览器 token 不然还是会带上个账号登录态」。
+   *
+   * ## 上游登出端点（实测 2026-10-24，两站都有）
+   *
+   * ```
+   * GET https://account.minimax.cn/oauth2/logout
+   *   → 302 Location: /unified-login
+   *   → Set-Cookie: _sid=; path=/; HttpOnly; secure; SameSite=Lax
+   * GET https://account.minimax.io/oauth2/logout    （国际站同形）
+   * ```
+   *
+   * ⚠️ 它**不接受任何回跳参数**（实测 `redirect` / `redirect_url` / `return_to` /
+   * `returnTo` / `url` / `service` / `target` / `to` / `continue` / `next_url` /
+   * `next` 共 11 个参数名，`Location` 恒为 `/unified-login`）⇒ 所以必须**两跳**：
+   * 先访问本地址，再打开 `forcedLoginUrl`。
+   *
+   * ⚠️⚠️ **副作用必须让用户知道**：作用域是整个 `account.minimax.cn` 网页会话 ——
+   * 用户在同一浏览器里登录的 MiniMax **网页版**会被一起登出（登录完成后新会话
+   * 立即重建，影响很小但真实存在）。故客户端打开前**必须**给出提示，不得静默执行。
+   *
+   * ## 纪律
+   *
+   * 1. **可选**：拿不到时不填，客户端退化为只开 `forcedLoginUrl`（旧行为）；
+   * 2. 客户端**先登出、再打开** `forcedLoginUrl`，中间留一个短延迟（见客户端注释）；
+   * 3. 它是**普通页面**（导航即可），不要用 `fetch` —— 需要浏览器**真正写入**
+   *    那个清 cookie 的 `Set-Cookie`，而 `fetch` 在无 `credentials` 时可能不落地；
+   * 4. 仅对 `minimax` / `minimaxintl` 下发，且**只在「新建账号」**路径（其它 provider
+   *    的授权页不在该 cookie 域，登出无意义且有害）。
+   */
+  logoutUrl?: string
 }
 
 export interface RpcPollLoginRequest {
@@ -1592,6 +1751,39 @@ export interface RpcGatewayStatusResponse {
    * - `none`：两者都拿不到，目录必然为空
    */
   modelsSource: 'catalog' | 'adapters' | 'none'
+  /**
+   * 期望运行**却没能监听**的原因（Issue #11 的建议 ②）。
+   *
+   * ⚠️ 存在的理由：`running: false` 有四种完全不同的成因，而面板原先只能表达
+   * 其中三种（被 env 停用 / 用户关了主开关 / 端口被占），**第四种「期望运行但
+   * 启动失败」没有任何可区分的信号** —— 它与「用户自己关了」在响应里逐字相同，
+   * 于是报障者只能看到「网关没了」，而下游全部 connection refused 又被误读成
+   * API-key 问题。
+   *
+   * 取值：
+   * - `null`：没有异常（正常在跑，或用户/ env 主动关闭）
+   * - `start-failed`：`shouldRun` 为真但 `start()` 失败（端口冲突等），
+   *   `reason` 带上游错误原文（如 `listen EADDRINUSE ...`）
+   * - `factory-missing`：插件装配异常，压根没有可用的网关实例工厂
+   */
+  lastError: RpcGatewayLastError | null
+}
+
+/** 网关「期望运行但未监听」的结构化原因（见 {@link RpcGatewayStatusResponse.lastError}）。 */
+export interface RpcGatewayLastError {
+  kind: 'start-failed' | 'factory-missing'
+  /** 上游错误原文（`start-failed` 时必有；`factory-missing` 时为说明文案）。 */
+  reason: string
+  /**
+   * 该失败发生的时刻（`Date.now()`）。
+   *
+   * ⚠️ 存在的理由（对抗审计 P1-2）：`disposeGatewayRuntime()` 收尾时要清掉
+   * 「上一轮遗留」的失败痕迹，但**不能**清掉「本轮 dispose 期间新一轮收敛真的
+   * 失败」的那条（实测：dispose 在飞时新收敛撞 `EADDRINUSE`，尾巴把它清成 null
+   * ⇒ 面板显示「网关已关闭」，真因丢失）。时间戳让这个判据可判，且比比较对象
+   * 引用更稳（新一轮可能写入形状相同的对象）。
+   */
+  at: number
 }
 
 /** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */
@@ -1680,33 +1872,34 @@ export interface RpcNativeSearchSetEnabledResponse {
 }
 
 /**
- * RPC: 「侧栏入口」开关的读取响应（Jet Hub 页头的「侧栏」开关）。
+ * RPC: 「面板入口」的读取响应（插件详情页设置卡片里的下拉）。
  *
- * 语义：`true` = 在**主导航**里显示「Jet Hub」入口（点它把 Jet Hub 页渲染进
- * 中央主面板）；`false` = 只保留「设置 → Jet Hub」这一条进入路径。
+ * 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
+ * `'sidebar'` = 主导航里那一行（`settings.section` 那一节注销）；
+ * `'settings'` = 只剩「设置 → 插件 → Jet Hub」（主导航那一行注销）。
  *
  * ⚠️ 为什么这个偏好住**宿主**（`state.json`）而不是浏览器 `localStorage`：
  * 本插件的三条进入路径（Web / 桌面 / headless）共用同一份 `~/.dsh` 状态，
  * 而 Web 侧的 origin 是 `127.0.0.1:<随机端口>` —— **每次启动端口都变**，
- * `localStorage` 会随旧 origin 一起被抛弃，表现为「关掉的入口下次启动又回来了」。
+ * `localStorage` 会随旧 origin 一起被抛弃，表现为「改掉的入口下次启动又变回来了」。
  */
-export interface RpcSidebarEntryGetEnabledResponse {
-  enabled: boolean
+export interface RpcPanelEntryGetResponse {
+  entry: PanelEntry
 }
 
-/** RPC: 「侧栏入口」开关写入请求。 */
-export interface RpcSidebarEntrySetEnabledRequest {
-  enabled: boolean
+/** RPC: 「面板入口」写入请求。 */
+export interface RpcPanelEntrySetRequest {
+  entry: PanelEntry
 }
 
 /**
- * RPC: 「侧栏入口」开关写入响应。
+ * RPC: 「面板入口」写入响应。
  *
  * ⚠️ 与 `nativeSearch.setEnabled` 同取向：回传的是**落盘后重读的值**，
  * 客户端一律以后端回传为准，不做乐观更新（宿主侧可能因为脏文档把值归一）。
  */
-export interface RpcSidebarEntrySetEnabledResponse {
-  enabled: boolean
+export interface RpcPanelEntrySetResponse {
+  entry: PanelEntry
 }
 
 /**

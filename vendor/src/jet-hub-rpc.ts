@@ -13,13 +13,14 @@
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status /
  *           nativeSearch.getEnabled / nativeSearch.setEnabled /
- *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
+ *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { dedupeMinimaxAccount } from './minimax-dedup.js'
 import { openIncognitoWindow } from './login.js'
 import { AccountPool, asProxyText } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
@@ -31,6 +32,7 @@ import {
   applyGatewayDesiredState,
   gatewayAddress,
   gatewayApiKey,
+  gatewayLastError,
   isGatewayRunning,
   setGatewayDesiredAllowLan,
   setGatewayDesiredEnabled,
@@ -93,13 +95,18 @@ import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
-import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
+import {
+  MINIMAX,
+  MINIMAX_INTL,
+  MINIMAX_WEB_LOGOUT_PATH,
+  type MinimaxProduct,
+} from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 // ⚠️ `sanitizeMinimaxXff` 与存储层**同一份判据**：RPC 层必须在写盘**之前**用它
 //    判合法性（非法即不写），否则「先写后判」会静默清掉用户原有的有效设置。
 //    ⚠️ 不要在这里另写一份 IP 校验（同义判据分两处必然漂移）。
-import { sanitizeMinimaxXff } from './jet-hub-store.js'
+import { PANEL_ENTRY_VALUES, sanitizeMinimaxXff } from './jet-hub-store.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 // OfficeAce（华为 MaaS 云端直连）：面板状态探测 / 登录流程 / 余额查询所需的
@@ -263,7 +270,12 @@ import { pickTestModel,
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
 import { geminiFetchForAccount } from './gemini-proxy.js'
+import { qoderFetchForAccount } from './qoder-proxy.js'
+import { minimaxIntlFetchForAccount } from './minimax-proxy.js'
+import { normalizeProxy } from './minimax-proxy.js'
 import { handleGeminiRpc } from './gemini-rpc.js'
+import { handleQoderRpc } from './qoder-rpc.js'
+import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
@@ -353,9 +365,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
-  RpcSidebarEntryGetEnabledResponse,
-  RpcSidebarEntrySetEnabledRequest,
-  RpcSidebarEntrySetEnabledResponse,
+  RpcPanelEntryGetResponse,
+  RpcPanelEntrySetRequest,
+  RpcPanelEntrySetResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -2298,6 +2310,14 @@ function registerJetHubEndpoints(
     // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
     // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
     geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
+    // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法）：
+    // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+    // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+    // 不接它 ⇒ 配好代理后对话能用、**积分行与一键签到却仍失败**，
+    // 症状与 issue IKMEVG 逐字相同。
+    // ⚠️ 与 `src/index.ts` 的 `creditsTable` 是**两个独立调用**，必须同改
+    //（本仓库记过「只接一处」的复发形态：minimaxXff 就漏过一次）。
+    minimaxIntlFetchFor: (accountId) => minimaxIntlFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -2324,6 +2344,20 @@ function registerJetHubEndpoints(
     resolveCredential: (refName) => ctx.credentials.resolve(credentialRef(refName)),
     warn: (message) => ctx.logger?.warn?.(message),
     accountPool: pool,
+    /**
+     * 刷新**轮换**出的凭据写回（2026-10-27 Gitee PR #153 审计 P0）。
+     *
+     * ⚠️ 与 `resolveCredential` **同一个 ref 约定**（都经 `credentialRef(...)` 归一）
+     * —— 实现侧传的是 `entry.credentialRef`，正是 `collectClaimResults` 里
+     * `deps.resolve(credentialRef(entry.credentialRef))` 用的那一个，
+     * 两条腿必须看到**同一份**凭据。
+     *
+     * ⚠️ 与既有续期腿 `autoclaw-auth.ts` 的 `credentials.set(ref, …)` **同源**
+     * —— 那是本仓库唯一被验证过的凭据回写路径，不要再写第二套。
+     */
+    persistCredential: async (refName, value) => {
+      await ctx.credentials.set(credentialRef(refName), value)
+    },
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -3954,6 +3988,21 @@ function registerJetHubEndpoints(
       const handled = await handleGeminiRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ 真实报障 2026-10-21：Qoder 国际版 `openapi.qoder.sh` 被 SNI 阻断，
+    //    而它此前是**唯一有墙外端点却没有 per-账号代理按钮**的渠道
+    //    （opencode / Gemini 都有）。⇒ `qoder.*` 走同样的前缀改道。
+    if (method.startsWith('qoder.')) {
+      const handled = await handleQoderRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ MiniMax 国际站的**出口代理**端点同款前缀改道（写 `setMinimaxIntlProxy`）。
+    //    前缀用 `minimaxintl.` 而不是 `minimax.`：① 与 provider id 逐字一致；
+    //    ② `minimax.` 前缀一旦被这里接管，将来中国站若加同名端点就会被本分支
+    //    误吞（两家语义不同，见 `minimax-proxy.ts` 的模块头）。
+    if (method.startsWith('minimaxintl.')) {
+      const handled = await handleMinimaxIntlRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
     //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
     //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
@@ -4227,7 +4276,40 @@ function registerJetHubEndpoints(
           // ⚠️ 分支内一律用 `product` / `auth`，**不要**出现 `QODER` 字面量 ——
           // 否则中国版会拿国际版的域名与 client_id 发请求。
           const { product, auth } = requireQoderFamily(provider)
-          const started = await auth.startLogin({ refName })
+          /**
+           * ⚠️⚠️ **必须在 `startLogin` 之前把代理预置进池**（真实报障 2026-10-21）。
+           *
+           * `startQoderLoginFlow` 的**第一步就是打设备码端点**（`openapi.qoder.sh`，
+           * 与国际版余额/推理**同一台被 SNI 阻断的主机**）⇒ 墙外环境下没有出口
+           * 连登录都起不来。而出口是账号维度的、只能从池里那条**占位条目**读
+           * ⇒ 顺序必须是「先入库（带代理）→ 再 startLogin」。
+           *
+           * ⚠️ 原实现是**先 `startLogin`、后 `addAccount`** —— 那时池里没有这个
+           * 账号，解析器只能拿空 id 去查 `QODER_PENDING_PROXY_KEY`（登录取不到
+           * 代理时的唯一兜底）。两处都失效（用户没配 pending + 条目还没入库）
+           * ⇒ 国际版登录**恒失败**，报的还是 `UND_ERR_CONNECT_TIMEOUT`，与
+           * 「凭据失效」在 UI 上完全同形 ⇒ 用户只会反复重登。
+           *
+           * ⚠️ 代理来源两级（与 gemini 分支同款取舍）：
+           * ① 载荷显式带（将来 UI 提供「在此输入代理」时用）；
+           * ② **从同 provider 的已有账号继承** —— 当前实际生效路径，因为
+           *    「refresh_token 失效 ⇒ 删号重登」是面板明示的既定动作，而重登
+           *    造的是**全新 id** ⇒ 旧号上的代理必然丢失。
+           *    继承只在**恰好一个账号带代理**时生效（多个时无法判断该继承哪个，
+           *    宁可直连也不要猜错出口把凭据发到错误的代理上）。
+           */
+          const existingQoderProxies = new Set(
+            (await pool.listAccountsByProvider(provider))
+              .map((e) => asProxyText(e.qoderProxy))
+              .filter((p) => p.trim() !== ''),
+          )
+          const requestedQoderProxy = typeof req.qoderProxy === 'string' ? req.qoderProxy.trim() : ''
+          const inheritedQoderProxy = existingQoderProxies.size === 1
+            ? [...existingQoderProxies][0]!
+            : ''
+          const qoderProxyInput = requestedQoderProxy !== ''
+            ? requestedQoderProxy
+            : inheritedQoderProxy
           // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
           // 登录成功后再回填昵称/有效期等真实字段。
           await pool.addAccount({
@@ -4239,6 +4321,41 @@ function registerJetHubEndpoints(
             refreshable: false,
             createdAt: Date.now(),
           })
+          /**
+           * ⚠️⚠️ **写池前必须过 `normalizeProxy`**（2026-10-25 合并审计 P2 修法）。
+           *
+           * 改前这里只 `trim()` 就把载荷写进池。而 `types.ts` 的
+           * `RpcCreateAccountRequest.qoderProxy` 注释**明文承诺**「来自客户端自报的
+           * RPC 载荷（无 schema 校验）⇒ 读取侧必须过 `normalizeProxy` 归一」——
+           * 注释与实现相反（与 PR !145 审计修过的 minimaxintl 那条**逐格同因**）。
+           *
+           * 后果（**不可自愈**）：`ftp://host:21` 这类串落盘后，该账号**每一条链路**
+           * 取 fetcher 时都抛「代理地址无效 — 不支持的协议 ftp」⇒ 该账号永久不可用，
+           * 且面板上看不出原因。当前客户端不传该字段，但它是**已文档化的入参**。
+           *
+           * ⚠️ 与 minimaxintl 分支同一处置：**拒绝整轮登录**并给出可操作原因
+           * （而不是静默降级直连 —— 用户明确想走代理时，静默直连会让他以为配好了）。
+           */
+          if (qoderProxyInput !== '') {
+            const normalizedQoderProxy = normalizeProxy(qoderProxyInput)
+            if (!normalizedQoderProxy.ok) {
+              // 删掉刚建的占位条目：不留「有账号但配置非法」的幽灵卡片。
+              void pool.removeAccount(id).catch(() => {})
+              return {
+                ok: false,
+                error: {
+                  code: 'bad-request',
+                  message: `出口代理地址无效：${normalizedQoderProxy.reason}`,
+                },
+              }
+            }
+            // ⚠️ 走 `setQoderProxy` 而不是直接往 `addAccount` 塞字段：那里有
+            // 「空串删键 + 最新快照合并」的既有口径，直接塞会绕过它们。
+            await pool.setQoderProxy(id, normalizedQoderProxy.proxy.url)
+          }
+          // ⚠️ **现在才 startLogin**（顺序见上）：池里已有带代理的占位条目，
+          // 解析器按 `accountId` 就能取到出口。
+          const started = await auth.startLogin({ refName, accountId: id })
           started.result.then(async (loginResult) => {
             const credential = parseQoderCredential(loginResult.access)
             // ⚠️ 设备码轮询响应**不带 `user_name`**，故 `credential.nickname` 恒为空
@@ -4249,7 +4366,14 @@ function registerJetHubEndpoints(
             //（与 `toLoginFlowResult` 对过期时间的处理同原则）。
             let nickname = credential?.nickname
             if ((nickname === undefined || nickname.length === 0) && credential !== undefined) {
-              nickname = await fetchQoderUserNickname(credential, product)
+              // ⚠️ **userinfo 也在 `openapi.qoder.sh` 上 ⇒ 必须走该账号的出口代理**
+              // （真实缺口，2026-10-21 随代理接线发现）。漏接的症状极具误导性：
+              // 国际版账号登录**本身成功了**（登录走 `startLogin` 的 fetcher，已接），
+              // 卡片却永远显示 `qoder-xxxx` 而不是真实昵称 —— 看起来像「上游没下发
+              // 用户名」，实则是这一次 userinfo 直连超时、被 `fetchQoderUserNickname`
+              // 按设计安静吞掉（它失败返回 `undefined`，不抛错）。
+              // 代理按**账号 id** 取：此刻占位条目已入库（见上文顺序说明）。
+              nickname = await fetchQoderUserNickname(credential, product, qoderFetchForAccount(id))
               // 写回**凭据**（不只账号条目）：账号条目会随 Jet Hub 的账号操作
               // 整体重写，而凭据里存一份才能在续期后与其它面板都稳定拿到。
               if (nickname !== undefined && loginResult.access.length > 0) {
@@ -4478,9 +4602,96 @@ function registerJetHubEndpoints(
             createdAt: Date.now(),
           })
 
+          /**
+           * ⚠️⚠️ **国际站：登录前必须让占位条目带上代理**（与 Gemini 的
+           * IKLTZ2 审计 P2-1 是同一个死锁形态）。
+           *
+           * 设备码申请与轮询换 token 都发生在凭据落盘**之前**，此时**只有这条
+           * 占位条目**认得这个账号 ⇒ 代理只能从这里读。不带 ⇒ 大陆网络下国际站
+           * **登录恒失败**，而用户**没法给一个还不存在的账号配代理**（面板的
+           * 「代理」按钮按 `accountId` 打开）⇒ 只能导出 `HTTPS_PROXY` 绕过。
+           *
+           * 触发路径很常见：refresh_token 失效的既定动作就是「删号重登」，
+           * 而重登造的是**全新 id** ⇒ 旧号上的代理配置必然丢失。
+           *
+           * **代理来源两级**（与 Gemini 同款）：
+           * ① 载荷显式带（将来 UI 提供输入时用）；
+           * ② **从同 provider 的已有账号继承** —— 当前的实际生效路径。
+           *    ⚠️ 只在**恰好一个账号带代理**时生效（多账号时无法判断该继承
+           *    哪个，宁可直连也不要猜错出口把凭据发到错误的代理上）。
+           *
+           * ⚠️ **只对国际站做**（中国站直连才是最优），且走
+           * `setMinimaxIntlProxy` 而不是直接塞字段：那里有「空串删键」的口径。
+           *
+           * ⚠️ 查池必须过 `typeof pool.listAccountsByProvider === 'function'`
+           * （与 `minimaxXff` 同款防御）：单测/旧接线可能传**只实现了一部分方法**
+           * 的池替身，直接调会在那种替身上抛 `TypeError`（实测：
+           * `minimax-intl.spec.ts` 的登录组替身只有 `listAccounts`）——
+           * 读不到池时**宁可跳过继承**，也不能让登录直接崩。
+           */
+          if (minimaxProduct.id === MINIMAX_INTL.id
+            && typeof pool.listAccountsByProvider === 'function') {
+            const existingIntlProxies = new Set(
+              (await pool.listAccountsByProvider(MINIMAX_INTL.id))
+                .map((e) => asProxyText(e.minimaxIntlProxy))
+                .filter((p) => p.trim() !== ''),
+            )
+            // ⚠️ `typeof` 与 `trim()` 是**防御**：载荷无 schema 校验
+            // （同 `accioRegion` 的注释）。不传时 `req.minimaxIntlProxy`
+            // 是 `undefined` ⇒ 走继承那一级。
+            const requestedIntlProxy = typeof req.minimaxIntlProxy === 'string'
+              ? req.minimaxIntlProxy.trim()
+              : ''
+            const inheritedIntlProxy = existingIntlProxies.size === 1
+              ? [...existingIntlProxies][0]!
+              : ''
+            const intlProxyInput = requestedIntlProxy !== '' ? requestedIntlProxy : inheritedIntlProxy
+            /**
+             * ⚠️⚠️ **必须过 `normalizeProxy` 才能写池**（PR !145 审计 P1 修法）。
+             *
+             * `types.ts` 的 `RpcCreateAccountRequest.minimaxIntlProxy` 注释明文承诺
+             * 「来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+             * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）」，
+             * 而原实现只 `trim()` 就写池 —— **注释与实现相反**。
+             *
+             * 后果（**不可自愈**）：非法串（如 `ftp://host:21`）落盘后，该账号的
+             * **每一条链路**（登录 / 续期 / 目录 / 身份 / 推理 / 积分 / 探测）都会在
+             * `createMinimaxFetcherResolver` 的 `normalizeProxy` 处**抛错**
+             * （见 `minimax-proxy.ts` 的模块头：那里刻意选择抛错而非静默直连）。
+             * 用户只能手动改代理或删号重登；而登录期那条抛错还会被 `catch` 成
+             * 「无法启动 MiniMax 登录（设备码申请失败）」——**文案指错了方向**。
+             *
+             * ⚠️ 与 `minimaxintl.setProxy` 端点（`minimax-rpc.ts`）**必须同口径**：
+             * 那里早就归一化了。同一字段两个写入入口两套判据，正是本仓库
+             * 「同义判据两份实现必然漂移」红线。
+             *
+             * ⚠️ 继承来的值来自池、而池里的值已由 `setProxy` 归一化 ⇒ 它**必然合法**，
+             * 故归一化失败只可能是载荷那条腿（用户/脚本手填），
+             * 此时**拒绝整个登录**并给出可操作原因，而不是把脏值写进池。
+             */
+            if (intlProxyInput !== '') {
+              const normalized = normalizeProxy(intlProxyInput)
+              if (!normalized.ok) {
+                // ⚠️ 删掉刚建的占位条目：不留「有账号但配置非法」的幽灵卡片。
+                void pool.removeAccount(id).catch(() => {})
+                return {
+                  ok: false,
+                  error: {
+                    code: 'bad-request',
+                    message: `出口代理地址无效：${normalized.reason}`,
+                  },
+                }
+              }
+              await pool.setMinimaxIntlProxy(id, normalized.proxy.url)
+            }
+          }
+
           let minimaxStarted: StartedMinimaxLoginFlow
           try {
-            minimaxStarted = await minimaxAuth.startLogin()
+            // ⚠️ **必须传 `accountId`**：换 token 那一次请求发生在凭据落盘
+            // **之前**，此时只有池里的占位条目认得这个账号 —— 不传就拿不到它的
+            // 代理 ⇒ 大陆网络下国际站**登录恒失败**，症状与「凭据无效」同形。
+            minimaxStarted = await minimaxAuth.startLogin({ accountId: id })
           } catch (error) {
             // 设备码申请失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -4489,7 +4700,8 @@ function registerJetHubEndpoints(
           }
 
           minimaxStarted.result.then(async (credential) => {
-            const result = await minimaxAuth.persistLogin(credential, { refName })
+            // ⚠️ 同 `startLogin`：身份查询也要走该账号的出口。
+            const result = await minimaxAuth.persistLogin(credential, { refName, accountId: id })
             /**
              * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
              * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
@@ -4525,13 +4737,128 @@ function registerJetHubEndpoints(
               // ⚠️ MiniMax **有** refresh 端点（与 Loomy 恒 false 不同）。
               refreshable: isMinimaxRefreshable(credential),
             })
+            /**
+             * ★★ **同账号去重**（2026-10-24）。
+             *
+             * ## 为什么 minimax 必须有（它是唯一缺这条的 provider）
+             *
+             * `zcode` / `officeace` / `autoclaw` 都有这段，minimax 没有 ⇒ 同一个号
+             * 点两次「新建账号」就是**两张卡片、两份 token**，各自参与选号与续期。
+             * 而 MiniMax 的授权页会**静默复用浏览器已有会话**（见下方
+             * `forcedLoginUrl` 的注释）⇒「点了两次」在本家几乎是**常态**。
+             *
+             * ## 判据必须是 `user_id`
+             *
+             * `access_token` / `refresh_token` 每次登录都变；`nickname` 可改可重复。
+             * `user_id` 是服务端下发的稳定标识（`persistLogin` 里落进凭据）。
+             * ⚠️ 拿不到 `user_id`（老凭据 / 身份查询失败）时**放弃去重**，绝不猜。
+             *
+             * ## 处置照 `zcode`：**不删条目**，标停用 + 改名
+             *
+             * `login.poll` 靠「条目在 + 凭据已写」判成功；删掉会让它显示成
+             * 「登录失败」，而事实恰恰相反（登录成功了，只是这个号已经有了）。
+             * ⚠️ 保留**原来那张**（它可能已承载排序/改名/限流记录），新条目停用。
+             */
+            const userId = result.userId
+            /**
+             * ⚠️⚠️ **整块交给 `dedupeMinimaxAccount`**（2026-10-25 合并审计补修）。
+             *
+             * 改前这里只做了 officeace 三件套的**第 1 件**（查重 + 新卡停用），
+             * 缺「新鲜凭据转写回保留卡」「清重复卡凭据」「原卡已停用则反转」。
+             * 后果实测两条：
+             * ① 原卡被用户手动停用 ⇒ 两张卡全停用 ⇒ `getAvailableAccount()`
+             *    返回 `null`（它按 `enabled` 过滤），而 `login.poll` 报登录成功
+             *    ⇒ 该渠道**零可用号**；
+             * ② 续期调度器**不看 `enabled`** ⇒ 同一上游账号两条续期链，
+             *    refresh_token 轮换时互相作废（正是本 PR 要治的「旧号掉登录」）。
+             *
+             * ⚠️ 该函数**永不抛错**（登录已成功，去重失败不得改写结论）；
+             *    仍包一层 try 是防御性的（例如池替身缺 `findAccount`）。
+             */
+            try {
+              await dedupeMinimaxAccount(
+                { pool, credentials: ctx.credentials, logger: ctx.logger },
+                {
+                  providerId: minimaxProduct.id,
+                  newAccountId: id,
+                  newCredentialRefName: refName,
+                  identity: userId,
+                  nickname,
+                  expiresAtMs: minimaxCredentialExpiresAtMs(credential),
+                  refreshable: isMinimaxRefreshable(credential),
+                },
+              )
+            } catch (error) {
+              ctx.logger.warn(
+                `[jet-hub] ${minimaxProduct.id} 去重流程异常（不影响登录结论）：${String(error)}`,
+              )
+            }
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${minimaxProduct.id} login failed for ${id}: ${String(error)}`)
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })
 
-          return { ok: true, value: { accountId: id, loginUrl: minimaxStarted.loginUrl } }
+          /**
+           * ⚠️⚠️ **宿主侧拉起无痕窗口**（2026-10-24，用户报障「登录链接一打开就
+           * 自带旧 session 登录态」）。
+           *
+           * ## 与 OfficeAce / CodeArts 同型，但会话载体不同
+           *
+           * 那两家是**服务端**复用了华为 / 阿里的 SSO 会话；MiniMax 是**页面脚本**
+           * 读自己的网页会话（`/oauth2/device/authorize` 带 cookie 即放行），症状
+           * 逐字相同：点「新建账号」→ 打开授权页 → 直接显示上一个号的「授权」按钮。
+           *
+           * ## ⚠️⚠️ 本分支**刻意不调 `openIncognitoWindow`**（2026-10-24 用户决策）
+           *
+           * 用户明确要求：「宿主开窗那一套废弃掉，只要 token 过期这件工作」。
+           *
+           * 现实原因（本轮真实事故）：**宿主能开窗 ≠ 用户能看见窗口**。本机是
+           * 无头部署（只有 Xvfb `:99`，用户经隧道用远端浏览器访问），宿主开窗后
+           * 返回 `incognitoOpened: true`，客户端照契约**跳过自己的 `window.open`**
+           * ⇒ 窗口画在没人看的虚拟屏上 ⇒ 用户报「点击新增账号不会跳转登录页了」。
+           *
+           * ⇒ 只下发 `forcedLoginUrl`，由**客户端在用户自己的浏览器里**打开：
+           *   - 它解决了「登录链接自带旧会话」（上游「切换账号」等价链接 —— 普通
+           *     窗口打开也一定会要求重新登录，因为服务端无 cookie 时回的是
+           *     `401 login_required` + `login_url`）；
+           *   - 它**根除**了「宿主认领开窗」这一类事故（返回值里不再有
+           *     `incognitoOpened` ⇒ 客户端恒走既有 `window.open` 通用路径，
+           *     与其余 12 家 provider 完全一致）。
+           *
+           * ⚠️ 为什么不用 `loginUrl`：其 `user_code` 不含身份，带旧 cookie 打开
+           * 就复用旧账号（本 bug 的根因）。
+           */
+          /**
+           * ⚠️⚠️ **登出地址**（方案 A：「登出 → 授权页」两跳，2026-10-24 用户决策）
+           *
+           * 为什么 `forcedLoginUrl` 还不够：它只保证这条链接**要求**登录，却
+           * **不注销**浏览器里已存在的会话。用户实测症状是「登录完成后要手动清理
+           * 浏览器 token，不然还是会带上个账号的登录态」—— 那正是旧 `_sid` 仍在。
+           *
+           * 上游 `GET {accountHost}/oauth2/logout`（两站同形，实测 2026-10-24）：
+           * `302 → /unified-login` + `Set-Cookie: _sid=; …; HttpOnly`。
+           * ⚠️ 它**不接受回跳参数**（11 个参数名全被忽略，`Location` 恒为
+           * `/unified-login`）⇒ 只能两跳，客户端负责顺序。
+           * ⚠️ 它清的是**整个 account 域**的网页会话（会连带登出用户的 MiniMax 网页版）
+           * ⇒ 客户端**必须先给提示**再执行，不得静默。
+           * ⚠️ 只在「新建账号」这条路径下发；其它 provider 的授权页不在该 cookie 域。
+           */
+          const logoutUrl = `${minimaxProduct.accountHost}${MINIMAX_WEB_LOGOUT_PATH}`
+
+          return {
+            ok: true,
+            value: {
+              accountId: id,
+              loginUrl: minimaxStarted.loginUrl,
+              ...minimaxStarted.forcedLoginUrl === undefined
+                ? {}
+                : { forcedLoginUrl: minimaxStarted.forcedLoginUrl },
+              // ⚠️ 只有真的拿到了 `forcedLoginUrl` 才给登出地址：否则登出完却没有
+              //    可去的授权页，等于把用户登出后留在空白登录页（更糟）。
+              ...minimaxStarted.forcedLoginUrl === undefined ? {} : { logoutUrl },
+            },
+          }
         } else if (provider === ZCODE.id) {
           /**
            * zcode 走**两步式**（与 codearts / qoder 等同型）：
@@ -5127,7 +5454,34 @@ function registerJetHubEndpoints(
 
       case 'account.update': {
         const req = payload as RpcUpdateAccountRequest
-        await pool.updateAccount(req.accountId, req.patch)
+        /**
+         * ⚠️⚠️ **patch 必须白名单化**（2026-10-25 合并审计 P2 修法）。
+         *
+         * `RpcUpdateAccountRequest.patch` 在**类型**上只有
+         * `nickname / enabled / expiresAt / refreshable` 四个键，但它是**无 schema
+         * 校验的客户端载荷**：`{qoderProxy:'ftp://host:21'}` 会被
+         * `AccountPool.updateAccount` 的 `{...entry, ...patch}` **原样展开进池**
+         * ⇒ 绕过 `sanitizeAccounts` 的代理 scheme 闸 ⇒ 该账号此后取 fetcher 恒抛
+         * 「代理地址无效」（实测：`AFTER-UPDATE qoderProxyFor = "ftp://host:21"`）。
+         *
+         * ⇒ 只放行那四个键。多余键**丢字段而不是丢请求**（删一个字段可逆，
+         * 删一条账号不可逆），并留一条 warn 便于发现 UI 打错。
+         */
+        const allowed = ['nickname', 'enabled', 'expiresAt', 'refreshable'] as const
+        const safePatch: Record<string, unknown> = {}
+        for (const key of allowed) {
+          const value = (req.patch as Record<string, unknown> | undefined)?.[key]
+          if (value !== undefined) safePatch[key] = value
+        }
+        const dropped = Object.keys((req.patch ?? {}) as Record<string, unknown>)
+          .filter((key) => !(allowed as readonly string[]).includes(key))
+        if (dropped.length > 0) {
+          ctx.logger.warn(
+            `[jet-hub] account.update 收到不支持的字段，已忽略：${dropped.join(', ')}`
+            + '（这类字段必须走各自专用端点，否则会绕过写入闸门）',
+          )
+        }
+        await pool.updateAccount(req.accountId, safePatch as never)
         return { ok: true, value: undefined }
       }
 
@@ -5985,7 +6339,16 @@ function registerJetHubEndpoints(
           const { product } = requireQoderFamily(req.provider)
           const value = await collectClaimResults<QoderCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimQoderDailyCheckin(credential, product),
+            // ⚠️ 第三参是每个账号自己的 `entry`（不是 `fetcher` —— 那个
+            // 错位正是 2026-10-08「一键领取 4 个 CodeBuddy 账号全失败：
+            // TypeError: fetcher is not a function」的成因，见
+            // `collectClaimResults` 方法头的长注释）。
+            //
+            // 签到端点同样走 `openapi.qoder.sh` ⇒ 国际版**必须**有出口代理，
+            // 否则一键领取对 qoder 恒失败、对中国版恒成功，看上去像「厂商
+            // 不让我们领」。代理按账号取，与中国版直连互不干扰。
+            claim: (credential, _product, entry) =>
+              claimQoderDailyCheckin(credential, product, qoderFetchForAccount(entry.id)),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
@@ -6319,7 +6682,14 @@ function registerJetHubEndpoints(
             // 但 TLS ClientHello 被丢（12s 无响应）⇒ fetch 必在 10.7s 后报
             // `UND_ERR_CONNECT_TIMEOUT`。这是**环境问题**，必须点名主机与出路，
             // 否则用户只会以为「凭据坏了」，反复重新登录。
-            const detailed = await fetchQoderBalanceDetailed(credential, product)
+            // ⚠️ **必须按账号取出口代理**（真实报障 2026-10-21）：国际版
+            // `openapi.qoder.sh` 被 SNI 阻断，直连恒 10.7s 超时。而**中国版**
+            // 直连只要 160ms ⇒ 只能按账号配，不能用全局环境变量（那会让
+            // 中国版也一起去挤代理）。配了代理却没接这一格的症状是
+            // 「面板里 10.8 秒才报错、报的还是没有代理的超时」——割裂且极难对应。
+            const detailed = await fetchQoderBalanceDetailed(credential, product, {
+              fetcher: qoderFetchForAccount(account.id),
+            })
             return {
               accountId: account.id,
               nickname: account.nickname,
@@ -7899,6 +8269,9 @@ function registerJetHubEndpoints(
           // 被 env 停用时即使 `enabled` 为真也不会监听，此时**不**回显地址，
           // 否则设置页会显示一个根本连不上的 URL。
           address,
+          // 「期望运行但没监听」的结构化原因（Issue #11 建议 ②）：
+          // `running: false` 本身分不清「用户关的」与「起不来的」。
+          lastError: await degrade('失败原因', () => gatewayLastError(), null),
           // ⚠️ 明文凭据：只用于设置页展示与复制，**不进日志**。
           apiKey: apiKey === null
             ? null
@@ -7963,6 +8336,8 @@ function registerJetHubEndpoints(
           allowLan: pool.gatewayAllowLan(),
           hostFromEnv: isGatewayHostFromEnv(process.env),
           address: blockedByEnv ? null : gatewayAddress() ?? null,
+          // 「期望运行但没监听」的结构化原因（Issue #11 建议 ②）。
+          lastError: gatewayLastError(),
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,
           modelsSource,
@@ -8021,6 +8396,8 @@ function registerJetHubEndpoints(
           allowLan: pool.gatewayAllowLan(),
           hostFromEnv,
           address: blockedByEnv ? null : gatewayAddress() ?? null,
+          // 「期望运行但没监听」的结构化原因（Issue #11 建议 ②）。
+          lastError: gatewayLastError(),
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,
           modelsSource,
@@ -8057,35 +8434,39 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // ── 「侧栏入口」开关（Jet Hub 页头的「侧栏」开关）──
+      // ── 「面板入口」（插件详情页设置卡片里的下拉）──
       //
-      // 语义：**开** = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，
-      // 点它把 Jet Hub 页渲染进中央主面板（`main` 槽的 `jet-hub` key）；
-      // **关** = 该行消失，进入路径只剩「设置 → Jet Hub」。
+      // 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
+      // `'sidebar'` = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，点它把
+      // 页面渲染进中央主面板（`main` 槽的 `jet-hub` key），同时 `settings.section`
+      // 那一节注销；`'settings'` = 该行注销，进入路径只剩「设置 → 插件 → Jet Hub」。
       //
-      // 消费方是客户端：`plugin-src/client/sidebar-entry.js` 在 `apply` 里先读
-      // 一次本端点，再决定注不注入那行；页头开关写回后由同一份进程内副本
-      // 通知两侧（设置页与主面板）重新渲染。
-      case 'sidebarEntry.getEnabled': {
-        const value: RpcSidebarEntryGetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+      // 消费方是客户端：`plugin-src/client/panel-entry.js` 在 `apply` 里先读一次
+      // 本端点，再决定注不注入那两处入口；卡片写回后由同一份进程内副本通知两处
+      // 注册逻辑重新求值。
+      case 'panelEntry.get': {
+        const value: RpcPanelEntryGetResponse = { entry: pool.panelEntry() }
         return { ok: true, value }
       }
 
-      case 'sidebarEntry.setEnabled': {
-        const req = payload as RpcSidebarEntrySetEnabledRequest
+      case 'panelEntry.set': {
+        const req = payload as RpcPanelEntrySetRequest
         // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
-        // 默认成 true 会静默打开用户特意关闭的入口。
-        if (typeof req.enabled !== 'boolean') {
-          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        // 把非法值当成某个合法值会静默改掉用户的入口。校验表用
+        // `PANEL_ENTRY_VALUES`（与 store 的 sanitize 同一份真源），不在这里
+        // 另写一套字面量比较。
+        if (!PANEL_ENTRY_VALUES.includes(req.entry)) {
+          return { ok: false, error: { code: 'bad-request', message: 'entry 必须是 sidebar 或 settings' } }
         }
-        await pool.setSidebarEntryEnabled(req.enabled)
+        await pool.setPanelEntry(req.entry)
         // 不刷新任何缓存：客户端的注册逻辑读的是**同一个**进程内副本，
-        // 写完由客户端自己按返回值（落盘后重读）同步两侧 UI。
+        // 写完由客户端自己按返回值（落盘后重读）同步两处 UI。
         ctx.logger.info(
-          `[jet-hub] ${req.enabled ? '显示' : '隐藏'}主导航侧栏入口`
-          + `${req.enabled ? '' : '（仍可从「设置 → Jet Hub」进入）'}`,
+          req.entry === 'sidebar'
+            ? '[jet-hub] 面板入口：仅侧栏（主导航一行；设置页那一节已注销）'
+            : '[jet-hub] 面板入口：仅设置页（主导航那一行已注销）',
         )
-        const value: RpcSidebarEntrySetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+        const value: RpcPanelEntrySetResponse = { entry: pool.panelEntry() }
         return { ok: true, value }
       }
 

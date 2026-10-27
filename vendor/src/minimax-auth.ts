@@ -24,6 +24,7 @@ import {
 } from './minimax-product.js'
 import { fetchMinimaxUserIdentity } from './minimax-identity.js'
 import {
+  inheritMinimaxIdentity,
   fallbackToEntry,
   isMinimaxRefreshable,
   minimaxCredentialExpiresAtMs,
@@ -39,6 +40,7 @@ import {
   pollMinimaxDeviceToken,
   refreshMinimaxCredential,
   startMinimaxDeviceAuthorization,
+  fetchMinimaxForcedLoginUrl,
   type MinimaxDeviceAuthorization,
 } from './minimax-oauth.js'
 
@@ -105,6 +107,24 @@ export interface MinimaxAuthOptions {
   serviceName?: string
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 按**账号 id** 取该账号的出口（MiniMax 国际站代理支持）。
+   *
+   * ## 为什么要有它
+   *
+   * `agent.minimax.io` 按**出口 IP 国别**分流，大陆来源恒被 307 到中国站 ⇒
+   * 报出与「凭据失效」**逐字同形**的 401（issue IKMEVG）。既有的
+   * `X-Forwarded-For` 只是**声明**一个海外 IP，真正换出口要靠代理。
+   *
+   * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor(accountId)`（生产代理）>
+   * 全局 `fetch`。与 `GeminiAuth` 的同名字段**逐字同构**（同一份判据，只换
+   * 产品语义）。
+   *
+   * ⚠️ 只在**国际站实例**上注入（中国站直连才是最优，出海反而更慢且可能被
+   * 引到国际站）。未注入时本字段 `undefined` ⇒ `fetcherFor()` 恒走既有路径，
+   * **行为逐字节不变**。
+   */
+  fetchFor?: (accountId: string) => typeof fetch
   /** 注入的 sleep（测试用）。 */
   sleep?: (ms: number) => Promise<void>
 }
@@ -113,6 +133,22 @@ export interface MinimaxAuthOptions {
 export interface StartedMinimaxLoginFlow {
   /** 用户点开的授权链接（**含 user_code**）。 */
   loginUrl: string
+  /**
+   * 「保证走一遍登录」的链接（**可能为 undefined**）。
+   *
+   * ## 为什么登录链接需要两个版本（2026-10-24，用户报障「一打开就自带旧 session」）
+   *
+   * `loginUrl` 里的 `user_code` **不含身份**，身份全在浏览器 cookie ⇒ 用已有
+   * 会话的浏览器打开就直接复用旧账号（上游不认任何 `prompt=*` 强制参数，实测）。
+   * 本字段是上游「切换账号」按钮的等价物：`/unified-login?login_redirect=<授权页>`，
+   * 由 {@link fetchMinimaxForcedLoginUrl} 用**无 cookie** 的服务端请求换来，
+   * 登录完自动回到授权页放行**新**账号。
+   *
+   * ⚠️ 它**不依赖**无痕窗口能力 ⇒ 在「手机/远端浏览器经隧道访问、宿主没有你的
+   * 浏览器」这种部署里，这是**唯一**生效的路径。
+   * ⚠️ 可选字段：拿不到时调用方退回 {@link loginUrl}（行为与从前逐字节相同）。
+   */
+  forcedLoginUrl?: string
   /** 授权完成后的凭据。 */
   result: Promise<MinimaxCredential>
   /** 放弃本次登录。 */
@@ -139,9 +175,30 @@ export class MinimaxAuth extends Service {
     return this.options.fetchImpl ?? fetch
   }
 
+  /**
+   * 取**某个账号**该走的 fetcher（MiniMax 国际站代理支持）。
+   *
+   * ⚠️⚠️ **必须按账号现取，不能在构造/循环外固化**：本类在一轮流程里可能换号
+   * （目录取号走 `getAvailableAccount`、续期按 ref 逐个走），出口必须跟着换 ——
+   * 固化一份会让「换了号却仍走旧账号的出口」，症状是「配了代理还是被分流」
+   * 且**零报错**，属最难查的一类静默失效。
+   *
+   * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor(accountId)`（生产代理）>
+   * 全局 `fetch`。未注入 `fetchFor`（中国站实例 / 旧接线）⇒ 恒走既有路径，
+   * **行为逐字节不变**。
+   *
+   * ⚠️ 空账号 id（`''`）= 直连：`fetchFor` 的解析器按「空 id = 没配代理」处理
+   * （见 `minimax-proxy.ts`）—— 拿不到账号时不该去查一个空 id。
+   */
+  private fetcherFor(accountId: string): typeof fetch {
+    if (this.options.fetchImpl !== undefined) return this.options.fetchImpl
+    if (this.options.fetchFor !== undefined) return this.options.fetchFor(accountId)
+    return fetch
+  }
+
   /** 申请设备码（供 RPC 提前拿到 loginUrl）。 */
-  async fetchDeviceAuthorization(): Promise<MinimaxDeviceAuthorization> {
-    return startMinimaxDeviceAuthorization(this.fetchImpl, this.product)
+  async fetchDeviceAuthorization(accountId?: string): Promise<MinimaxDeviceAuthorization> {
+    return startMinimaxDeviceAuthorization(this.fetcherFor(accountId ?? ''), this.product)
   }
 
   /**
@@ -149,13 +206,28 @@ export class MinimaxAuth extends Service {
    *
    * ⚠️ 不能在这里阻塞等授权完成 —— 前端 `window.open` 只在
    * transient activation 窗口内有效（见 AGENTS.md「两步式登录」）。
+   *
+   * @param options.accountId 本次登录**将要落在哪个账号条目上**（可选）。
+   *
+   * ## ⚠️⚠️ 为什么登录也必须知道账号 id（换 token 的那一步要出海）
+   *
+   * 设备码申请与轮询换 token 都发生在**凭据落盘之前**，此时凭据还在内存里、
+   * 账号池里也**只有那条占位条目**认得这个账号 ⇒ 代理只能按 `accountId`
+   * 从池里读（`minimaxIntlProxy`）。不带 ⇒ 国际站在大陆网络下**登录恒失败**，
+   * 而用户**没法给一个还不存在的账号配代理**（面板的「代理」按钮按
+   * `accountId` 打开）⇒ **死锁**（与 Gemini 的 IKLTZ2 审计 P2-1 同型）。
+   *
+   * 触发路径很常见：refresh_token 失效时面板明示的既定动作就是「删号重登」，
+   * 而重登造的是**全新 id** ⇒ 旧号上的代理配置必然丢失。
+   *
+   * ⚠️ 不传时是空串 = 直连，与既有行为**逐字节一致**（`fetcherFor('')`）。
    */
-  async startLogin(): Promise<StartedMinimaxLoginFlow> {
-    const auth = await this.fetchDeviceAuthorization()
+  async startLogin(options: { accountId?: string } = {}): Promise<StartedMinimaxLoginFlow> {
+    const auth = await this.fetchDeviceAuthorization(options.accountId)
     let aborted = false
     const controller = new AbortController()
     const result = pollMinimaxDeviceToken(auth, {
-      fetcher: this.fetchImpl,
+      fetcher: this.fetcherFor(options.accountId ?? ''),
       ...this.options.sleep === undefined ? {} : { sleep: this.options.sleep },
       signal: controller.signal,
       product: this.product,
@@ -168,8 +240,22 @@ export class MinimaxAuth extends Service {
     // 会 reject（用户关掉登录弹窗就是这条路径）。缺这一句时，
     // 若调用方在 `await result` 之前就放弃，Node 会报 `unhandledRejection`。
     result.catch(() => {})
+    /**
+     * ⚠️⚠️ 2026-10-24：**额外**去换一条「保证需要登录」的链接。
+     *
+     * 用户报障：「登录链接一打开就自带旧 session 登录态」。`loginUrl` 的
+     * `user_code` 不含身份、身份全在浏览器 cookie；上游不认 `prompt=*`，
+     * 但它的「切换账号」按钮走 `/oauth2/device/authorize`（无 cookie ⇒
+     * `401 login_required` + `login_url`）⇒ 服务端已替我们拼好「登录完回到授权页」。
+     *
+     * ⚠️ 它**不消耗任何凭据**（纯 GET、无 `Authorization`），可安全地在每次
+     * 「新建账号」时调用 —— 本仓库有过「诊断请求烧掉 refresh_token」的事故。
+     * ⚠️ 该函数**永不抛错**（失败退回本地兜底；再失败返回 undefined）。
+     */
+    const forcedLoginUrl = await fetchMinimaxForcedLoginUrl(auth, this.fetchImpl, this.product)
     return {
       loginUrl: auth.verificationUriComplete,
+      ...forcedLoginUrl === undefined ? {} : { forcedLoginUrl },
       result,
       close: () => {
         aborted = true
@@ -206,30 +292,45 @@ export class MinimaxAuth extends Service {
    * 3. **国际站必须带池里的 XFF**：`agent.minimax.io` 对大陆出口恒 307 到
    *    `agent.minimaxi.com`，跨 origin 跟随会剥掉 `Authorization` ⇒ 401
    *    （真机实测：无 XFF 时国际站身份**永远**拿不到）。
+   *
+   * @param options.accountId 落盘到**哪个账号条目**（可选，供代理取出口）。
+   *   ⚠️ 它是唯一能让「换 token 之后的身份查询」走对出口的来源 —— 此刻凭据
+   *   刚落盘、按凭据反查账号 id 那条路还没建立（与 `startLogin` 同因）。
    */
   async persistLogin(
     credential: MinimaxCredential,
-    options: { refName: string; nickname?: string },
-  ): Promise<{ accountId?: string; nickname?: string }> {
+    options: { refName: string; nickname?: string; accountId?: string },
+  ): Promise<{ accountId?: string; nickname?: string; userId?: string }> {
     // ⚠️ 与 `fetchModels` 同一份 XFF 取法（`typeof` 判一下：单测/旧接线可能传
     //    只实现部分方法的池替身，直接 `.minimaxXff()` 会抛 TypeError）。
     const pool = this.ctx.accountPool
     const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined
     // ⚠️ 查不到（含抛错、401、非 JSON、空 name）一律 `undefined`，不阻塞登录。
     const identity = options.nickname === undefined
-      ? await fetchMinimaxUserIdentity(credential, this.fetchImpl, this.product, xff)
+      ? await fetchMinimaxUserIdentity(
+          credential,
+          this.fetcherFor(options.accountId ?? ''),
+          this.product,
+          xff,
+        )
       : undefined
     const nickname = options.nickname ?? identity?.name
 
     const payload: MinimaxCredential = {
       ...credential,
       ...nickname === undefined ? {} : { nickname },
+      // ⚠️ 稳定身份必须落进凭据 —— 它是「同账号去重」的**唯一**判据
+      //    （`account.create` 的 minimax 分支按它查 `findAccountIdByIdentityField`）。
+      //    `identity.userId` 一直拿得到（`GET /v1/api/user/info` 的 `userID`），
+      //    但此前**只用来拼昵称、随后被丢弃** ⇒ 去重无从下手。
+      ...identity?.userId === undefined ? {} : { user_id: identity.userId },
     }
     await this.ctx.credentials.set(credentialRef(options.refName), JSON.stringify(payload))
     this.lastRefreshError = undefined
     return {
       ...credential.account_id === undefined ? {} : { accountId: credential.account_id },
       ...nickname === undefined ? {} : { nickname },
+      ...identity?.userId === undefined ? {} : { userId: identity.userId },
     }
   }
 
@@ -240,7 +341,19 @@ export class MinimaxAuth extends Service {
     return parseMinimaxCredential(resolved.value)
   }
 
-  /** 续期默认单凭据。 */
+  /**
+   * 续期**默认单凭据**。
+   *
+   * ⚠️⚠️ **这是第 5 条续期路径，且必须同样继承身份**（2026-10-25 合并审计）：
+   * PR !147 声称「收口在**唯一**出口 `refreshCredentialFor`」，但本方法在生产上
+   * **可达**（`src/index.ts` 的 `getAvailableAccount()` 返回空时就走这里 ——
+   * 而「返回空」正是去重把两张卡都停用后的形态），且它此前直接
+   * `set(refreshMinimaxCredential(...))` ⇒ `nickname` / `user_id` **双双消失**
+   * （实测：续期后落盘只剩令牌五件套）。后果是 IKP8UA（昵称退回内部 id）+
+   * 去重失去唯一判据，**每 30 分钟一轮**，必然复现。
+   *
+   * ⇒ 与 `refreshCredentialFor` 共用同一个纯函数 `inheritMinimaxIdentity`。
+   */
   async refresh(): Promise<void> {
     const credential = await this.resolveDefaultCredential()
     if (credential === undefined) {
@@ -250,11 +363,13 @@ export class MinimaxAuth extends Service {
       throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
     }
     try {
-      const next = await refreshMinimaxCredential(
+      const refreshed = await refreshMinimaxCredential(
         credential.refresh_token as string,
         this.fetchImpl,
         this.product,
       )
+      // ⚠️ 与 `refreshCredentialFor` **同一份**继承判据（同义判据分两处必然漂移）。
+      const next = inheritMinimaxIdentity(refreshed, credential)
       await this.ctx.credentials.set(credentialRef(this.credentialRefName), JSON.stringify(next))
       this.lastRefreshError = undefined
     } catch (error) {
@@ -286,7 +401,7 @@ export class MinimaxAuth extends Service {
     }
     // 无账号池时退化为「直接续期 + 落盘」（单凭据路径）
     if (pool === undefined) {
-      const next = await this.refreshCredentialFor(credential)
+      const next = await this.refreshCredentialFor(credential, accountId)
       await this.ctx.credentials.set(ref, JSON.stringify(next))
       return
     }
@@ -297,7 +412,7 @@ export class MinimaxAuth extends Service {
       accountId: accountId ?? '',
       credential,
       accessors: MINIMAX_EXPIRY_ACCESSORS,
-      refresh: (c) => this.refreshCredentialFor(c),
+      refresh: (c) => this.refreshCredentialFor(c, accountId),
       save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
       warn: (message) => this.ctx.logger?.warn?.(message),
       info: (message) => this.ctx.logger?.info?.(message),
@@ -340,7 +455,7 @@ export class MinimaxAuth extends Service {
           credential,
           accessors: MINIMAX_EXPIRY_ACCESSORS,
           current: entry,
-          refresh: (c) => this.refreshCredentialFor(c),
+          refresh: (c) => this.refreshCredentialFor(c, entry.id),
           save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
           warn: (message) => this.ctx.logger?.warn?.(message),
         })
@@ -370,15 +485,23 @@ export class MinimaxAuth extends Service {
    * 续期给定凭据（供 `refreshAccountWithReconcile` 的 `refresh` 回调）。
    *
    * ⚠️ **不落盘** —— 落盘由共享实现的 `save` 回调负责。
+   *
+   * @param accountId 该凭据属于哪个账号（可选，供代理取出口）。
+   *   ⚠️ 与推理路径同因：国际站的续期端点也在 `agent.minimax.io` 上，
+   *   大陆出口直连会 307 ⇒ 续期恒失败而 UI 只显示「已过期」。
    */
-  async refreshCredentialFor(credential: MinimaxCredential): Promise<MinimaxCredential> {
+  async refreshCredentialFor(
+    credential: MinimaxCredential,
+    accountId?: string,
+  ): Promise<MinimaxCredential> {
     if (!isMinimaxRefreshable(credential)) {
       throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
     }
+    let refreshed: MinimaxCredential
     try {
-      return await refreshMinimaxCredential(
+      refreshed = await refreshMinimaxCredential(
         credential.refresh_token as string,
-        this.fetchImpl,
+        this.fetcherFor(accountId ?? ''),
         this.product,
       )
     } catch (error) {
@@ -388,15 +511,33 @@ export class MinimaxAuth extends Service {
       }
       throw error
     }
+    /**
+     * ⚠️⚠️ 续期**必须继承**身份字段（2026-10-24）。
+     *
+     * `parseMinimaxTokenGrant` 只构造令牌五件套（`access_token` / `refresh_token` /
+     * `token_type` / `expires_at` / `scope`），**不认识** `nickname` / `user_id`；
+     * 而续期结果会被整体覆盖落盘 ⇒ 每续期一次丢一次：`nickname` 丢了账号卡片退回
+     * 内部 id（IKP8UA 复发），`user_id` 丢了**同账号去重失去唯一判据**。
+     * 定时续期 30 分钟一轮、SELF_HEAL 还会补一次 ⇒ 这个丢失**必然发生**。
+     *
+     * ⚠️ 收口在**唯一**的续期出口（本方法）：本文件有 4 条续期路径，在各调用点
+     *    分别补必然漏一处。
+     */
+    return inheritMinimaxIdentity(refreshed, credential)
   }
 
   /**
    * 拉取远端模型目录（给定凭据）。
    *
    * ⚠️ **测试专用入口**（无需账号池）：`fetchModels` 是它的薄包装。
+   *
+   * @param accountId 用**哪个账号**的出口（可选，供代理取）。
    */
-  async fetchModelsWith(credential: MinimaxCredential): Promise<readonly MinimaxModelEntry[]> {
-    const raw = await this.fetchRawModels(credential)
+  async fetchModelsWith(
+    credential: MinimaxCredential,
+    accountId?: string,
+  ): Promise<readonly MinimaxModelEntry[]> {
+    const raw = await this.fetchRawModels(credential, accountId)
     return raw ?? this.product.fallbackModels.map(fallbackToEntry)
   }
 
@@ -412,8 +553,15 @@ export class MinimaxAuth extends Service {
    * 兜底表内容可以被改写，若远端下发的恰好与兜底表相同，「比较内容」的判据会把
    * 一次成功的拉取误判为失败。只有「解析函数返回了几个条目」这个**内部事实**
    * 能可靠区分两者。
+   *
+   * @param accountId 用**哪个账号**的出口（可选，供代理取）。
+   *   ⚠️ 目录端点也在 `agent.minimax.io` 上：大陆出口直连恒 307 ⇒ 整个
+   *   provider 会从模型选择器里**消失**（issue IKMEVG 的另一症状面）。
    */
-  private async fetchRawModels(credential: MinimaxCredential): Promise<readonly MinimaxModelEntry[] | undefined> {
+  private async fetchRawModels(
+    credential: MinimaxCredential,
+    accountId?: string,
+  ): Promise<readonly MinimaxModelEntry[] | undefined> {
     try {
       const url = new URL(`${this.product.apiHost}${MINIMAX_MODELS_PATH}`)
       url.searchParams.set('region', this.product.region)
@@ -449,7 +597,7 @@ export class MinimaxAuth extends Service {
           signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
         }),
         {
-          fetcher: this.fetchImpl,
+          fetcher: this.fetcherFor(accountId ?? ''),
           onGeoRoute: () => { geoRouted = true },
         },
       )
@@ -486,23 +634,33 @@ export class MinimaxAuth extends Service {
 
   /** 拉取远端模型目录（账号池版本）。 */
   async fetchModels(pool?: AccountPool): Promise<readonly MinimaxModelEntry[]> {
-    const credential = await this.resolveModelsCredential(pool)
-    if (credential === undefined) return this.product.fallbackModels.map(fallbackToEntry)
-    return this.fetchModelsWith(credential)
+    const picked = await this.resolveModelsCredential(pool)
+    if (picked === undefined) return this.product.fallbackModels.map(fallbackToEntry)
+    return this.fetchModelsWith(picked.credential, picked.accountId)
   }
 
-  /** 目录拉取用哪份凭据：账号池优先，其次插件自存的默认凭据。 */
+  /**
+   * 目录拉取用哪份凭据：账号池优先，其次插件自存的默认凭据。
+   *
+   * ⚠️ **同时返回账号 id**（代理支持）：目录端点也在 `agent.minimax.io` 上，
+   * 国际站必须走该账号的出口才拿得到。单凭据回退时 id 是空串（= 直连），
+   * 与既有行为一致。
+   */
   private async resolveModelsCredential(
     pool?: AccountPool,
-  ): Promise<MinimaxCredential | undefined> {
+  ): Promise<{ credential: MinimaxCredential; accountId: string } | undefined> {
     if (pool !== undefined) {
       // ⚠ `getAvailableAccount` 返回 **`{ entry, credential }`**（两层），
       // **不是**「账号条目本身」—— 照抄既有 provider 的写法：
       // `const available = await pool.getAvailableAccount<MinimaxCredential>(id, ''); available?.credential`
       const available = await pool.getAvailableAccount<MinimaxCredential>(this.product.id, '')
-      if (available) return available.credential
+      if (available) {
+        return { credential: available.credential, accountId: available.entry.id }
+      }
     }
-    return await this.resolveDefaultCredential()
+    const credential = await this.resolveDefaultCredential()
+    if (credential === undefined) return undefined
+    return { credential, accountId: '' }
   }
   /**
    * 只取**真远端**目录；未登录 / 上游失败 / 解析出 0 条 ⇒ `[]`。
@@ -519,9 +677,9 @@ export class MinimaxAuth extends Service {
    * 只是**不**把兜底表当结果返回。
    */
   async fetchRemoteModelsOnly(pool?: AccountPool): Promise<readonly MinimaxModelEntry[]> {
-    const credential = await this.resolveModelsCredential(pool)
-    if (credential === undefined) return []
-    return (await this.fetchRawModels(credential)) ?? []
+    const picked = await this.resolveModelsCredential(pool)
+    if (picked === undefined) return []
+    return (await this.fetchRawModels(picked.credential, picked.accountId)) ?? []
   }
 
   /**
@@ -570,9 +728,12 @@ export class MinimaxAuth extends Service {
         if (credential === undefined) continue
 
         // 查一次身份（只读 GET；失败返回 undefined，不抛错）。
+        // ⚠️ **走 `fetcherFor(entry.id)`**：国际站的用户信息端点也在
+        //    `agent.minimax.io` 上，大陆出口直连会 307 ⇒ 401（真机实测）
+        //    ⇒ 自愈对国际站账号恒失败且看起来「和国内站一样在跑」。
         const identity = await fetchMinimaxUserIdentity(
           credential,
-          this.fetchImpl,
+          this.fetcherFor(entry.id),
           this.product,
           xff,
         )
@@ -589,11 +750,30 @@ export class MinimaxAuth extends Service {
           await pool.updateAccount(entry.id, { nickname: identity.name })
           repaired.push(entry.id)
         }
-        // 顺带把身份写进凭据（`persistLogin` 的读取侧约定见该方法注释）。
-        if ((credential as { nickname?: string }).nickname !== identity.name) {
+        /**
+         * 顺带把身份写进凭据（`persistLogin` 的读取侧约定见该方法注释）。
+         *
+         * ⚠️⚠️ **必须连 `user_id` 一起补写**（2026-10-25 合并审计打穿）：
+         * 改前这里只写 `nickname`，而 `identity.userId` **就在手上**却被丢掉 ⇒
+         * 存量凭据（PR 之前登录的）永远没有 `user_id` ⇒ `account.create` 的
+         * 同账号去重**永不命中**（`findAccountIdByIdentityField` 对缺失字段是
+         * **跳过**，不是「不匹配」）⇒ 一个号仍可无限建卡、各持一份 token。
+         *
+         * 这条自愈是**唯一**能给存量账号补身份的地方：`persistLogin` 只写新账号，
+         * `inheritMinimaxIdentity` 只能继承「已有的」，救不了「从来没有的」。
+         * 本机三份 `MINIMAX_ACCOUNT_*` 凭据实测**零份**带 `user_id` ⇒ 不是边角情况。
+         */
+        const needsNicknameBackfill = (credential as { nickname?: string }).nickname !== identity.name
+        const needsUserIdBackfill = identity.userId !== undefined
+          && (credential as { user_id?: string }).user_id !== identity.userId
+        if (needsNicknameBackfill || needsUserIdBackfill) {
           await this.ctx.credentials.set(
             ref,
-            JSON.stringify({ ...credential, nickname: identity.name }),
+            JSON.stringify({
+              ...credential,
+              nickname: identity.name,
+              ...identity.userId === undefined ? {} : { user_id: identity.userId },
+            }),
           )
         }
       } catch (error) {

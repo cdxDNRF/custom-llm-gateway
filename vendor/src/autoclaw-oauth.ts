@@ -415,12 +415,25 @@ export async function refreshAutoclawToken(
     product?: AutoclawProduct
     fetchImpl?: typeof fetch
     deviceId?: string
+    /**
+     * **单次请求**超时（毫秒）；缺省 {@link AUTOCLAW_REQUEST_TIMEOUT_MS}（60s）。
+     *
+     * ⚠️ 存在的理由（2026-10-27 审计 P2-2）：本函数**依次试两个端点**
+     * （`/userapi/v1/refresh` 与 `/agent-refresh`），各用 60s ⇒ 调用方光等刷新
+     * 就可能 **120s**。签到那条腿若用它，用户点「一键领取」最坏要等
+     * `2×60 + 15 = 135s`（实测真实挂钟 **120,015ms** 只差 claim 那段），
+     * 而修复前上界是 15s ⇒ 9 倍。
+     *
+     * ⇒ 让调用方按自己的预算覆盖它（签到腿用 {@link AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS}）。
+     */
+    timeoutMs?: number
   },
 ): Promise<AutoclawCredential> {
   const product = options?.product ?? AUTOCLAW
   const fetcher = options?.fetchImpl ?? fetch
   const cleanRefresh = cleanBearerToken(refreshToken)
   const deviceId = options?.deviceId ?? 'dsh-autoclaw-device-001'
+  const timeoutMs = options?.timeoutMs ?? AUTOCLAW_REQUEST_TIMEOUT_MS
 
   const endpoints = [AUTOCLAW_REFRESH_PATH, AUTOCLAW_REFRESH_FALLBACK_PATH]
   let lastError: Error | undefined
@@ -444,7 +457,7 @@ export async function refreshAutoclawToken(
           source_id: AUTOCLAW_SOURCE_ID,
           device_id: deviceId,
         }),
-        signal: AbortSignal.timeout(AUTOCLAW_REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       })
 
       if (!resp.ok) {

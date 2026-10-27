@@ -158,6 +158,27 @@ export interface ProviderCreditsDeps {
    * 固化成一份 fetcher —— 账号可能随时在面板里改代理。
    */
   readonly geminiFetchFor?: (accountId: string) => typeof fetch
+  /**
+   * MiniMax **国际站**的按账号 fetcher（PR !145 审计 P0 修法）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它（真实缺陷，本 PR 自己声称要修却没修）
+   *
+   * PR !145 的提交说明与 `index.ts` 注释都写「登录 / 续期 / 目录 / 身份 / 推理 /
+   * **积分**六条链路都走 `minimaxIntlFetchForAccount`」，但本文件（三个积分入口
+   * 的所在处）**一行都没改** —— 三个原语的第二参仍是 `undefined`（⇒ 默认参数
+   * = 全局 `fetch`）。而 `agent.minimax.io` 按出口 IP 国别分流，大陆出口直连
+   * 恒 307 到中国站，中国站不认国际站 token ⇒ 401。
+   *
+   * ⇒ **用户配好代理后，对话能用了，积分行却仍报「余额查询失败」、一键签到仍
+   * 失败** —— 症状与 issue IKMEVG 逐字相同，只是从「全部链路」缩到「积分」这一面。
+   *
+   * ⚠️ 与 {@link geminiFetchFor} **刻意分成两个字段**：两家语义与主机都不同
+   *（Gemini 是「墙外连不上」，国际站是「连得上却被分流」），共用会让
+   *「清掉一家的代理」连带清掉另一家的出口配置。
+   *
+   * ⚠️ 同样必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+   */
+  readonly minimaxIntlFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -315,6 +336,33 @@ async function runTraeLotteryForUi(credential: TraeCredential): Promise<string |
 export function createProviderCredits(
   deps: ProviderCreditsDeps = {},
 ): Readonly<Record<string, ProviderCredits>> {
+  /**
+   * MiniMax 国际站该用哪个 fetcher（**三个入口共用这一份判据**）。
+   *
+   * ## ⚠️⚠️ 为什么抽成一处（PR !145 审计 P0 的修法）
+   *
+   * 三个入口（余额 / 签到状态 / 领取）都要按账号取出口，而它们的**取法完全相同**。
+   * 写成三份内联三元就是本仓库反复记录的「同义判据两份实现必然漂移」——
+   * 漏改一份的症状是「余额走了代理、签到没走」，而这种半通状态比全不通更难归因。
+   *
+   * ## 判据
+   *
+   * - 没注入 `minimaxIntlFetchFor`（单测 / 旧接线）⇒ **全局 `fetch`**，
+   *   与修复前**逐字节等价**；
+   * - 注入但拿不到账号 id（`undefined` / 空串）⇒ **全局 `fetch`**：
+   *   不知道是谁就不该猜一个账号去用它的出口（那会把请求发到错误的出口上）；
+   * - 都拿到 ⇒ 按账号现取（`fetchFor` 内部会读池里的 `minimaxIntlProxy`）。
+   *
+   * ⚠️ `fetchFor` 在代理串非法时**会抛错**（见 `minimax-proxy.ts` 的模块头：
+   * 「归一可能失败，那必须抛错让用户看见，而不是静默退回直连」）。本函数
+   * **不吞**它 —— 吞掉就退化成静默直连，那正是这次要消灭的形态。
+   */
+  const minimaxIntlFetcher = (accountId: string | undefined): typeof fetch => {
+    if (deps.minimaxIntlFetchFor === undefined) return fetch
+    if (accountId === undefined || accountId === '') return fetch
+    return deps.minimaxIntlFetchFor(accountId)
+  }
+
   return {
     /**
      * CodeArts（华为云）：余额搭 `statistics/plugin` 的账户类型检测回来，
@@ -574,8 +622,30 @@ export function createProviderCredits(
     autoclaw: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
-      claim: async (credential) =>
-        await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      /**
+       * ⚠️ **必须把 `call.warn` 与 `call.persistCredential` 透传下去**
+       * （2026-10-27 Gitee PR #153 审计 P0/P1-3）：
+       * - `warn`：刷新失败原先被裸 `catch` 吞掉，`outcome` 与成功逐字相同 ⇒
+       *   用户永远不知道「活动奖励其实没发」；
+       * - `persistCredential`：刷新**可能轮换** `refresh_token`，新值若没人接住，
+       *   旧值立即作废 ⇒ 账号续期能力被**逐日烧掉**（详见
+       *   `ProviderCallContext.persistCredential` 的长注释）。
+       *   ⚠️ 这里用 `entry.credentialRef` 绑 ref —— 与 `resolve` 那条腿**同一个
+       *   ref 约定**（`credentialRef(entry.credentialRef)`），不要自己拼。
+       */
+      claim: (credential, entry, call) =>
+        claimAutoclawDailyQuota(credential as AutoclawCredential, {
+          warn: (message) => call?.warn(message),
+          ...call?.persistCredential === undefined
+            ? {}
+            : {
+                persist: (next: AutoclawCredential) =>
+                  call.persistCredential!(
+                    entry?.credentialRef as unknown as string,
+                    JSON.stringify(next),
+                  ),
+              },
+        }),
       precheckStatus: false,
     },
     /**
@@ -595,11 +665,21 @@ export function createProviderCredits(
           credential as AutoclawCredential,
           { product: AUTOCLAW_INTL },
         ),
-      claim: async (credential) =>
-        await claimAutoclawDailyQuota(
-          credential as AutoclawCredential,
-          { product: AUTOCLAW_INTL },
-        ),
+      /** 与 `autoclaw` 同形（含 `warn` / `persistCredential` 透传），只差产品基址。 */
+      claim: (credential, entry, call) =>
+        claimAutoclawDailyQuota(credential as AutoclawCredential, {
+          product: AUTOCLAW_INTL,
+          warn: (message) => call?.warn(message),
+          ...call?.persistCredential === undefined
+            ? {}
+            : {
+                persist: (next: AutoclawCredential) =>
+                  call.persistCredential!(
+                    entry?.credentialRef as unknown as string,
+                    JSON.stringify(next),
+                  ),
+              },
+        }),
       precheckStatus: false,
     },
     accio: {
@@ -730,24 +810,67 @@ export function createProviderCredits(
      * 不填则行为与修复前完全一致（不附该头）。
      *
      * ⚠️ 每次调用**现读** `deps.minimaxXff()`（用户随时可能改设置）。
+     *
+     * ⚠️⚠️ **三个入口都必须走该账号的出口**（PR !145 审计 P0 修法，真实缺陷）：
+     * PR !145 只把按账号 fetcher 接进了 `BuddyBalanceSelector`（**选号器**），
+     * 而**积分面板**走的是本文件的三个入口 —— 它们当时仍传 `undefined`
+     *（= 全局 `fetch`）⇒ 配好代理后对话能用、积分行却仍报「余额查询失败」、
+     * 一键签到仍失败。症状与 issue IKMEVG 逐字相同。
+     *
+     * ⚠️ **三个入口的「账号 id 从哪来」并不相同**（实测三个调用点的签名，
+     * 别按「看起来统一」去改）：
+     *
+     * | 入口 | 第二参 | 账号 id 来源 |
+     * |---|---|---|
+     * | `fetchBalanceDetailed` | `call: ProviderCallContext` | `call?.accountId` |
+     * | `fetchStatus` | `product`（**不是** call） | 拿不到 ⇒ 直连（见下） |
+     * | `claim` | `entry: ProviderAccountEntry` | `entry.id` |
+     *
+     * ⇒ `fetchStatus` 那条**结构上拿不到账号 id**（骨架 `collectCreditsStatus` /
+     * `collectClaimResults` 传的第二参都是 `product`），故它只能直连。这是
+     * **如实登记的限制**，不是漏改：要修它得先改两个骨架的签名（波及十家
+     * provider 的 `fetchStatus` 实现），超出本次修复范围。
+     * ⚠️ 后果：**签到状态预检**在国际站上仍走直连 ⇒ 大陆出口下 `credits.status`
+     * 与「一键签到」的预检那一步仍可能失败。`claim` 本身已走代理。
      */
     minimaxintl: {
       // ⚠️ 走 Detailed（理由同中国版）：否则「地理分流 / 凭据失效 / 网关签名」
       //    这些**唯一能指路**的原因会被压成一句「余额查询失败」。
-      fetchBalanceDetailed: async (credential) => {
+      fetchBalanceDetailed: async (credential, call) => {
         const { balance, error } = await fetchMinimaxCreditBalanceDetailed(
-          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+          credential as MinimaxCredential,
+          minimaxIntlFetcher(call?.accountId),
+          MINIMAX_INTL,
+          deps.minimaxXff?.(),
         )
         return { balance, ...error === undefined ? {} : { error } }
       },
+      // ⚠️ **第二参是 `product` 不是 `call`**（`ProviderCredits.fetchStatus` 的
+      //    签名是 `(credential, call)`，但两个骨架调用点传的都是 `product` ——
+      //    见上表的限制说明）。这里**刻意显式忽略**该参并直连：
+      //    硬写 `(credential, call) => ... call?.accountId` 会得到一个恒
+      //    `undefined` 的 `accountId`（因为传进来的是 product），
+      //    症状是「看起来接了代理、实际永远直连」—— 比不接更难查。
       fetchStatus: (credential) =>
         fetchMinimaxSigninStatus(
-          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+          credential as MinimaxCredential,
+          undefined,
+          MINIMAX_INTL,
+          deps.minimaxXff?.(),
         ),
       // 预检与幂等理由同中国版（见上）。
-      claim: (credential) =>
+      //
+      // ⚠️ **第二参是 `entry` 不是 `call`**（`ProviderCredits.claim` 的签名是
+      //    `(credential, entry, call)` —— 收 `entry` 是为了 TRAE 的指纹代次）。
+      //    账号 id 从 `entry.id` 取。
+      //    ⚠️ 写成 `call?.accountId` 会**编译不过**（`entry` 上没有该字段），
+      //    这正是它比运行时静默更安全的地方 —— 别为了「看起来统一」而改签名。
+      claim: (credential, entry) =>
         claimMinimaxDailyCheckin(
-          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+          credential as MinimaxCredential,
+          minimaxIntlFetcher(entry.id),
+          MINIMAX_INTL,
+          deps.minimaxXff?.(),
         ),
     },
 

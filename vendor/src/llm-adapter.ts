@@ -731,6 +731,15 @@ function isAuthError(status: number, body: string): boolean {
     // 凭据续期：它与 AK/SK、security_token 都无关，重发就能过（见
     // {@link isTransientSignatureFailure} 的实测依据）。
     if (isTransientSignatureFailure(status, body)) return false
+    // ⚠️ 同理排除「本机代理拒发改写请求」（bili，Gitee IKQ7AP）：它与凭据**无关**，
+    // 刷新后压缩仍在、重签凭据仍缺 ⇒ bili 依旧拒发 ⇒ 白跑一次 STS 网络往返，
+    // 然后落 AUTH 把唯一的指路文案吞掉。见 {@link isProxyResignRefusal} 的实测表。
+    //
+    // ⚠️ 这两条排除**不破坏**「401/403 先判、恒归认证类」的铁律：那条管的是
+    // 「上游报文里的**额度/上下文措辞**不得抢在状态码之前改写分类」（网关故障常
+    // 捎带余额词）；这里排除的是**非网关来源**的 401/403 —— 判据锚定的是
+    // bili 独有的三个 marker，与 APIG 的报文形态零重叠。
+    if (isProxyResignRefusal(status, body)) return false
     return true
   }
   return body.includes('APIG.0602') || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body)
@@ -963,6 +972,16 @@ function errorDetailImpl(body: string, includeDetailField: boolean): string {
  * 不要据构造的报文改分类顺序。
  */
 function httpErrorCode(status: number, body: string): string {
+  // ⚠️ bili 拒发改写请求：**非网关来源**的 401/403，必须在 AUTH 短路**之前**单列
+  //（Gitee IKQ7AP）。判据锚定 bili 独有 marker，与 APIG 形态零重叠（见
+  // {@link isProxyResignRefusal}）—— 它不破坏「401/403 先判」的铁律，理由见
+  // {@link isAuthError} 内的同款注释。
+  //
+  // ⚠️ **码绝不能取 `AUTH`**（IKLBSH 同族）：`AUTH` 会被客户端整条替换成
+  // 「API 密钥无效」，而这条错误的 message **本身就是出路**（告诉用户怎么让
+  // bili 拿到重签凭据）⇒ 取 AUTH 等于把唯一的指路句子吞掉。实测修复前 message
+  // 只剩 `model request failed with HTTP 403`，`bili_resign_unavailable` 完全丢失。
+  if (isProxyResignRefusal(status, body)) return PROXY_REFUSED_SIGNED_CODE
   if (status === 401 || status === 403) return 'AUTH'
   // ⚠️ **分类必须走 `errorDetailForClassify`**（不含 detail 腿）—— 用展示出口会让
   // detail 里的额度/超限措辞**翻转错误码**（实测表见 `errorDetail` 的 doc）。
@@ -1006,6 +1025,104 @@ function httpErrorCode(status: number, body: string): string {
 export function isTransientSignatureFailure(status: number, body: string): boolean {
   if (status !== 401 && status !== 403) return false
   return typeof body === 'string' && /body hash mismatch/i.test(body)
+}
+
+/**
+ * 本机上下文压缩代理（bili / billion-context）按 **compress-or-refuse contract**
+ * 拒发**被改写过**的签名请求。
+ *
+ * 报文形态（真实会话 `session-016866dc` turn 7，逐字，Gitee IKQ7AP）：
+ * ```json
+ * {"error":{"type":"signed_request_requires_resign","code":"bili_resign_unavailable",
+ *  "message":"bili refused to forward this sdk-hmac-sha256 …-signed request:
+ *  the signature covers the request body, and any rewrite (context compression)
+ *  would invalidate it upstream … No re-sign credential was available for this scheme.",
+ *  "type":"session_dead"}}
+ * ```
+ *
+ * ## ⚠️⚠️ 它为什么**绝不能**落进 {@link isAuthError}（真实缺陷，2026-10-25 实测复现）
+ *
+ * 三条根因链逐行成立（行号以 `9f76d46` 为准）：
+ *
+ * 1. {@link isTransientSignatureFailure} 只认 `body hash mismatch`（APIG 网关侧
+ *    瞬时故障）—— bili 的三个 marker 不命中；
+ * 2. {@link isAuthError} 对 401/403 恒真 ⇒ 进入「静默 refresh 一次再重试」分支；
+ * 3. 重试时**压缩仍在、重签凭据仍缺** ⇒ bili 依旧拒发 ⇒ `httpErrorCode` 的
+ *    第一条把 403 归成 `AUTH`。
+ *
+ * 实测四格（真实 `CodeArtsAdapter` + 逐字报文）：
+ *
+ * | 观测 | 修复前 | 修复后 |
+ * |---|---|---|
+ * | 错误码 | `AUTH` | `PROXY_REFUSED_SIGNED` |
+ * | `refresh()` 调用 | **1 次**（白跑一次 STS 网络往返） | **0 次** |
+ * | message | `codearts: model request failed with HTTP 403`（**一句话**） | 保留 bili 原文与可执行出路 |
+ * | `bili_resign_unavailable` 可搜 | **否** | **是** |
+ *
+ * ## 语义与 {@link isTransientSignatureFailure} 的**关键区别**
+ *
+ * | | APIG `body hash mismatch` | bili 拒发 |
+ * |---|---|---|
+ * | 成因 | 网关侧一次性故障 | 代理**有意拒绝**（契约行为） |
+ * | 重发 | **有效**（实测重发即过） | **无效**（压缩仍在、凭据仍缺，必然再撞） |
+ * | 出路 | 等一下再试 | 用户/宿主侧补重签凭据，或临时放行 |
+ *
+ * ⇒ 这条**不是**「重发即可」，是「重发不可，需用户/宿主侧补凭据」——
+ * 与凭据无关：刷新、重试、换号都**不会好**（换号只会让**下一个账号**的凭据
+ * 同样到不了 bili 手里）。
+ *
+ * ## ⚠️ 判据刻意只认 bili 的三个 marker
+ *
+ * `APIG.0301` 的另一半（`verify ak sk signature fail`）**同时覆盖真实的 AK/SK
+ * 错误**（见 {@link isTransientSignatureFailure} 的注释），**绝不**把 `APIG.0301`
+ * 或 `SignatureDoesNotMatch` 加进本判据 —— bili 的 `message` 里**恰好引用了**那
+ * 两个词（描述它为什么拒发），按它们放宽会让真凭据问题误判成代理拒发。
+ * 只认 `signed_request_requires_resign` / `bili_resign_unavailable` /
+ * `bili refused to forward` 三个 **bili 独有**的串。
+ *
+ * @param status - HTTP 状态码；bili 实测回 **403**（issue 原报文），401 一并接
+ *   （代理版本差异时可能换码，同属「拒发」语义）。
+ * @param body - 响应体（可能为空串）。
+ */
+export function isProxyResignRefusal(status: number, body: string): boolean {
+  if (status !== 401 && status !== 403) return false
+  return typeof body === 'string'
+    && /signed_request_requires_resign|bili_resign_unavailable|bili refused to forward/i.test(body)
+}
+
+/** {@link isProxyResignRefusal} 命中时的错误码。 */
+export const PROXY_REFUSED_SIGNED_CODE = 'PROXY_REFUSED_SIGNED'
+
+/**
+ * 构造 bili 拒发时的错误文案。
+ *
+ * ## 文案必须回答用户的三个问题（与 `reasoningLoopFailure` 同一条纪律）
+ *
+ * 1. **真实原因**：是本机代理拒发，不是凭据失效 —— 并**显式否认**「重新登录」；
+ * 2. **为什么**：签名覆盖正文、压缩改写了正文、代理拿不到重签凭据（三句因果链）；
+ * 3. **可执行的下一步**（issue 的建议修法 C，逐条保留）：让 bili 能重签（两法），
+ *    或临时放行。
+ *
+ * ⚠️ **必须保留 `bili_resign_unavailable` 字样**（issue 验收标准第 5 条）：
+ * 它是用户可搜索、文档可指路的锚点；`AUTH` 之所以是错误的码，正因为它会把
+ * 整条 message 替换成「API 密钥无效」（IKLBSH 同族）。
+ *
+ * ⚠️ 文案里**不得**出现 Markdown 强调符：错误 message 是纯文本渲染。
+ *
+ * @param body - 响应体原文（把 bili 的解释拼进文案，保住可诊断性）。
+ */
+export function proxyResignRefusalFailure(body: string): { message: string; code: string } {
+  const detail = body.trim().length > 0 ? body.trim().slice(0, 600) : '(响应体为空)'
+  return {
+    message:
+      '本机上下文压缩代理（bili）拒发了这条签名请求：请求体被压缩改写，而签名覆盖正文，'
+      + '代理拿不到重签凭据（bili_resign_unavailable）。凭据本身有效，重新登录无用。'
+      + '修法二选一：① 让 bili 能重签 —— 在 Jet Hub 保证存在一个 codearts 账号'
+      + '（enabled 且凭据可解析出 access_key_id / secret_access_key），'
+      + '或用 BILI_CODEARTS_REF / resign["sdk-hmac-sha256"].credentialRef 钉一个；'
+      + `② 临时放行 —— BILI_RESIGN_PASSTHROUGH=1（该 scheme 逐字节直穿、不压缩）。上游：${detail}`,
+    code: PROXY_REFUSED_SIGNED_CODE,
+  }
 }
 
 /** 可中止的休眠；当信号中止时立即 resolve。 */
@@ -1734,6 +1851,27 @@ export class CodeArtsAdapter extends LlmAdapter {
           signatureRetries += 1
           await delay(SIGNATURE_RETRY_DELAY_MS * signatureRetries, options.signal)
           continue
+        }
+        // ⚠️⚠️ 本机代理拒发改写请求（bili，Gitee IKQ7AP）：**在 AUTH 刷新之前**
+        // 直接抛出，不进入刷新/换号路径。
+        //
+        // 为什么位置在 `isAuthError` 分支之前、且是**独立早退**而不是只靠
+        // `isAuthError` 排除：`isAuthError` 返回 false 只保证「不白刷凭据」，
+        // 但 403 还会继续落到下面的额度/限流/`httpErrorCode` 分类链。
+        // `httpErrorCode` 那格已改成返回 `PROXY_REFUSED_SIGNED`（码正确），
+        // 但**文案**会走通用的 `model request failed with HTTP …` 模板 ——
+        // 那句唯一的指路话（怎么让 bili 拿到重签凭据）仍到不了用户眼前。
+        // ⇒ 在这里直接用 {@link proxyResignRefusalFailure} 抛完整文案。
+        //
+        // ⚠️ **重发无效**：与 `isTransientSignatureFailure` 那条的本质区别
+        //（见其注释的对照表）—— 压缩仍在、重签凭据仍缺，重发/刷新/换号都不会好。
+        // ⚠️ **不换号**：换号只会让下一个账号的凭据同样到不了 bili 手里；
+        // 且与 codearts 不做 permanentLock 的既有决定一致 —— 「代理拒发」不是
+        // 「账号死亡」，任何永久化都不该由这条 403 触发（issue 的反面教材：
+        // 同源缺陷在另一实现上把账号**永久禁用**了）。
+        if (isProxyResignRefusal(response.status, errorText)) {
+          const failure = proxyResignRefusalFailure(errorText)
+          throw new LlmError(failure.message, failure.code, { status: response.status })
         }
         // 鉴权失败（SecurityToken 过期/被吊销/APIG.0602）：刷新一次凭据后
         // 重试整个 chat 请求。入口的 expires_at 预判无法覆盖后端提前吊销
@@ -2871,6 +3009,192 @@ const RESET_TIME_PATTERN = /(?:将在|reset at)\s+([\d-]+\s+[\d:]+)\s+(UTC[+-]\d
  * 且必须与这里 `parseRateLimitError` 的兜底**同值**，否则两处口径会漂。
  */
 export const RATE_LIMIT_FALLBACK_MS = 3_600_000
+
+/**
+ * 额度耗尽的业务码（CodeBuddy 系实测值）。
+ *
+ * ⚠️ 与 {@link RATE_LIMIT_BUSINESS_CODE}（6004 = 频率限流）**不可合并**：
+ * 两者动作相同但**冷却终点相反**（见 {@link isCreditExhausted} 的表）。
+ */
+export const CREDIT_EXHAUSTED_BUSINESS_CODE = 14018
+
+/**
+ * 额度耗尽的文案兜底判据（`14018` 的码值腿之外的唯一通道）。
+ *
+ * 上游原话（`www.workbuddy.ai`，HTTP 429）：
+ * `Credits exhausted. Please visit the link below to purchase add-on packs…`
+ *
+ * ⚠️ **关键词必须窄**：`insufficient` 单独出现**过宽**（见
+ * {@link isCreditExhausted} 的说明）。
+ */
+const CREDIT_EXHAUSTED_PATTERN =
+  /credits?\s+exhausted|quota\s+exhausted|积分.{0,4}(?:不足|耗尽|用尽)|额度.{0,4}(?:不足|耗尽|用尽)|余额.{0,4}(?:不足|耗尽|用尽)/i
+
+/**
+ * 额度**耗尽**（不是频率限流）的判据 —— 「钱用光了」，不是「发太快」。
+ *
+ * ## ⚠️⚠️ 为什么必须与 {@link isRateLimited} 分开（真实缺陷，Gitee IKQ6HJ）
+ *
+ * 两者的**动作完全相同**（换号 + 写冷却标记），但**冷却终点的语义相反**：
+ *
+ * | | 频率限流（6004 / 429） | 额度耗尽（14018 / Credits exhausted） |
+ * |---|---|---|
+ * | 恢复方式 | 时间到了就恢复（分钟级滚动窗口） | **等次日配额 / 充值** |
+ * | 冷却终点 | 服务端声明时刻，否则 +1h 兜底 | **UTC+8 当日 24:00** |
+ * | 写成 +1h 的后果 | 无（本来就该 1 小时） | **每小时被重新选中一次、必然再失败** |
+ *
+ * 用户侧症状（原始报障）：「面板说可以用了，一试又不行」——面板的『限额重置』
+ * 显示的是失败时刻 + 1 小时，到点后账号被重新选中，必然再失败一次，再写一条
+ * 1 小时标记，**循环往复**。而真实出路是等次日配额或充值。
+ *
+ * ## 为什么是「UTC+8 当日 24:00」而不是「+24h」
+ *
+ * 与 `loomyCooldownResetAtMs`（Gitee IKL80H 那起事故）**同一条纪律**：
+ * 额度按 UTC+8 自然日结算，用滑动 24h 会让 23:50 烧光的账号被封到**次日 23:50**
+ * ——用户 0 点后上游明明已放行、插件仍说「没到重置时间」，白等近一整天。
+ * 四家同口径的既有实现：`loomyCooldownResetAtMs` / `qoder-adapter` /
+ * `zcode-adapter` / `llm-adapter` 的 codearts 分支。
+ *
+ * ## 判据刻意**窄**
+ *
+ * 只认 `14018` 码值与 `credits exhausted` 完整短语。**不收** `insufficient` 这类
+ * 泛词 —— 上下文超长报文里的 `the context window is insufficient for this model`
+ * 会被误伤，而那是「换号无益」的另一类失败（同类误伤在
+ * `classifyLoomyFailure` / `classifyRaccoonFailure` 各踩过一次）；
+ * 中文侧同样只收「额度/积分/余额 + 不足/耗尽」的**确定性组合**。
+ *
+ * ⚠️ **本函数只看响应体，不看状态码**：14018 实测回 **HTTP 429**，但它与
+ * 频率限流共用 429 ⇒ 状态码对这一格**没有判别力**，只能靠码值/文案。
+ *
+ * @param body - 响应体（可能为空串）。
+ */
+export function isCreditExhausted(body: string): boolean {
+  if (body.length === 0) return false
+  // ① 结构化业务码：只认 JSON 的 `code` 字段（与 `hasRateLimitBusinessCode` 同一
+  //    取舍 —— 全文搜 `14018` 会被 UUID 里的数字子串误命中）。
+  //
+  //    ⚠️ **必须同时认嵌套形态**：buddy 系的真实报文是
+  //    `{"error":{"data":{"code":14018,"msg":"…"}}}`（码在**第二层**），
+  //    只看顶层 `code` 会让码值腿在这家**恒不命中**、只剩英文文案腿 ——
+  //    而上游一改文案就静默失效（同族教训：`channelVerificationUpstreamId`
+  //    的注释记录了「判据认了某字段、出口却提不出该字段」的漂移）。
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    const inner = typeof data.error === 'object' && data.error !== null
+      ? data.error as Record<string, unknown>
+      : undefined
+    const nested = typeof inner?.data === 'object' && inner.data !== null
+      ? inner.data as Record<string, unknown>
+      : undefined
+    const codes = [data.code, inner?.code, nested?.code]
+    if (codes.some(code => code === CREDIT_EXHAUSTED_BUSINESS_CODE
+      || code === String(CREDIT_EXHAUSTED_BUSINESS_CODE))) {
+      return true
+    }
+  } catch {
+    // 非 JSON：交给文案腿。
+  }
+  // ② 文案腿（网关包装过的 200/400、纯文本错误页、以及 `errorDetail` 产物）。
+  return CREDIT_EXHAUSTED_PATTERN.test(body)
+}
+
+/**
+ * 额度耗尽的冷却终点：**UTC+8 当日 24:00**。
+ *
+ * 与 {@link isCreditExhausted} 配套，供 `buddy-adapter` 的换号记账分支与
+ * `account-probe` 的重测回写共用 —— **只留一份实现**，两处各算一次必然漂移
+ * （本仓库首条红线「同一语义两套判据」）。
+ *
+ * ⚠️ **必须放在本文件（共享层）而不是某个渠道的适配器里**：`account-probe.ts`
+ * 也要用它（重测时把同一时刻回传给存储），而探测层不得反向依赖某个渠道的
+ * 适配器 —— `tests/unit/account-probe-adapter.spec.ts` 普遍
+ * `vi.mock('../../src/buddy-adapter.js')`，形成依赖后那个 mock 会把该函数
+ * 一起变成 `undefined`（Gitee IKQ6HJ 报告里记录的同一处陷阱）。
+ *
+ * @param nowMs - 当前时刻（注入以便单测）。
+ */
+export function creditExhaustedResetAtMs(nowMs: number = Date.now()): number {
+  return nextUtc8DayStartMs(nowMs)
+}
+
+/**
+ * 只取**服务端显式声明**的重置时刻；解析不到就返回 `undefined`（**不兜底**）。
+ *
+ * ## 为什么必须与 {@link parseRateLimitError} 并存
+ *
+ * `parseRateLimitError` 的语义是「调用方需要一个可写的标记」，故它**必然**
+ * 给出一个时刻（解析不到就 `+1h`）。而额度耗尽那一格需要区分
+ * 「服务端真给了时刻」与「它压根没给」：
+ *
+ * - 服务端给了 ⇒ **以它为准**（上游比我们更清楚何时恢复）；
+ * - 服务端没给 ⇒ 走 {@link creditExhaustedResetAtMs} 的 UTC+8 自然日，
+ *   **不是** `+1h`。
+ *
+ * 两者混用会让 14018 继续落进 1 小时兜底（正是 Gitee IKQ6HJ 的缺陷形态）。
+ *
+ * @param body - 响应体（可能为空串）。
+ * @returns 服务端声明的重置时刻（epoch ms），无则 `undefined`。
+ */
+export function explicitRateResetAtMs(body: string): number | undefined {
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    // ⚠️ 只读 `msg`（与 `parseRateLimitError` **同源**：两句真实文案都写在该字段里）。
+    // 若哪天上游把时刻挪到别的字段，两处必须**同批**改，不能只改一处。
+    //
+    // ⚠️ 嵌套形态也要认（`{"error":{"data":{"msg":"… reset at …"}}}`）：
+    // 只读顶层会让本函数在 buddy 系的真实报文形态上恒为 `undefined` —— 那不会
+    // 报错，只会静默退回自然日终点（「服务端给了时刻却不采用」）。
+    const inner = typeof data.error === 'object' && data.error !== null
+      ? data.error as Record<string, unknown>
+      : undefined
+    const nested = typeof inner?.data === 'object' && inner.data !== null
+      ? inner.data as Record<string, unknown>
+      : undefined
+    const candidates = [data.msg, inner?.msg, nested?.msg]
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue
+      const resetMatch = RESET_TIME_PATTERN.exec(candidate)
+      if (!resetMatch) continue
+      const resetMs = Date.parse(`${resetMatch[1]} ${resetMatch[2]}`)
+      if (!Number.isNaN(resetMs)) return resetMs
+    }
+    return undefined
+  } catch {
+    // ⚠️⚠️ **非 JSON（纯文本）也必须扫一遍** —— 这不是兜底洁癖，是**真实主路径**
+    // （对抗审计实测打穿的缺陷）：
+    //
+    // `account-probe.ts` 拿到的 `message` 是**适配器抛出的 `LlmError.message`**，
+    // 而适配器早已把上游报文压平成纯文本：
+    // `workbuddy: Credits exhausted. Your quota will reset at 2099-12-31 23:59:59 UTC+8`
+    // ⇒ `JSON.parse` 必然失败 ⇒ 本函数恒 `undefined` ⇒ 探测腿永远退回自然日，
+    // 而推理腿（拿**原始报文**）能取到显式时刻 ⇒ 两条腿对同一条报文算出两个值。
+    //
+    // 实测三格（同一份 `14018 + reset at 2099` 报文）：
+    // | 输入形态 | 修前 | 修后 |
+    // |---|---|---|
+    // | 原始 JSON（推理腿） | 2099 | 2099 |
+    // | 压平后的 message（探测腿） | **undefined** ⇒ 自然日 | **2099** |
+    //
+    // ⚠️⚠️ **「正常正文凑不出这个形状」这句断言已被实测证伪，别再引用它**
+    // （对抗审计 2026-10-25 实测）：`'…配额将在 2099-12-31 23:59:59 UTC+8 重置…'`
+    // 与 `'…will reset at 2099-12-31 23:59:59 UTC+8…'` **都能凑出**且 `Date.parse`
+    // 正常解析 ⇒ 纯文本回退本身有误命中面。
+    //
+    // 当前**不可达**：两个调用点（推理腿 `buddy-adapter.ts` / 探测腿
+    // `account-probe.ts`）都在 `isCreditExhausted(body)` 门禁**之内**，
+    // 而上面那句纯限流正文实测 `isCreditExhausted = false` ⇒ 到不了扫描。
+    //
+    // ⚠️ 但这是**结构性**风险：门禁（本函数上方）与扫描（这里）分处两个函数，
+    // 将来任何人放宽/重排门禁、或给第三条腿接 `explicitRateResetAtMs`，误命中会
+    // **静默**打开。**新接调用点前先读这段**，并确认新路径同样有额度门禁。
+    const bareMatch = RESET_TIME_PATTERN.exec(body)
+    if (bareMatch !== null) {
+      const bareMs = Date.parse(`${bareMatch[1]} ${bareMatch[2]}`)
+      if (!Number.isNaN(bareMs)) return bareMs
+    }
+    return undefined
+  }
+}
 
 /**
  * 从限流错误中提取重置时间；体里没有时间时返回 {@link RATE_LIMIT_FALLBACK_MS} 兜底。

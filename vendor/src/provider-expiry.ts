@@ -132,6 +132,52 @@ export interface ProviderExpiryDeps {
    *    国际站在被地理分流到中国站时折算失败（那正是 IKMEVG 的形态）。
    */
   readonly minimaxXff?: () => string | undefined
+  /**
+   * MiniMax **国际站**的按账号 fetcher（PR !145 审计 P0 修法）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它
+   *
+   * `agent.minimax.io` 按出口 IP 国别分流：大陆出口直连恒 307 到中国站，中国站
+   * 不认国际站 token ⇒ 401。而**聚合轮换的候选可见性由折算决定**
+   *（`aggregate-expiry.ts` 的 `credentialExpiry` 拿不到读数 ⇒ `UNUSABLE`
+   * ⇒ 该候选被 `rankCandidates` 剔除）⇒ 没接这条腿时，用户配好代理、
+   * 对话能用了，但**该渠道仍从聚合轮换里静默消失**，且零报错。
+   *
+   * PR !145 的注释自己点了这个症状，却只把 fetcher 接进了选号器
+   *（`BuddyBalanceSelector`）与适配器 —— **折算路径一行没改**。
+   *
+   * ⚠️ 与 {@link minimaxXff} 的关系：**两者互补**。XFF 只是「声明」一个海外 IP
+   *（上游不认该头即失效），本字段是**真正**换出口。
+   *
+   * ⚠️ 必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+   */
+  readonly minimaxIntlFetchFor?: (accountId: string) => typeof fetch
+  /**
+   * Qoder（**两站共用**）的按账号 fetcher（2026-10-25 审计 A2-17，B2 判「合入前必须补」）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它（与 {@link minimaxIntlFetchFor} 同因，但**本 PR 漏接了**）
+   *
+   * Qoder **国际版**全部端点在墙外被 SNI 阻断，唯一出路是 per-账号出口代理。
+   * 那套代理在 `618a090` 里接了**四条腿**：推理、原生搜索、余额选号、登录/续期/目录。
+   * 但**折算路径一行没改** —— `qoderExpiry` 内部调
+   * `fetchQoderCreditBalance(credential, product)`（**不带 fetcher**）⇒ 走全局 `fetch`
+   * ⇒ 墙外环境下折算**恒失败** ⇒ `aggregate-expiry` 拿到 `undefined`
+   * ⇒ 该渠道折算成 `UNUSABLE` ⇒ 被 `rankCandidates` 剔除
+   * ⇒ **用户在聚合轮换列表里永远看不到 qoder / qodercn**，且**零报错、零日志**；
+   * 而面板（走选号器那条腿）看起来完全正常。
+   *
+   * ⚠️ 这不是「与本 PR 无关的既有缺口」：`index.ts` 明写
+   * 「`credits` 与 `expiry` 是两个独立消费域……**两条腿缺一不可**，
+   * 这正是本仓库记过 6 次的那类静默陷阱」，而本 PR 恰好只接了 credits 一侧。
+   * {@link minimaxIntlFetchFor} 的注释也逐字点了同一个症状
+   * （「只把 fetcher 接进了选号器与适配器 —— 折算路径一行没改」）。
+   *
+   * ⚠️ 与 {@link minimaxIntlFetchFor} **分开两个键**而不是共用一个：两家的解析器
+   *    是不同实例（`minimaxIntlFetchForAccount` / `qoderFetchForAccount`），
+   *    合成一个会让「只接了一家」静默通过。
+   * ⚠️ 必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+   */
+  readonly qoderFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -299,8 +345,8 @@ export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Re
      *    ⚠️ **两站各占一项**：`credentialExpiry` 的分派按 provider id，漏
      *    `qodercn` 会让中国版单独恒 `UNUSABLE`（与 minimaxintl 同因）。
      */
-    qoder: qoderFamilyExpiry(QODER),
-    qodercn: qoderFamilyExpiry(QODER_CN),
+    qoder: qoderFamilyExpiry(QODER, deps),
+    qodercn: qoderFamilyExpiry(QODER_CN, deps),
     // ⚠️ **MiniMax Code**（中国版 / 国际版，2026-10-20）：两家共用同一个原语
     //    （只换 product），与 buddy / workbuddy 同款 —— 单独抽 `minimaxFamilyExpiry`
     //    是为了让「它们只差一个 product」一眼可见（同族各写一份判据 = 分叉的开始）。
@@ -324,7 +370,7 @@ export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Re
  * ⚠️ `context.cachedBalance` **在每次折算时现读**（不是建表时固化）：
  *    与 `createProviderCredits` 的同名字段同一纪律。
  */
-function qoderFamilyExpiry(product: QoderProduct): ProviderExpiry {
+function qoderFamilyExpiry(product: QoderProduct, deps: ProviderExpiryDeps): ProviderExpiry {
   return {
     credentialExpiry: (c, context) => qoderExpiry(
       c as QoderCredential,
@@ -332,6 +378,12 @@ function qoderFamilyExpiry(product: QoderProduct): ProviderExpiry {
       context?.cachedBalance === undefined
         ? undefined
         : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      // ⚠️ **按 `accountId` 现取**（与 `minimaxIntl` 同款）：账号可能随时改代理。
+      //    `context.accountId` 缺失时传空串 —— 与解析器的契约一致
+      //    （空 id 会去查「登录预置」那条，查不到则直连）。
+      deps.qoderFetchFor === undefined
+        ? undefined
+        : deps.qoderFetchFor(context?.accountId ?? ''),
     ),
   }
 }
@@ -358,6 +410,23 @@ function minimaxFamilyExpiry(product: MinimaxProduct, deps: ProviderExpiryDeps):
         ? undefined
         : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
       deps.minimaxXff?.(),
+      /**
+       * ⚠️ **按账号取出口**（PR !145 审计 P0 修法）。
+       *
+       * 判据：只有国际站需要（中国站直连才是最优 —— 给它挂代理反而让流量绕境外
+       * 一圈，且可能被引到国际站）；且必须拿到账号 id 才取，否则退回全局 `fetch`
+       *（不知道是谁就不该猜一个账号去用它的出口）。
+       *
+       * ⚠️ 这与 `createProviderCredits` 的 `minimaxIntlFetcher` 是**同一份判据的
+       * 两处消费**（两条链路各自有 deps 类型，无法共享函数体）——
+       * 一致性由 `expiry-runtime-parity.spec.ts` 的真跑 `apply()` 锁住。
+       */
+      product.id === 'minimaxintl'
+        && deps.minimaxIntlFetchFor !== undefined
+        && context?.accountId !== undefined
+        && context.accountId !== ''
+        ? deps.minimaxIntlFetchFor(context.accountId)
+        : undefined,
     ),
   }
 }

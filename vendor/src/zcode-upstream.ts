@@ -32,6 +32,9 @@
  * 所以要领额度必须**先补两条事件**，再查 preview，再 claim。
  */
 
+import { randomUUID } from 'node:crypto'
+import { release as osRelease } from 'node:os'
+
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
 import {
@@ -145,11 +148,113 @@ export const ZCODE_MARKETING_ACTION_URL = `${ZCODE_ORIGIN}/api/v1/marketing/touc
 export const ZCODE_VERSION_GATED_MIN_APP_VERSION = '3.16.3'
 
 /**
+ * 合法的客户端版本号形态（`major.minor.patch`，纯数字、**无前导零**）。
+ *
+ * ⚠ 它**是安全闸，不只是格式偏好**（2026-10-25 审计实测）：`app_version` 会原样
+ * 进 `User-Agent` / `X-ZCode-App-Version` / **URL 的 query**。`Headers()` 对非法
+ * 头值抛 `TypeError`（`"3.16.3\r\nX-Injected: 1"` 实测如此）⇒ 一份脏凭据（手改
+ * 备份导入）能把整个 zcode 请求打成未分类错误；而 `'3.16.3-beta.1'` / `'3.016.3'`
+ * 会被 `compareZcodeAppVersion` 当成「更大 / 等值」⇒ **绕过**门控。
+ *
+ * ⚠ 前导零也算脏：`3.016.3` 数值上等于 `3.16.3`，但不是官方会发出的形态。
+ */
+const ZCODE_APP_VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/
+
+/**
+ * 「每个账号一个、进程内稳定」的伪会话 id。
+ *
+ * ⚠ 官方每个会话一个 uuid（抓包实测 `x-session-id: df5db422-…`，同会话内恒定）。
+ * 插件没有「会话」这一层，故退而求其次：**每个账号（`device_mid`）一个**、
+ * 请求间复用 —— 比每请求换新更接近真实客户端。
+ *
+ * ⚠⚠ **不能做成 `randomUUID()` 的模块级常量**（2026-10-25 审计打穿）：
+ * 那样**池里所有账号共用一个 session id**，上游完全可以把两个不同账号关联成
+ * 「同一会话」，而我们恰恰在多账号轮换 —— 这个关联没有任何真实客户端会产出。
+ */
+const ZCODE_SESSION_IDS = new Map<string, string>()
+
+/** 取该账号的伪会话 id（首见时生成，进程内复用）。 */
+function zcodeSessionId(deviceMid: string | undefined): string {
+  const key = typeof deviceMid === 'string' ? deviceMid : ''
+  const existing = ZCODE_SESSION_IDS.get(key)
+  if (existing !== undefined) return existing
+  const created = randomUUID()
+  ZCODE_SESSION_IDS.set(key, created)
+  return created
+}
+
+/**
+ * 官方客户端的「平台三件套」—— **必须同源**。
+ *
+ * ## ⚠⚠ 为什么三件套要由同一个函数产出（2026-10-25 审计打穿）
+ *
+ * 改前是 `X-Platform: 'win32-x64'` / `X-Os-Category: 'windows'` 两处**硬编码**，
+ * 而 `X-Os-Version: os.release()` 是**真值** ⇒ 在非 Windows 宿主上同一请求里出现
+ * 「Windows 平台 + Darwin 内核号（如 `24.6.0`）」这种**任何官方客户端都不会发出**
+ * 的组合 —— 三件套自相矛盾本身就是一条新的指纹，与「对齐官方」的目的相反。
+ *
+ * ## 取舍
+ *
+ * - **win32 宿主**：三件套全取真值（`os.release()`，实测 `10.0.26100`）。
+ * - **其它宿主**：三件套**一起**伪装成官方 Windows 客户端（本文件存在的理由就是
+ *   「形状像官方」；只伪装一半反而是更强的异常信号）。
+ *
+ * ⚠ 残留且**已登记**的不一致：`system` 的 `# Environment` 段仍报**真实**平台
+ * （`buildEnvironmentSection` 默认 `process.platform`）—— 那是模型看的自我描述，
+ * 伪装它会降低工具使用正确率（bash vs powershell）。两者分属「请求指纹」与
+ * 「模型上下文」，刻意不强行统一；改这里时别顺手把 `# Environment` 也改成 win32。
+ */
+const ZCODE_SPOOF_PLATFORM = Object.freeze({
+  platform: 'win32-x64',
+  osCategory: 'windows',
+  osVersion: '10.0.26100',
+})
+
+/**
+ * 该宿主该发的平台三件套（三值同源，见上方注释）。
+ *
+ * ⚠ 两个形参都**必须入参化**（默认取真实宿主）：三件套的自洽性只在「非 win32
+ * 宿主」上才可能出问题，而 CI / 开发机大多是 win32 ⇒ 不注入就**永远测不到**那条
+ * 分支。2026-10-25 审计实测：在 Windows 上把 `X-Os-Version` 换回 `os.release()`
+ * 后，宿主机相关的断言**全绿** —— 因为本机的 `os.release()` 恰好就是
+ * `10.0.26100`，与伪装值逐字相同。故内核版本也必须能注入。
+ */
+export function zcodeClientPlatform(
+  hostPlatform: NodeJS.Platform = process.platform,
+  hostOsVersion: string = osRelease(),
+): {
+  platform: string
+  osCategory: string
+  osVersion: string
+} {
+  if (hostPlatform === 'win32') {
+    return { platform: 'win32-x64', osCategory: 'windows', osVersion: hostOsVersion }
+  }
+  return { ...ZCODE_SPOOF_PLATFORM }
+}
+
+/**
  * 构造 ZCode 的「来源标识」请求头。
  *
- * ⚠ 这些头是官方客户端在真实流量里发的。实测**它们不是 3012 的判据**
- * （判据是请求体里的 system 内容），但它们仍是「像官方客户端」的一部分，
- * 且 `X-Device-Mid` **是硬需求**（缺它 billing 全家桶回 400）。
+ * ## ★ 这些头的值以官方客户端的真实抓包为准（2026-10-25 逐字对齐）
+ *
+ * 官方 GUI 的一次 `/v1/messages` 带 **18 个头**。本函数此前只发 10 个，
+ * 且其中**两个的值与官方不符**：
+ *
+ * | 头 | 官方 | 本函数（改前） |
+ * |---|---|---|
+ * | `x-release-channel` | `production` | `stable` ✗ |
+ * | `x-platform` | `win32-x64` | `win32` ✗ |
+ *
+ * 并缺 7 个官方每次都带的头：`x-title` / `x-os-version` / `x-zcode-agent` /
+ * `x-session-id` / `x-zcode-session-type` / `x-request-id` / `x-zcode-trace-id`。
+ *
+ * ⚠ 旧注释写「实测它们不是 3012 的判据」—— 那是**旧版客户端**上取到的结论。
+ * 上游在 2026-10-23 升级到 `3.16.3` 之后，`405 + unusual activity` 开始在
+ * **所有**插件请求上稳定出现（跨账号、跨会话），而官方客户端同账号同网络正常
+ * ⇒ 头的形状重新成为首要嫌疑，故此处逐字对齐抓包。
+ *
+ * ⚠ `X-Device-Mid` **仍是硬需求**（缺它 billing 全家桶回 400）。
  */
 export function buildZcodeHeaders(
   credential: Pick<ZcodeCredential, 'device_mid' | 'app_version'>,
@@ -164,23 +269,44 @@ export function buildZcodeHeaders(
      * （见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}）：
      * ① 营销投放查询 `fetchZcodeMarketingPlans`（版本低 ⇒ 投放为空）；
      * ② **领取** `claimZcodePlan`（版本低 ⇒ `1004 no permission`，真机一发定音）。
-     * 两者都必须按请求覆盖，**不得**改凭据本身
-     * （那会让推理路径的既有实测结论一起作废）。
+     * 两者都必须按请求覆盖，**不得**改凭据本身。
+     *
+     * ★ 未显式覆盖时走 {@link zcodeVersionGatedAppVersion}（凭据版本与
+     * `3.16.3` 取较大者），**不再直接回落到凭据里的旧版本**。
+     *
+     * 依据（2026-10-25 真机取证）：官方客户端在 2026-10-23 升级到 `3.16.3`
+     * 之后，本插件发的**推理**请求开始稳定 `405 + request has been blocked
+     * due to unusual activity`（跨账号、跨会话；官方客户端同账号同网络正常）。
+     * 版本号是当时**唯一**与官方不一致的请求特征 —— 身份块已逐字对齐（2632
+     * 字符）、其余 11 个官方头（`Suc` 全量）也全部对齐 ⇒ 版本号成为首要嫌疑。
      */
     appVersion?: string
+    /**
+     * 覆盖平台三件套（**仅供测试**：非 win32 分支无法在 Windows 主机上自然触发）。
+     * 生产调用一律不传 ⇒ 走 {@link zcodeClientPlatform}。
+     */
+    platform?: { platform: string; osCategory: string; osVersion: string }
   } = {},
 ): Record<string, string> {
-  const appVersion = options.appVersion ?? credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+  const appVersion = options.appVersion ?? zcodeVersionGatedAppVersion(credential)
+  const platform = options.platform ?? zcodeClientPlatform()
   const headers: Record<string, string> = {
     'User-Agent': `ZCode/${appVersion}`,
     'HTTP-Referer': ZCODE_ORIGIN,
+    'X-Title': 'Z Code@electron',
     'X-ZCode-App-Version': appVersion,
-    'X-Release-Channel': 'stable',
+    'X-Release-Channel': 'production',
     'X-Client-Language': 'zh-CN',
     'X-Client-Timezone': 'Asia/Shanghai',
     'X-Device-Mid': credential.device_mid,
-    'X-Platform': 'win32',
-    'X-Os-Category': 'windows',
+    'X-Platform': platform.platform,
+    'X-Os-Category': platform.osCategory,
+    'X-Os-Version': platform.osVersion,
+    'X-ZCode-Agent': 'glm',
+    'X-Session-Id': zcodeSessionId(credential.device_mid),
+    'X-ZCode-Session-Type': 'other',
+    'X-Request-Id': randomUUID(),
+    'X-ZCode-Trace-Id': randomUUID(),
     'anthropic-version': '2023-06-01',
   }
   if (options.json !== false) headers['Content-Type'] = 'application/json'
@@ -636,11 +762,11 @@ async function fetchClaimablePlans(
   fetchImpl: typeof fetch,
 ): Promise<ZcodeClaimablePlanSummary[]> {
   try {
-    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+    const appVersion = zcodeCredentialAppVersion(credential)
     const response = await fetchWithTimeout(
       fetchImpl,
       `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`,
-      { method: 'GET', headers: buildZcodeHeaders(credential, { json: false }) },
+      { method: 'GET', headers: buildZcodeHeaders(credential, { json: false, appVersion }) },
       15_000,
     )
     if (!response.ok) return []
@@ -675,12 +801,12 @@ export async function reportZcodeActivation(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+  const appVersion = zcodeCredentialAppVersion(credential)
   for (const event of ['app_launch', 'app_daily_active']) {
     try {
       await fetchWithTimeout(fetchImpl, ZCODE_EVENT_REPORT_URL, {
         method: 'POST',
-        headers: buildZcodeHeaders(credential, { json: true }),
+        headers: buildZcodeHeaders(credential, { json: true, appVersion }),
         body: JSON.stringify({
           event,
           device_mid: credential.device_mid,
@@ -699,11 +825,11 @@ export async function fetchZcodeClaimablePlans(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
 ): Promise<readonly ZcodeClaimablePlan[]> {
-  const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+  const appVersion = zcodeCredentialAppVersion(credential)
   const url = `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`
   const response = await fetchWithTimeout(fetchImpl, url, {
     method: 'GET',
-    headers: buildZcodeHeaders(credential, { json: false }),
+    headers: buildZcodeHeaders(credential, { json: false, appVersion }),
   }, 25_000)
   if (!response.ok) return []
   let parsed: { data?: { plans?: unknown } }
@@ -771,10 +897,31 @@ export function compareZcodeAppVersion(a: string, b: string): number {
  */
 export function zcodeVersionGatedAppVersion(credential: Pick<ZcodeCredential, 'app_version'>): string {
   const stored = typeof credential.app_version === 'string' ? credential.app_version.trim() : ''
-  if (stored.length === 0) return ZCODE_VERSION_GATED_MIN_APP_VERSION
+  if (!ZCODE_APP_VERSION_PATTERN.test(stored)) return ZCODE_VERSION_GATED_MIN_APP_VERSION
   return compareZcodeAppVersion(stored, ZCODE_VERSION_GATED_MIN_APP_VERSION) < 0
     ? ZCODE_VERSION_GATED_MIN_APP_VERSION
     : stored
+}
+
+/**
+ * **不受门控**的请求（query / body 里的 `app_version`）该用的版本。
+ *
+ * ⚠ 与 {@link zcodeVersionGatedAppVersion} 的分工必须分清：
+ * - 本函数 = 「凭据里的版本，但必须是干净的 semver」⇒ 拿不到干净的就用兜底值；
+ * - 门控版 = 「与 `3.16.3` 取较大者」⇒ 只给**实测过门控**的路径（见常量注释）。
+ *
+ * ## 为什么必须存在（2026-10-25 审计打穿）
+ *
+ * 改前这些站点写的是 `credential.app_version ?? ZCODE_APP_VERSION_FALLBACK` ——
+ * `??` **只挡 `undefined`/`null`**，于是空串会发出 `app_version=`、脏值会原样
+ * 发出（换行注入会让 `Headers()` 抛 `TypeError`）。而同一请求的头走门控、
+ * query 走凭据 ⇒ 还会出现「同一请求里两个版本号」的自相矛盾。
+ */
+export function zcodeCredentialAppVersion(
+  credential: Pick<ZcodeCredential, 'app_version'>,
+): string {
+  const stored = typeof credential.app_version === 'string' ? credential.app_version.trim() : ''
+  return ZCODE_APP_VERSION_PATTERN.test(stored) ? stored : ZCODE_APP_VERSION_FALLBACK
 }
 
 /** 投送物里一个 plan 的元数据（展示与排序用）。 */
@@ -1267,12 +1414,12 @@ export async function fetchZcodeCaptchaConfig(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ZcodeCaptchaConfig | undefined> {
-  const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+  const appVersion = zcodeCredentialAppVersion(credential)
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`
   try {
     const response = await fetchWithTimeout(fetchImpl, url, {
       method: 'GET',
-      headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false }),
+      headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false, appVersion }),
     }, 20_000)
     if (!response.ok) return undefined
     const parsed = await response.json() as {
@@ -1358,12 +1505,12 @@ export async function fetchZcodeModels(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ZcodeRemoteModelLike[] | undefined> {
-  const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+  const appVersion = zcodeCredentialAppVersion(credential)
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`
   try {
     const response = await fetchWithTimeout(fetchImpl, url, {
       method: 'GET',
-      headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false }),
+      headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false, appVersion }),
     }, 20_000)
     if (!response.ok) return undefined
     const parsed = await response.json() as { data?: { builtinModels?: unknown } }
