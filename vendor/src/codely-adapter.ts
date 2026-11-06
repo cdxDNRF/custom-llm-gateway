@@ -153,15 +153,33 @@ const CODELY_INFERENCE_TIMEOUT_MS = 600_000
 /** 换号预算（含首次请求）：402 在网关校验层就被拒，换号本身不产生推理费用。 */
 const CODERLY_MAX_ROTATE = 5
 
-/** 429 短时限流冷却：1 小时（与 loomy / raccoon / trae soft-rate 同档）。 */
+/**
+ * 429 限流冷却：1 小时（与 loomy / raccoon / trae 的 soft-rate 同档，
+ * 见 `accio-adapter.ts`）。
+ *
+ * ⚠️ 这个时长**不是**"短时"：注释曾写「429 是短时限流」，与 1 小时自相矛盾。
+ *    档位本身不改 —— 它与别家 soft-rate 一致，`codely-rotation.spec.ts` 也钉住了，
+ *    单独给 codely 缩档会让同一份限流在各家表现不同。
+ */
 const CODERLY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
 
 /**
  * 「换号有用」的失败形态（cline / accio 同语义）：
  *
- * - **402** / 报文含 `budget_exceeded`：该账号积分或团队预算耗尽 —— 等待不会恢复，
+ * - **402** / 报文含 `budget_exceeded`：积分或团队预算耗尽 —— 等待不会恢复，
  *   换号（或签到 / 充值）才有用；
- * - **429**：短时限流 —— 换号立即恢复。
+ * - **429**：限流 —— 换号可能立即恢复。
+ *
+ * ## ⚠️ 两条腿对 429 的处置**故意不同**，这不是 bug（2026-10-24 澄清）
+ *
+ * | 端点 | 429 含义 | 处置 |
+ * |---|---|---|
+ * | **推理** `POST /v1/chat/...` | 账号级 RPM / TPM 超发 | 换号 + 记 1 小时冷却 |
+ * | **换发** `GET cli_api_key` | **网关全局**限流 | 归 `transient`，**不换号、不记账** |
+ *
+ * 换发侧的 429 换号也没用（撞的是同一个网关），所以不记账；推理侧换号确实有用，
+ * 所以记账。写成两处口径是为了各自正确，不是忘了统一 —— 详见
+ * `codely-auth.ts` 的 `CodelyCliApiKeyResult` 注释。
  *
  * ⚠️ 401/403 **不**换号：Codely 的 401 绝大多数是「团队无权访问该模型」
  * （换账号也撞同一个团队策略，见 `streamViaHttp` 里的取证表），真凭据失效
@@ -175,6 +193,76 @@ export function isCodelyRotatableFailure(status: number, body: string): boolean 
 /** 上游「预算 / 积分耗尽」报文特征（LiteLLM：`type:"budget_exceeded", code:"402"`）。 */
 function isCodelyBudgetExceeded(body: string): boolean {
   return /budget_exceeded|budget has been exceeded/i.test(body)
+}
+
+/**
+ * 预算报文的**归一化形态**（2026-10-31 对抗审计 1D 修）：供团队级判定的两号比对用。
+ *
+ * ## 为什么不逐字比
+ *
+ * 上游报文里的 `request_id` / `instance` 这类**每次请求都变**的字段会让两个号
+ * 的报文必然逐字不等 ⇒ 判定静默永不触发（换发端点实测同形，见 `codely-auth.ts`）。
+ * 归一化抹掉它们，保留真正的骨架特征。
+ *
+ * ## 归一化规则（故意保守：只抹确定易变的）
+ *
+ * 1. **JSON 感知**：能解析成对象时，删除 `request_id` / `instance` 两个键
+ *    （LiteLLM problem/json 报文的逐次易变字段）；再在序列化产物上把**所有含
+ *    小数点的数字**按 **6 位有效数字**重写（`message` **字符串内**的
+ *    `Current cost: 54.708759999999994` 一并覆盖 —— 抹
+ *    `54.708759999999994` vs `54.70876` 这类**同一数值**的序列化尾差；
+ *    1.5 / 2.5 重写后仍是自身，「cost 递增 ⇒ 判账号级」的既有语义不变，
+ *    见 spec「整池耗尽」用例）。
+ * 2. **解析失败回退**：非 JSON（HTML 网关页等）按文本处理：剥 `request_id`/
+ *    `instance` 的 `"key":"value"` 片段 + 压空白后比对 —— 宽松方向是有意的：
+ *    这类报文本就缺乏骨架，宁可偶尔把两个撞同一堵网关墙的号判成团队级
+ *    （换号本来就无用），也不能把带易变字段的真团队墙漏成整池连坐。
+ *
+ * ⚠️ 已知残余风险（登记于 streamViaHttp 判据注释）：`Current cost` 若是团队
+ * 累计消费（逐号递增），归一化也救不了 —— 那要等真实团队级报障取证后再改。
+ */
+function normalizeBudgetDetail(detail: string): string {
+  try {
+    const parsed: unknown = JSON.parse(detail)
+    if (typeof parsed === 'object' && parsed !== null) {
+      const scrubbed = structuredClone(parsed as Record<string, unknown>)
+      delete scrubbed['request_id']
+      delete scrubbed['instance']
+      scrubNested(scrubbed)
+      // ⚠️ LiteLLM 的 cost 不在 JSON 数字里，而嵌在 `error.message` **字符串**内
+      //    （`Current cost: 54.708759999999994`）⇒ 上面的数字 scrub 摸不到它。
+      //    在序列化**产物**上再做一次文本级浮点归一：**所有含小数点的数字**统一
+      //    按 6 位有效数字重写（覆盖任意嵌套深度的字符串字段）。
+      //    ⚠️ 不能只挑「≥6 位小数」的：`54.70876`（5 位）与
+      //    `54.708759999999994`（15 位）是**同一数值**的两种序列化，前者会漏网。
+      //    统一 toPrecision(6) 后两者都是 54.7088；而 1.5 / 2.5 重写后仍是自身
+      //    ⇒ 「cost 递增 ⇒ 判账号级」的既有语义不变（spec「整池耗尽」仍绿）。
+      return JSON.stringify(scrubbed).replace(/\d+\.\d+/g, (m) => String(Number(Number(m).toPrecision(6))))
+    }
+  } catch { /* 非 JSON：走文本回退 */ }
+  return detail
+    .replace(/"(?:request_id|instance)"\s*:\s*"[^"]*"/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** 递归把对象/数组里的浮点数按 6 位有效数字重写（抹同一数值的序列化尾差）。 */
+function scrubNested(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i += 1) {
+      const v = node[i]
+      if (typeof v === 'number' && !Number.isInteger(v)) node[i] = Number(v.toPrecision(6))
+      else if (typeof v === 'object' && v !== null) scrubNested(v)
+    }
+    return
+  }
+  if (typeof node !== 'object' || node === null) return
+  for (const key of Object.keys(node as Record<string, unknown>)) {
+    const obj = node as Record<string, unknown>
+    const v = obj[key]
+    if (typeof v === 'number' && !Number.isInteger(v)) obj[key] = Number(v.toPrecision(6))
+    else if (typeof v === 'object' && v !== null) scrubNested(v)
+  }
 }
 
 /**
@@ -335,6 +423,8 @@ export class CodelyAdapter extends LlmAdapter {
    */
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     if (this.options.cliSpawner !== undefined) {
+      // ⚠️ 测试专用：本路径与 HTTP 路径**行为不同**（不换号 / 不记账 / 不续拉），
+      //    差异见 `streamViaCli` 的注释 —— 别用它验证换号与冷却类行为。
       yield* this.streamViaCli(options)
       return
     }
@@ -698,6 +788,50 @@ export class CodelyAdapter extends LlmAdapter {
     let res: Response | undefined
     let detail = ''
     /**
+     * 团队级预算耗尽的判定状态（2026-10-24 加）。
+     *
+     * ## 为什么需要它
+     *
+     * `isCodelyBudgetExceeded` 的报文特征（`budget_exceeded`）**不区分**「这个账号
+     * 自己的额度用完了」和「整个团队的预算用完了」—— LiteLLM 两者同 `type`、同
+     * `code`，实测报文里连 `Max budget` 都是一样的 `-1.0`。
+     *
+     * 而换号对后者**完全无用**：团队预算是绑团队策略的，换哪个号都撞同一堵墙
+     * （循环里 401 那处的取证表已经论证过同一件事）。旧实现不区分 ⇒ 连转
+     * `CODERLY_MAX_ROTATE = 5` 个号，**每一个**都被记到 `nextUtc8DayStartMs()`
+     * （UTC+8 次日 0 点）⇒ 一次团队预算耗尽就把整池封到第二天。
+     *
+     * 这与 `streamViaHttp` 自己立的纪律直接冲突：
+     * 「换号只会让同一个上游故障去撞另一个账号，纯属白烧整池」。
+     *
+     * ## 判据
+     *
+     * **连续两个不同账号返回「归一化后相同」的预算报文** ⇒ 判定为团队级。
+     * 用报文比对而不是只看 status，是因为 402 也可能是单号额度耗尽
+     * （那种情况换号是有用的，不该 break）。
+     *
+     * ⚠️⚠️ **「归一化」而不是「逐字相等」**（2026-10-31 对抗审计 1D 修）：
+     * 同一上游的报文**并不保证逐字稳定** —— 换发端点实测就带 `request_id` /
+     * `instance`（见 `codely-auth.ts` 的 RFC 7807 取证），推理侧若同形，两个号
+     * 的报文必然逐字不等 ⇒ 逐字比对会让团队级判定**静默永不触发**，退化回
+     * 修复前的「整池封到次日 0 点」，且零日志零告警。归一化把易变字段抹掉后再比
+     * （见 {@link normalizeBudgetDetail}），其余骨架必须一致。
+     * ⚠️ **仍未实测「两个账号真撞同一份报文」**（报障截图只有单账号）——
+     *    若 `Current cost` 是**团队累计消费**（逐号递增），最坏仍判成账号级。
+     *    这条假设要等真实团队级报障再取证；在此之前，判不中只是**退回旧行为**
+     *    （多烧几次注定失败的换号），不会比修复前更糟。
+     */
+    let lastBudgetDetail: string | null = null
+    let teamBudgetExhausted = false
+    /**
+     * 本轮已因「预算耗尽」记过冷却的账号。
+     *
+     * ⚠️ 为什么要记：命中团队级时，前面那些号**已经被记账了**（判定只能发生在
+     *    第 2 个号之后，那时第 1 个号早已写进冷却表）。不回滚 ⇒ 本次修复「别把
+     *    撞团队墙的好号封到明天」只做到了一半 —— 漏掉的第一个号恰恰也是好号。
+     */
+    const budgetMarked: string[] = []
+    /**
      * 是否**至少有一次**因为「换发 `cli_api_key` 失败」而退出循环。
      *
      * ⚠️ 用来与「一次请求都没发起」区分开：两者 `res` 都是 `undefined`，
@@ -820,6 +954,14 @@ export class CodelyAdapter extends LlmAdapter {
           ? AbortSignal.timeout(CODELY_INFERENCE_TIMEOUT_MS)
           : AbortSignal.any([options.signal, AbortSignal.timeout(CODELY_INFERENCE_TIMEOUT_MS)]),
       })
+      // ⚠️⚠️ **已登记的失明区**（2026-10-31 对抗审计 1C，未修）：HTTP 200 但
+      //    SSE 流内发 error 帧（如流内 `budget_exceeded`）会**绕过下面整个换号
+      //    循环** —— `res.ok` 在读 detail 之前 break，SSE 消费器又不识别 error 帧
+      //    ⇒ 不换号、不分类、不判团队级，最终落 `EMPTY_RESPONSE`（spec 的
+      //    (200, budget) 用例走的是**非流式**那条腿，此路径在流式不可达）。
+      //    accio 有同型实测（200 + 流内 402），codely 未实测是否有此形态。
+      //    修法（要动 SSE 消费器，属独立任务）：消费器识别 error 帧后按
+      //    `isCodelyRotatableFailure` 同口径抛可换号错误。
       if (res.ok) break
       detail = await res.text().catch(() => '')
       const body = detail.length === 0 ? '' : `（${detail.slice(0, 240)}）`
@@ -860,10 +1002,53 @@ export class CodelyAdapter extends LlmAdapter {
       if (!isCodelyRotatableFailure(res.status, detail)) break
       if (options.signal?.aborted === true) break
       if (pool === undefined || currentAccountId === '') break
+      // ③ 团队级预算耗尽：**必须排在记账之前**。
+      //    否则撞的是团队墙、却把账号当成「这个号自己不行」记进冷却表 —— 而这个号
+      //    其实是好的，只是被连坐封到次日 0 点。
+      // ⚠️ `detail` **为空时不参与判定**：空报文意味着没有可比对的报文特征，
+      //    此时「两个账号撞同一份报文」这个前提不成立，按账号级处理（换号可能有用）。
+      //    否则所有只返回裸 402、不带 body 的上游都会被误判成团队级，提前停止换号。
+      if ((res.status === 402 || isCodelyBudgetExceeded(detail)) && detail.length > 0) {
+        // ⚠️ 比对用归一化形态（2026-10-31 对抗审计 1D 修，理由见上方判据注释）：
+        //    上游报文可能带 request_id / instance / 浮点尾差，逐字比对会让
+        //    团队级判定静默永不触发。归一化只抹易变字段，骨架仍必须一致。
+        const normalized = normalizeBudgetDetail(detail)
+        if (lastBudgetDetail !== null && normalized === lastBudgetDetail) {
+          // 两个不同账号撞归一化后相同的预算报文 ⇒ 团队级。
+          // 直接 break 且**不记账本号**（上面 ②那步还没执行到）。
+          teamBudgetExhausted = true
+          // ⚠️ 回滚本轮已记的预算账：这些号撞的是**同一堵团队墙**，本身都是好的。
+          //    留在冷却表里就等于把它们封到次日 0 点，与「团队级不连坐」的立意自相
+          //    矛盾 —— 第 1 个号不该因为「它是第一个撞上去的」就被牺牲。
+          //
+          //    回滚失败只忽略、不抛：用户仍可在面板点「重测」解冻，而抛出去会让
+          //    本次请求连一条错误说明都拿不到。
+          for (const markedId of budgetMarked) {
+            // ⚠️ 必须用 `try` 而不是 `.catch()`：方法缺失时是**同步**抛
+            //    `TypeError`（`pool.clearModelRateLimits is not a function`），
+            //    而 `.catch` 只接得住 Promise 拒绝 —— 用它会让异常冒泡出换号循环，
+            //    最终变成「请求没有任何 error、也没有任何内容」这种最难的排查形态。
+            try {
+              await pool.clearModelRateLimits(markedId, [model])
+            } catch { /* 回滚失败不阻断本次报错，用户仍可点「重测」解冻 */ }
+          }
+          break
+        }
+        // 第一个号：还无法区分「它自己的额度」与「团队预算」，先记归一化报文继续换号
+        // （存归一化形态：下一轮与 normalized 直接比，两侧行为对称）。
+        lastBudgetDetail = normalized
+      } else {
+        // ⚠️ 非预算轮次（429 / 其它 4xx / 5xx…）**必须清空**，否则「连续」二字落空：
+        //    A 号 402(X) → B 号 429 → C 号 402(X) 时，C 会拿 A 那份报文比对并判成
+        //    团队级 ⇒ 提前 break、C 不记账、后面还有号也不再试，用户拿到
+        //    「团队预算已耗尽、换号无用」而实际 B 刚才只是被限流、池里还有可用号。
+        lastBudgetDetail = null
+      }
       // ② 立刻记账（**无条件**，必须在下面的「预算用尽」判断之前 —— 理由见循环头
       //    注释）：先 break 再记账会让「预算用尽退出」时的最后一个失败账号永远漏记
       //    ⇒ 它下次仍被选中、又撞一次同样的墙（minimax 的「8 号只记 7」同型缺陷，
       //    本条由 codely-rotation.spec.ts 的「预算上限」用例钉住）。
+      const budgetFailure = res.status === 402 || isCodelyBudgetExceeded(detail)
       try {
         await pool.updateModelRateLimit(
           currentAccountId,
@@ -872,6 +1057,9 @@ export class CodelyAdapter extends LlmAdapter {
             ? Date.now() + CODERLY_RATE_LIMIT_COOLDOWN_MS
             : nextUtc8DayStartMs(),
         )
+        // 只有**预算类**失败才需要回滚：429 是账号级 RPM 超发，撞的不是团队墙，
+        // 那种冷却本就该留着（别家 soft-rate 同档）。
+        if (budgetFailure) budgetMarked.push(currentAccountId)
       } catch {
         // ③ 记账失败不中断换号（accio P2-1 同款）：少记一次冷却的代价
         //    远小于「整池轮换被一次写盘失败掐断」。
@@ -924,13 +1112,20 @@ export class CodelyAdapter extends LlmAdapter {
       // 退避重试 5 次（全部注定失败，用户看到的就是 5/5 × 7.5s 然后整轮失败）。
       // QUOTA_EXCEEDED 才能停掉无谓重试，并给到「签到 / 充值」这个唯一有效动作。
       if (res.status === 402 || isCodelyBudgetExceeded(detail)) {
+        // ⚠️ 团队级与账号级必须是**两条不同文案**：团队级换号无用，唯一出路是充值；
+        //    账号级则还可以换号 / 签到。混成一句会让用户去做一个注定无效的动作。
         throw new LlmError(
-          (tried.size > 1
-            ? `codely: 已轮换 ${tried.size} 个账号，积分 / 团队预算全部耗尽`
-            : 'codely: 当前账号积分或团队预算已用尽')
+          (teamBudgetExhausted
+            ? `codely: 团队预算已耗尽 —— 已轮换 ${tried.size} 个账号，全部撞同一份预算报文，换号无用`
+            : tried.size > 1
+              ? `codely: 已轮换 ${tried.size} 个账号，积分 / 团队预算全部耗尽`
+              : 'codely: 当前账号积分或团队预算已用尽')
             + `（上游 ${res.status}${body}）。`
-            + '可先在面板「一键签到」领积分；签到 / 充值后点该账号的「重测」立即解冻，'
-            + '或等次日 0 点自动恢复',
+            + (teamBudgetExhausted
+              ? '这是**团队层面**的上限，换任何账号结果都一样 —— 需由团队充值，或等次日 0 点自动恢复。'
+                + '（本轮已试账号的冷却标记均已回滚，不会连坐到明天）'
+              : '可先在面板「一键签到」领积分；签到 / 充值后点该账号的「重测」立即解冻，'
+                + '或等次日 0 点自动恢复'),
           'QUOTA_EXCEEDED',
         )
       }
@@ -1270,6 +1465,20 @@ export class CodelyAdapter extends LlmAdapter {
       } as unknown as GenerateOptions
       // ⚠️ 传 `shared`（第 3 参）：正文块状态跨轮**同一份** ⇒ `block-start(0)` 只发
       //    一次、`block-end(0)` 带**累积全文**（旧实现各层一份 ⇒ 流式≠落盘）。
+      //
+      // ⚠️⚠️ `tried` **故意不传**（2026-10-24 核实后维持现状，不要"顺手补上"）：
+      //
+      //   · **传了会伤**：续拉只发生在「本轮**成功**但判定停滞」时，此时 `tried`
+      //     里主要就是那个刚成功的账号。传下去 ⇒ 续拉层把它排除 ⇒ **续拉必定换号**，
+      //     而续拉的语义是「接着生成」，不是「换个号重试」。
+      //
+      //   · **不传也不亏**：本轮**失败**过的账号已经写进冷却表，续拉层选号时由
+      //     `getAvailableAccount` 的 `modelRateLimits` 过滤腿剔掉（见上文循环注释）；
+      //     坏凭据（裸 `JSON.parse` 的 `{}`）则由 `usableCodelyCredential` 原地跳过。
+      //     ⇒ 不会出现「把同一个失败账号再试一遍」。
+      //
+      //   · `tried` 在这里唯一能额外挡住的是「本轮试过、但没写冷却表的号」——
+      //     那恰是**成功**的号，本就该继续用。
       yield* this.streamViaHttp(retryOptions, retryBudget - 1, block)
       return
     }
@@ -1327,7 +1536,29 @@ export class CodelyAdapter extends LlmAdapter {
     yield { type: 'finish', reason: { kind } }
   }
 
-  /** 旧的 CLI 驱动路径（仅测试注入 `cliSpawner` 时使用，生产不走）。 */
+  /**
+   * 旧的 CLI 驱动路径（仅测试注入 `cliSpawner` 时使用，生产不走）。
+   *
+   * ## ⚠️ 与 `streamViaHttp` 的**行为差异**（2026-10-24 显式记录）
+   *
+   * 这条路径**不具备** HTTP 路径的请求级能力，别照着 HTTP 那套去理解它：
+   *
+   * | 能力 | HTTP 路径 | 本路径 |
+   * |---|---|---|
+   * | 换发 `cli_api_key` | ✅ | ❌ 不换发 |
+   * | 从池选号 / 换号重试 | ✅（上限 `CODERLY_MAX_ROTATE`） | ❌ 不选号，无换号 |
+   * | 失败记账（`updateModelRateLimit`） | ✅ | ❌ 完全不记账 |
+   * | 目录前置校验 | ✅ | ❌ |
+   * | 停滞续拉 | ✅ | ❌ 一次跑完 |
+   *
+   * ⇒ **别拿这条路径去验证换号 / 冷却 / 团队级判定**：它压根不走那些分支，
+   *   在那里写断言会得到「看起来通过了、其实什么都没测」的假绿。那些行为请走
+   *   `codely-rotation.spec.ts`（注入的是 HTTP 路径）。
+   *
+   * 保留它的唯一理由：保住 `codely-cli.ts` 的调用点（零调用点是本仓库记过的
+   * 陷阱）与既有用例。生产由 `stream()` 的 `cliSpawner === undefined` 挡住，
+   * 永远走 HTTP。
+   */
   private async *streamViaCli(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const prompt = buildCliPrompt(options)
     if (prompt.length === 0) {

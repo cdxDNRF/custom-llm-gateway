@@ -160,6 +160,433 @@ function scoopChromiumPath(root: string): string {
   return join(root, 'apps', 'chromium', 'current', 'chrome.exe')
 }
 
+/**
+ * `reg.exe` 单次查询的超时（毫秒）。
+ *
+ * ⚠️⚠️ **必须有**（2026-10-30 四路审计 P1 D-04 修）：`spawnSync` **默认无超时**
+ * ⇒ `reg` 卡住（网络路径上的 App Paths、组策略锁死注册表等）⇒ **无限期冻结**
+ * Electron 主进程的事件循环 ⇒ 整个插件无响应。
+ * ⚠️ 同仓库 `killProcessTree` 的 `taskkill` **带了** `timeout: 10_000` 且注释
+ * 写明「别无限等」⇒ **同一条纪律在这里漏了**。
+ */
+const REG_QUERY_TIMEOUT_MS = 5_000
+
+/**
+ * `reg.exe` 单值查询（**默认实现**）。
+ *
+ * ⚠️ **必须取原始字节**（`encoding: 'buffer'`）—— 见
+ * {@link windowsRegisteredBrowserPaths} 的头部注释（编码是 GBK，不是 UTF-8）。
+ * ⚠️ **必须带 `timeout`** —— 否则 `reg` 卡住会无限期冻结事件循环。
+ */
+function defaultRegistryQuery(key: string): { status: number | null, stdout: string } {
+  const result = spawnSync(
+    'reg',
+    ['query', key, '/ve'],
+    // ⚠️⚠️ **`encoding: 'buffer'` 是 P0 D-01 的根**（2026-10-30 第二轮审计 P1-2）：
+    //    必须是**原始字节**（OEM 代码页），不能是 `'utf8'` —— 后者会把中文
+    //    解成 U+FFFD（不可逆）⇒ 路径拼错 ⇒ 存在性过滤把它筛掉 ⇒
+    //    整条注册表腿静默失效。
+    // ⚠️⚠️ **`timeout` 同为承重件** —— 否则 `reg` 卡住会无限期冻结事件循环。
+    { encoding: 'buffer', windowsHide: true, timeout: REG_QUERY_TIMEOUT_MS },
+  )
+  return {
+    status: result.status,
+    // ⚠️ 用**带兜底**的解码：首选编码猜错时（解出 U+FFFD）自动重试候选编码。
+    stdout: decodeRegistryOutputWithFallback(result.stdout),
+  }
+}
+
+/**
+ * 注册表查询结果的**进程级缓存**（2026-10-30 审计 P2-2 修）。
+ *
+ * ⚠️⚠️ **为什么必须缓存**：一次 `windowsRegisteredBrowserPaths()` = **8 次
+ * `spawnSync`**（4 个 exe × 2 个 hive），实测 **399~550ms**；而
+ * `magicrewBrowserRoots()` 是**函数调用** ⇒ 每次 `importFromLocalBrowser`
+ * 都要付这笔（而 `readLocalBrowserCreds` 还会对 2 个 hostname 各调一次
+ * ⇒ **~1.1s 事件循环冻结**）。
+ *
+ * ⚠️ **缓存期取 5 分钟**：注册表里的 App Paths 登记**极少变动**（只有装/卸
+ * 软件才变）⇒ 5 分钟的滞后完全可接受；换来的是「一次导入只付一次」。
+ * ⚠️ 单测**注入**查询器 ⇒ 走的是另一条分支（`windowsRegisteredBrowserPaths`
+ * 的 `query` 参数），**不碰**这个缓存 ⇒ 单测仍是确定性的。
+ */
+const REGISTRY_QUERY_CACHE_TTL_MS = 5 * 60_000
+let registryPathsCache: { at: number, paths: string[] } | undefined
+
+/**
+ * Windows「App Paths」里登记的 Chromium 可执行文件（**带缓存**）。
+ *
+ * ⚠️ **缓存只对默认查询器生效**（注入了 `query` 的调用点 —— 即单测 ——
+ * 走的是**未缓存**那条路，保留确定性）。
+ */
+export function windowsRegisteredBrowserPathsCached(
+  nowMs: number = Date.now(),
+): string[] {
+  if (registryPathsCache !== undefined && nowMs - registryPathsCache.at < REGISTRY_QUERY_CACHE_TTL_MS) {
+    return registryPathsCache.paths
+  }
+  const paths = windowsRegisteredBrowserPaths()
+  registryPathsCache = { at: nowMs, paths }
+  return paths
+}
+
+/** 清掉注册表查询缓存（**仅供单测**，避免用例之间互相污染）。 */
+export function resetRegistryPathsCache(): void {
+  registryPathsCache = undefined
+}
+
+/**
+ * Windows「App Paths」里登记的 Chromium 可执行文件。
+ *
+ * ⚠️⚠️⚠️ **编码是本函数最容易错的一格**（2026-10-30 四路审计 P0 D-01 定案）：
+ *
+ * `reg.exe` 的输出**不是 UTF-8**，而是**系统 OEM 代码页**
+ * （中文 Windows = **GBK/CP936**，英文 = CP1252）。旧实现写死
+ * `encoding: 'utf8'` ⇒ 路径里的中文被解成 **U+FFFD**（**不可逆**）⇒
+ * 拼出**不存在的目录** ⇒ 「便携版已修好」在中文路径下**从未成立**。
+ *
+ * 实测取证（本机中文 Windows，写入临时 HKCU 键后删除）：
+ * ```
+ * stdout hex: …28 c4 ac c8 cf 29…  REG_SZ  …44 3a 5c d6 b5 c5 eb…
+ *              ↑↑↑↑↑↑↑↑ GBK 的「默认」二字    ↑↑↑↑↑↑ GBK 的「我的工具」
+ * utf8 解码 => "…    (Ĭ��)    REG_SZ    D:\�ҵĹ���\Chrome\App\chrome.exe"
+ * gbk  解码 => "…    (默认)    REG_SZ    D:\我的工具\Chrome\App\chrome.exe"  ✅
+ * ```
+ *
+ * ⇒ 修法：**取原始字节**（`encoding: 'buffer'`）再按**系统代码页**解码。
+ * ⚠️ 代码页**必须按系统语言选**（见 {@link registryCodePage}）——
+ * **不能无条件先试 `gb18030`**（英文 Windows 上会把 1252 的字节解成别的字符）。
+ * ⚠️ Node 内置 `TextDecoder` 支持 `gb18030` / `windows-1252`（实测 Node 22 可用）。
+ *
+ * ⚠️ **更稳的替代**：`reg export` 输出 **UTF-16LE**（无代码页歧义）⇒
+ * 用 `TextDecoder('utf-16le')` 解即可。本实现**不用**它是因为 `reg export`
+ * 需要导出整棵子树、输出体积大得多；`/ve` 单值查询 + 代码页解码已足够，
+ * 且**存在性过滤**（见下）会把解错的路径直接筛掉。
+ */
+export function windowsRegisteredBrowserPaths(
+  query: (key: string) => { status: number | null, stdout: string } = defaultRegistryQuery,
+): string[] {
+  if (process.platform !== 'win32') return []
+  const found: string[] = []
+  for (const hive of ['HKCU', 'HKLM']) {
+    for (const name of ['chrome.exe', 'chromium.exe', 'msedge.exe', 'brave.exe']) {
+      const key = `${hive}\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${name}`
+      try {
+        const result = query(key)
+        if (result.status !== 0) continue
+        for (const line of result.stdout.split(/\r?\n/)) {
+          // ⚠️ `REG_EXPAND_SZ`（含 `%VAR%` 的默认值）**也要认** ——
+          //    旧实现用 `/\bREG_SZ\b/i`，实测**不匹配** `REG_EXPAND_SZ`
+          //    （`\b` 在 `_` 前不成立 ⇒ 整行被跳过 ⇒ 含 `%VAR%` 的默认值被漏）。
+          const marker = /\bREG_(?:EXPAND_)?SZ\b/i.exec(line)
+          if (marker === null) continue
+          let executable = line.slice(marker.index + marker[0].length).trim()
+          // ⚠️ `REG_EXPAND_SZ` 的值可能含 `%VAR%` ⇒ 展开环境变量。
+          //
+          // ⚠️⚠️ **只展开「确实存在」的环境变量**（2026-10-30 第二轮审计 P2-3 修）：
+          // 旧实现 `replace(/%([^%]+)%/g, (_, name) => process.env[name] ?? '')`
+          // 会把**不存在的**变量替换成**空串** ⇒ 路径被**改短** ⇒
+          // 实测 `C:\a%b%c\chrome.exe`（`b` 不存在）⇒ `C:\ac\chrome.exe`
+          // ⇒ 指向**另一个**（可能存在的）路径 ⇒ 存在性过滤**放行**它
+          // ⇒ **误命中**（而不是安全地「找不到」）。
+          //
+          // ⇒ 修法：只替换**环境里真的有**的变量；不存在的**原样保留**
+          // （⇒ 路径保持不变 ⇒ 存在性过滤会把它正确筛掉）。
+          if (marker[0].toUpperCase() === 'REG_EXPAND_SZ') {
+            executable = executable.replace(/%([^%]+)%/g, (match, name: string) => {
+              const value = process.env[name]
+              return value === undefined ? match : value
+            })
+          }
+          if (!isAbsolute(executable)) continue
+          // ⚠️⚠️ **basename 守卫必须容许「注册名 ≠ 文件名」**（2026-10-30 审计 P3-3）：
+          //    实测本机 `App Paths\msedge.exe` 的默认值是
+          //    `C:\Program Files (x86)\Microsoft\Edge\Application\Microsoft Edge.exe`
+          //    ⇒ basename 是 `Microsoft Edge.exe` ⇒ 旧守卫 `=== 'msedge.exe'`
+          //    **把它误杀**（实测生产函数本机返回 `[]`）。
+          //
+          //    ⇒ 判据改成「**basename 与注册名指向同一个产品**」：
+          //    ① 去掉空格/连字符/下划线后**相等**（`Microsoft Edge.exe` ⇒
+          //    `microsoftedge` vs `msedge` ⇒ 仍不等）；
+          //    ② 或 basename **含**注册名去 `.exe` 后的主体（`msedge.exe` 自己
+          //    命中；`Microsoft Edge.exe` **不**命中 ⇒ 见 ③）。
+          //
+          //    ⇒ ③ 最稳的一条：**注册项自己就是权威** —— App Paths 的键名
+          //    （`chrome.exe` / `msedge.exe` / `brave.exe`）已经说明了「这是哪个
+          //    产品」，**值里的文件名不必与它同名**（Edge 就是反例）。
+          //    ⇒ 所以这里**只要求「值是个存在的可执行文件」**，产品归属交给
+          //    注册项本身；basename 只做**兜底排除**（排除明显不是浏览器的值）。
+          const base = basename(executable).toLowerCase()
+          if (!base.endsWith('.exe')) continue
+          // ⚠️⚠️ **存在性过滤**（2026-10-30 审计 P2-1 / P1-2 修）：
+          //    解码错、布局推错、注册了但文件已卸载 —— 三种情况都会产出
+          //    **不存在的路径** ⇒ 而下游 `readdirSync` 会**静默失败**（读不到 ⇒
+          //    症状与「用户没登录」**同形**、零日志）。
+          //    ⇒ 一道 `existsSync` 同时治「编码错」「布局错」「垃圾路径」
+          //    （标准安装会推�� `C:\Program Files\Google\Data` 这种垃圾）。
+          if (!existsSync(executable)) continue
+          if (!found.some((item) => winPathEquals(item, executable))) found.push(executable)
+        }
+      } catch {
+        // 没有 reg / 注册表不可读时继续走原有的固定候选链。
+      }
+    }
+  }
+  return found
+}
+
+/**
+ * 本机 `reg.exe` 输出用的**代码页**（`'gb18030'` 或 `'windows-1252'`）。
+ *
+ * ⚠️⚠️⚠️ **不能无条件先试 `gb18030`**（2026-10-30 第二轮审计发现并修）：
+ * 两个解码器**都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」在
+ * **英文 Windows**（代码页 1252）上会把 1252 的字节解成**别的字符**：
+ * ```
+ * 路径 C:\Users\José\Chrome
+ *   gb18030    ⇒ "C:\Users\Jos閈\Chrome"   ← 错了
+ *   windows-1252 ⇒ "C:\Users\José\Chrome"  ✅
+ * ```
+ * ⇒ 在英文系统上，路径被解错 ⇒ **存在性过滤把它筛掉** ⇒ 整条注册表腿
+ * **静默失效**（比「解成 U+FFFD」更难发现，因为它至少还是有效文本）。
+ *
+ * ⚠️⚠️⚠️ **判据源必须是「注册表里的 OEMCP」，不能是 `Intl` 的 locale**
+ * （2026-10-30 第二轮审计 P1-1 修）：第一版按 `Intl.DateTimeFormat()
+ * .resolvedOptions().locale` 判「CJK ⇒ GBK」⇒ **ja / ko / zh-TW 全错**：
+ * - 日文 Windows 的 OEMCP 是 **932（Shift-JIS）** ⇒ `gb18030` 会把 `あ`(82 A0)
+ *   解成 `偁`；
+ * - 韩文是 **949（EUC-KR）**；
+ * - **繁体中文是 950（Big5）** ⇒ `gb18030` 会把 `中` 解成 `い`。
+ * ⚠️ 而且 `Intl` 的 locale 是**用户区域格式**、**不一定等于 UI 语言**
+ * （「英文 UI + 中文区域格式」的机器会分叉）。
+ *
+ * ⇒ 修法：读**权威**的 OEM 代码页
+ * `HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP` 值
+ * （实测本机 = **936**；命令形态是 `reg query <key> /v OEMCP`）。
+ * ⇒ 一次覆盖 936 / 932 / 949 / 950 / 1252 / 65001 六档，且**不依赖语言**。
+ */
+export type RegistryEncoding = 'gb18030' | 'shift_jis' | 'euc-kr' | 'big5' | 'windows-1252' | 'utf-8'
+
+/**
+ * OEM 代码页数值 → `TextDecoder` 的编码名。
+ *
+ * ⚠️ 只列**实测会用到的**几档（其余一律退回 `windows-1252` —— 存在的
+ * 后果只是「解错 ⇒ 存在性过滤筛掉 ⇒ 找不到」，**安全降级**，不会误命中）。
+ */
+export function encodingForOemCodePage(codePage: number): RegistryEncoding {
+  switch (codePage) {
+    case 936: return 'gb18030'
+    case 932: return 'shift_jis'
+    case 949: return 'euc-kr'
+    case 950: return 'big5'
+    case 65001: return 'utf-8'
+    case 1252: return 'windows-1252'
+    default: return 'windows-1252'
+  }
+}
+
+/** `HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 里 `OEMCP` 值的路径。 */
+export const OEM_CODEPAGE_REG_KEY =
+  'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage\\OEMCP'
+
+/**
+ * 读本机的 **OEM 代码页**（权威来源）。
+ *
+ * ⚠️ 读不出来时返回 `undefined` ⇒ 调用方退回 locale 启发式（再退回 1252）。
+ */
+export function readOemCodePage(
+  query: (key: string, args: readonly string[]) => { status: number | null, stdout: string } =
+    (key, args) => {
+      const result = spawnSync('reg', ['query', key, ...args], {
+        encoding: 'buffer', windowsHide: true, timeout: REG_QUERY_TIMEOUT_MS,
+      })
+      return { status: result.status, stdout: decodeRegistryOutput(result.stdout, 'windows-1252') }
+    },
+): number | undefined {
+  try {
+    // ⚠️ 命令形态：`reg query <key> /v OEMCP`（**不是** `/ve` —— 默认项是空的）。
+    const result = query('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage', ['/v', 'OEMCP'])
+    if (result.status !== 0) return undefined
+    const match = /OEMCP\s+REG_SZ\s+(\d+)/i.exec(result.stdout)
+    if (match === null) return undefined
+    const value = Number(match[1])
+    return Number.isInteger(value) && value > 0 ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 本机 `reg.exe` 输出用的**代码页**。
+ *
+ * ⚠️ **优先读注册表的 OEMCP**（权威、与 UI 语言一致）；
+ * ⚠️ 读不到时退回 **locale 启发式**（次优，但比「无条件先试 gb18030」好得多）。
+ */
+export function registryCodePage(
+  oemCodePage?: number,
+  locale?: string,
+): RegistryEncoding {
+  if (oemCodePage !== undefined && oemCodePage > 0) return encodingForOemCodePage(oemCodePage)
+  let resolved = locale
+  if (resolved === undefined) {
+    try {
+      resolved = Intl.DateTimeFormat().resolvedOptions().locale ?? ''
+    } catch {
+      resolved = ''
+    }
+  }
+  // ⚠️ locale 启发式（**兜底**，不是权威）：
+  // ⚠️⚠️ **ja / ko / zh-TW 不能映射到 gb18030**（它们的 OEMCP 分别是
+  // 932 / 949 / **950 Big5**）⇒ 这里只把**简体**中文映射到 GBK；
+  // 其余（含 ja/ko/zh-TW）一律 1252 ⇒ 后果是「解错 ⇒ 被存在性过滤筛掉」
+  // （**安全降级**：找不到，而不是误命中）。
+  if (/^zh-(cn|sg|hans)/i.test(resolved) || /^zh$/i.test(resolved)) return 'gb18030'
+  return 'windows-1252'
+}
+
+/**
+ * 把 `reg.exe` 的原始输出字节按**系统 OEM 代码页**解码成文本。
+ *
+ * ⚠️ 中文 Windows 的 OEM 代码页是 **936（GBK）**；英文是 **1252**。
+ * ⚠️ **不能**用 UTF-8（中文会变 U+FFFD，不可逆）—— 见
+ * {@link windowsRegisteredBrowserPaths} 的头部注释。
+ * ⚠️ **也不能**无条件先试 `gb18030`（英文系统上会解错）—— 见
+ * {@link registryCodePage}。
+ *
+ * @param raw - `reg.exe` 的原始输出字节（`encoding: 'buffer'` 拿到的）。
+ * @param encoding - 代码页（缺省按 {@link registryCodePage} 判定）。
+ */
+export function decodeRegistryOutput(
+  raw: Buffer | string | undefined,
+  encoding: RegistryEncoding = registryCodePage(readOemCodePage()),
+): string {
+  if (raw === undefined) return ''
+  if (typeof raw === 'string') return raw
+  // ⚠️ Node 内置 `TextDecoder` 带 `fatal: false` ⇒ 非法字节变 U+FFFD 而不抛。
+  try {
+    return new TextDecoder(encoding).decode(raw)
+  } catch {
+    // 该编码在本机不可用 ⇒ 退回 latin1（逐字节映射，**不丢字符**，但非本地编码）。
+    // ⚠️ 存在性过滤会把解错的路径筛掉 ⇒ 退化的表现是「找不到」，不是「乱路径」。
+    return raw.toString('latin1')
+  }
+}
+
+/**
+ * 解码重试的**候选顺序**（`decodeRegistryOutputWithFallback` 用）。
+ *
+ * ⚠️ 首选是权威 OEMCP 对应的那个；其余是「常见代码页」兜底。
+ * ⚠️ ⚠️ **纯 ASCII 输出**（路径无非 ASCII 字符）⇒ 第一个候选即命中 ⇒
+ * **零额外开销**（绝大多数情况）。
+ */
+const REGISTRY_DECODE_CANDIDATES: readonly RegistryEncoding[] = [
+  'windows-1252', 'gb18030', 'shift_jis', 'euc-kr', 'big5', 'utf-8',
+]
+
+/**
+ * 把 `reg.exe` 的原始输出字节解码成文本，**并在首选编码解出 U+FFFD 时重试**。
+ *
+ * ⚠️⚠️ **为什么需要重试**（2026-10-30 第二轮审计）：首选编码**猜错**时，
+ * `TextDecoder`（`fatal: false`）**不会抛** ⇒ 只会产出 **U+FFFD** ⇒ 路径被
+ * 存在性过滤筛掉 ⇒ 整条注册表腿静默失效。
+ *
+ * ⇒ 判据：「解出来的文本含 U+FFFD」⇒ 说明这个编码**大概率不对** ⇒
+ * 依次试**其它**候选编码，取**第一个不含 U+FFFD** 的。
+ *
+ * ⚠️⚠️ **但 U+FFFD 也不够**（2026-10-30 第二轮审计）：`gb18030` 解 1252 的 `é`(0xE9)
+ * 得到的是 `闈`（U+95C8）——一个「合法」字符，**不含 U+FFFD**！
+ * ⇒ 判据必须再加一条：「**备选解码的结果与首选不同**」⇒ 首选可疑 ⇒ 取那个。
+ *
+ * ⚠️ 候选顺序：首选（权威 OEMCP）→ 1252 → 936 → 932 → 949 → 950 → UTF-8。
+ * ⚠️ ⚠️ **纯 ASCII 的输出**（路径里没有非 ASCII）⇒ 任何编码都解得出**同样**
+ * 的结果 ⇒ 第一个候选直接命中 ⇒ **零额外开销**（这是绝大多数情况）。
+ */
+export function decodeRegistryOutputWithFallback(
+  raw: Buffer | string | undefined,
+  preferred?: RegistryEncoding,
+): string {
+  const first = preferred ?? registryCodePage(readOemCodePage())
+  const decoded = decodeRegistryOutput(raw, first)
+  if (raw === undefined || typeof raw === 'string') return decoded
+  // ⚠️ 没有 U+FFFD ⇒ 首选编码解对了（纯 ASCII 输出也走这条路）。
+  // ⚠️ **纯 ASCII** ⇒ 任何编码都解出同样的结果 ⇒ 直接返回（零额外开销）。
+  if (!/[^\x00-\x7F]/.test(raw.toString('latin1'))) return decoded
+  // ⚠️ 首选解出 U+FFFD ⇒ 首选**大概率错** ⇒ 必须重试。
+  if (decoded.includes('\uFFFD')) {
+    for (const candidate of REGISTRY_DECODE_CANDIDATES) {
+      if (candidate === first) continue
+      const alternative = decodeRegistryOutput(raw, candidate)
+      if (!alternative.includes('\uFFFD')) return alternative
+    }
+    return decoded
+  }
+  // ⚠️⚠️ 首选解出了「合法但可能错」的字符（如 gb18030 解 1252 的 `é` ⇒ `闈`）
+  // ⇒ 判据：「备选解码的结果与首选**不同**」⇒ 首选可疑 ⇒ 取备选。
+  // ⚠️ 存在性过滤会把错的筛掉 ⇒ 与其赌首选，不如取「与首选不同」的那个。
+  for (const candidate of REGISTRY_DECODE_CANDIDATES) {
+    if (candidate === first) continue
+    const alternative = decodeRegistryOutput(raw, candidate)
+    if (alternative !== decoded && !alternative.includes('\uFFFD')) return alternative
+  }
+  return decoded
+}
+
+/**
+ * 已登记浏览器的默认与便携版 User Data 目录。
+ *
+ * ⚠️⚠️ **布局不能硬编码「两级」**（2026-10-30 四路审计 P0 D-02 修）：
+ * 旧实现用 `dirname(dirname(executable))` —— 它只对 `<install>/App/chrome.exe`
+ * 这一种布局成立：
+ * ```
+ * <install>/App/chrome.exe       → dirname(dirname) = <install>       ✅
+ * <install>/chrome.exe           → dirname(dirname) = <install> 的父级 ❌ 高一级
+ * <install>/Chrome/App/chrome.exe→ dirname(dirname) = <install>/Chrome ✅（恰好）
+ * ```
+ * ⇒ 高一级 ⇒ 拼出 `<父级>/Data` ⇒ **永远读不到** ⇒ 静默 0 结果。
+ *
+ * ⇒ 修法：**逐级向上探测**，取**存在** `Data/Default` 或 `User Data/Default`
+ * 的那一级（最多 4 级）。`existsSync` 判据同时把「解错的路径」筛掉。
+ *
+ * ⚠️ 便携版 Chrome **不注册 App Paths**（那是**安装器**的行为）⇒ 这条腿
+ * 在**最需要它的场景**下恒不产出；真兜底是 `MAGICREW_CHROME_USER_DATA`
+ * （见 `src/magicrew-local-browser.ts`）。本函数仍值得保留：① 少数工具
+ * 确实会登记；② `Data` 候选对**已注册**的绿色版软件仍然有效。
+ */
+export function registeredBrowserUserDataRoots(
+  paths: readonly string[] = windowsRegisteredBrowserPathsCached(),
+): string[] {
+  const roots: string[] = []
+  for (const executable of paths) {
+    // ⚠️ **逐级向上探测**（不是固定两级）—— 见本函数头部注释。
+    //
+    // ⚠️⚠️ **起点是 exe 所在的目录**（不是它的父目录）：
+    // 布局 B `<install>/chrome.exe` 的**安装根就是 exe 所在目录** ⇒
+    // 若从父目录起步，就会**跳过**它、永远找不到 `<install>/Data`。
+    let dir = dirname(executable)
+    for (let depth = 0; depth < 4; depth++) {
+      // ⚠️ 存在性判据：这一级下有 `Data` 或 `User Data` 的 profile 才算。
+      const hasProfile = (sub: string): boolean => {
+        try {
+          return existsSync(join(dir, sub, 'Default')) || existsSync(join(dir, sub, 'Profile 1'))
+        } catch {
+          return false
+        }
+      }
+      const candidates: string[] = []
+      if (hasProfile('Data')) candidates.push(join(dir, 'Data'))
+      if (hasProfile('User Data')) candidates.push(join(dir, 'User Data'))
+      for (const root of candidates) {
+        if (!roots.some((item) => winPathEquals(item, root))) roots.push(root)
+      }
+      // ⚠️ 找到就**停**（更外层不会是安装根）。
+      if (candidates.length > 0) break
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+  }
+  return roots
+}
+
 /** Windows 候选链（逐字保留自重构前，⚠️ 改这里等于动本仓库绝大多数用户）。 */
 function windowsBrowserCandidates(
   env: Record<string, string | undefined>,
@@ -1167,6 +1594,36 @@ export class ChromiumSession {
   /** 浏览器主进程 pid（清理与诊断用）。 */
   get pid(): number | undefined {
     return this.child?.pid
+  }
+
+  /**
+   * 本次会话的临时 profile 目录（即传给 chromium 的 `--user-data-dir`）。
+   *
+   * ⚠️ 存在的唯一用途：**从**这个目录里读登录态。`magicrew` 的网页版登录
+   * （`magicrew-browser-login.ts`）必须把 `readMagicrewLocalCreds` 的 `roots`
+   * 指到这里 —— 它缺省扫**用户真实浏览器**的目录，而本会话用的是
+   * `mkdtempSync` 出来的一次性目录，不去指就是「恒读不到 + 完全静默」。
+   *
+   * ⚠️ `undefined` = 还没启动（或已被 {@link dispose} 收掉）。本 getter **只读**：
+   * 目录的创建与删除仍由 {@link launch} / {@link dispose} 独占，
+   * 别在外部 `rmSync` 它（`dispose()` 里那套退避重试是真实缺陷换来的）。
+   */
+  get userDataDir(): string | undefined {
+    return this.profileDir
+  }
+
+  /**
+   * 浏览器进程是否**已经退出**（含用户自己关掉了窗口）。
+   *
+   * ⚠️ 判据是「`child` 已置空**且** `spawnFailure` 已就位」——`launch()` 的 `'exit'`
+   * 监听只在**它自己**退出时同时满足这两条（主动 `kill()` 会先把 `child` 置空，
+   * 那一刻 `spawnFailure` 仍是 `undefined`；启动前两者也都为空）。
+   *
+   * 用途：登录类流程（`magicrew-browser-login.ts`）据它**提前**结束等待 ——
+   * 用户关窗后若还耗满 4 分钟预算，用户看到的是「明明关掉了却还在转圈」。
+   */
+  get exited(): boolean {
+    return this.child === undefined && this.spawnFailure !== undefined
   }
 
   /**

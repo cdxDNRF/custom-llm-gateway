@@ -119,6 +119,8 @@
 
 import type { BuddyNoAccountReason, BuddySelectorLike } from './buddy-balance-selector.js'
 import { pickBuddyAccount } from './buddy-balance-selector.js'
+import { sessionBalanceEnabled } from './session-balance.js'
+import { isPolicyBlockedAccount } from './account-pool.js'
 import type {
   LoomyCandidateAccount,
   LoomyNoAccountReason,
@@ -150,6 +152,15 @@ export interface ResolverPool<TCredential = unknown> {
     credentialRef: string
     enabled: boolean
     modelRateLimits?: Record<string, number>
+    /**
+     * 账号级**封禁**标记（Gitee issue IKS2MV）。
+     *
+     * ⚠️ 必须在这里声明并参与过滤：`getAvailableAccount` 与 `candidatesOf` 是
+     * **两份**选号判据（下文 `candidatesOf` 的注释已警告「必须逐字一致」），
+     * 只改池那一份的话，主请求路径照样会把封禁账号选出来 —— 每一发都先撞一次
+     * 403 再换号，并顺带写两次盘（2026-11-01 对抗审计实测 E8）。
+     */
+    policyBlockedAtMs?: number
   }>
   /** 该 provider 是否处于「锁定永久积分」状态。 */
   permanentLocked(provider: string): boolean
@@ -159,6 +170,25 @@ export interface ResolverPool<TCredential = unknown> {
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
   ): Promise<{ entry: { id: string; credentialRef: string }; credential: TCredential } | null>
+  /**
+   * 按 `sessionId` 选号（可选能力；供 `accountSelection: 'session-balance'` 使用）。
+   *
+   * 未实现时调用方回落到 {@link getAvailableAccount}。真实的 `AccountPool`
+   * 已实现；单测里的结构化替身可以继续只实现上面两个方法。
+   */
+  getAvailableAccountForSession?(
+    provider: string,
+    modelId: string,
+    sessionId?: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): Promise<{ entry: { id: string; credentialRef: string }; credential: TCredential } | null>
+  /**
+   * 「ZCode 会话负载均衡」面板开关（可选能力；真实 `AccountPool` 已实现）。
+   *
+   * 每次选号**现读**（Jet Hub 页头可随时切换）。未实现时回落环境变量
+   * `DSH_ZCODE_SESSION_BALANCE`（默认开）—— 只为单测替身保留。
+   */
+  sessionBalanceEnabled?(): boolean
 }
 
 /** 注入的共享设施。 */
@@ -178,6 +208,18 @@ export interface CredentialResolverDeps<TCredential = unknown> {
    *   它要**清空**「本次实际使用的账号」标记（留着旧 id 会误伤无辜账号）。
    */
   readonly reportAccount?: (accountId: string | undefined) => void
+}
+
+/**
+ * 单次解析的「实际选中账号」出口。
+ *
+ * 为什么需要它：`deps.reportAccount` 是**进程级回调**（zcode 用它写
+ * `activeZcodeAccountId` Map）。多个会话并发时，共享 Map 会被别的请求覆盖，
+ * 适配器再读 `currentAccountId()` 就可能把失败记到别的账号头上。
+ * 把这个**按调用**的 out 参数传进来，适配器拿到的是本笔解析真正选中的 id。
+ */
+export interface CredentialPick {
+  accountId?: string
 }
 
 /**
@@ -214,6 +256,24 @@ export interface LoomySelectorLike {
  *
  * ⚠️ 只有**核实过**该家确实不存在模型级免费概念时才可以用它。判据是「产品/
  * 兜底表里没有任何 `isFree: true`，且上游目录不返回 `is_free`」，不是「懒得查」。
+ *
+ * ## ⚠️ 已登记的例外（2026-11-01，magicrew / magicrewintl）
+ *
+ * 两站**确实有**模型级免费概念（`src/magicrew-adapter.ts` 按 `magicrewIsFree(wirePoints)`
+ * 产出 `isFree: true`），却仍用了本常量 —— 这是**退让**，不是「确认没有」：
+ * `isFreeModel(modelId)` 是**同步 + 单个 id** 的判据，而 magicrew 的免费与否取决于
+ * `fetchMagicrewModelPoints()` 异步取回、缓存在**适配器实例私有字段** `modelPoints`
+ * 里的 `input_points`；resolver 与适配器是**两个对象**、装配顺序还是 resolver 在前
+ * ⇒ 没有可注入的同步查询口。
+ *
+ * **后果（已知、已取证）**：`allowPermanent` 为 `false`（用户锁了永久积分）且池里
+ * 只剩永久积分时，用户挑一个 0 点数的**免费**模型也会被拒，文案还会把用户推向
+ * 「解锁永久积分」（不可逆地开始烧永久积分）。触发面很窄（必须同时满足锁 + 只剩永久 +
+ * 选免费模型），且上游到底有没有 `input_points === 0` 的模型**尚未取证**。
+ *
+ * ⇒ 若要收紧：给适配器加一个同步查询 `isFreeModelById(id)`，并在 `src/index.ts`
+ * 用 late-bound 引用接上（首次调用时适配器可能还没建 ⇒ 仍退化成非免费，方向保守）。
+ * 在那之前**不得**把这行文档读成「magicrew 没有免费模型」。
  */
 export const NO_FREE_MODEL = (): false => false
 
@@ -255,6 +315,17 @@ export interface BuddyBalancePlan {
    * 一次行为变更。
    */
   readonly reportPickedAccount?: boolean
+  /**
+   * 锁定态下「余额查不到」时是否降级放行（默认 `false` = 保持既有语义）。
+   *
+   * ⚠️ 只有**确认余额接口会被上游网关整片拒绝**的渠道才开（超级麦吉两站，
+   * 2026-11-04 真机：国内站 HTTP 403 / 国际站 405，九个账号无一幸免）。
+   * 不开时行为逐字不变：锁定 + 查不到 ⇒ `lockedError('unknown')` ⇒ 整个
+   * provider 的模型列表被清空（用户报障「模型都选不了了」）。
+   * 开了以后：查不到余额时放宽一次（允许消耗永久积分），只在余额**查得到**
+   * 且真的没有可用档时才报锁定错误 —— 锁定语义在可判定时不变。
+   */
+  readonly degradeLockedWhenUnknown?: boolean
 }
 
 /**
@@ -320,6 +391,15 @@ export interface CredentialResolverConfig<TCredential> {
   ) => void
   /** 余额分档计划；缺省 ⇒ 纯池选号（骨架 A）。 */
   readonly balance?: BalancePlan
+  /**
+   * 账号选择策略；缺省 `'manual'` = 池的手动顺序优先（既有语义）。
+   *
+   * `'session-balance'`：按本次请求的 `sessionId` 做会话亲和（同一会话**优先**
+   * 落同一账号；账号今日请求数达阈值后会被沉底，正在跑的会话会迁移一次 —— 见
+   * `session-balance.ts` 的 `rankAccountsBySessionWithOverflow`），没有
+   * `sessionId` 时随机分摊。目前仅 **zcode** 启用。
+   */
+  readonly accountSelection?: 'manual' | 'session-balance'
 }
 
 /**
@@ -337,6 +417,10 @@ function candidatesOf(
   return pool
     .listAccountsByProvider(providerId)
     .filter(a => a.enabled)
+    // 账号级封禁：整个账号排除（与 `AccountPool.candidateAccounts` 同一条判据，
+    // 见 `isPolicyBlockedAccount`）。⚠️ 这两份判据必须同步改，否则「永久排除」
+    // 只在池那条路径上生效，而真实请求走的是本函数（对抗审计 E8 实测的形态）。
+    .filter(a => !isPolicyBlockedAccount(a))
     .filter((a) => {
       const key = modelId ?? ''
       if (key.length === 0) return true
@@ -356,7 +440,7 @@ function candidatesOf(
 export function createCredentialResolver<TCredential>(
   deps: CredentialResolverDeps<TCredential>,
   config: CredentialResolverConfig<TCredential>,
-): (modelId?: string) => Promise<TCredential | undefined> {
+): (modelId?: string, sessionId?: string, selection?: CredentialPick) => Promise<TCredential | undefined> {
   const providerId = config.product.id
 
   /** ⑤ 兜底：读固定 ref，或交给调用方自定义。 */
@@ -365,7 +449,20 @@ export function createCredentialResolver<TCredential>(
       ? await config.readCredential(config.fallback.refName)
       : await config.fallback.resolve()
 
-  return async (modelId?: string): Promise<TCredential | undefined> => {
+  return async (
+    modelId?: string,
+    sessionId?: string,
+    selection?: CredentialPick,
+  ): Promise<TCredential | undefined> => {
+    /**
+     * 统一回报出口：既写 `selection`（本次请求私有，供 zcode 这类多账号并发
+     * 的适配器精确取「本笔实际账号」），也保留 `deps.reportAccount` 的既有
+     * 进程级副作用（账本 / activeZcodeAccountId 兼容）。
+     */
+    const report = (accountId: string | undefined): void => {
+      if (selection !== undefined) selection.accountId = accountId
+      deps.reportAccount?.(accountId)
+    }
     /**
      * 分档编排排除掉的账号（**只有 buddy 协议会填**）—— 池兜底据此跳过它们，
      * 否则「档位最优但凭据损坏」的号会被 `getAvailableAccount` 立刻选回，
@@ -396,7 +493,7 @@ export function createCredentialResolver<TCredential>(
         for (const candidate of candidates) {
           const credential = await config.readCredential(candidate.credentialRef)
           if (credential !== undefined) {
-            if (plan.reportPickedAccount !== false) deps.reportAccount?.(candidate.id)
+            if (plan.reportPickedAccount !== false) report(candidate.id)
             return credential
           }
           tried.add(candidate.id)
@@ -410,9 +507,10 @@ export function createCredentialResolver<TCredential>(
       const picked = await pickBuddyAccount<TCredential>(plan.selector, candidates, {
         allowPermanent,
         resolveCredential: config.readCredential,
+        degradeOnUnknown: plan.degradeLockedWhenUnknown === true,
       })
       if (picked.kind === 'account') {
-        if (plan.reportPickedAccount !== false) deps.reportAccount?.(picked.account.id)
+        if (plan.reportPickedAccount !== false) report(picked.account.id)
         return picked.credential
       }
       for (const accountId of picked.tried) tried.add(accountId)
@@ -460,7 +558,7 @@ export function createCredentialResolver<TCredential>(
           //    只回答「该用哪个号」，答案是它给的那个；换号是另一套语义，
           //    旧闭包里没有它，加上就是行为变更。
           if (credential !== undefined) {
-            deps.reportAccount?.(picked.account.id)
+            report(picked.account.id)
             return credential
           }
         } else if (!allowPermanent) {
@@ -476,9 +574,23 @@ export function createCredentialResolver<TCredential>(
     }
 
     // ③ 池选号（⚠️ `modelId` 透传，否则模型级限流过滤整体短路）。
-    const available = await deps.pool.getAvailableAccount(providerId, modelId ?? '', tried)
+    //    `'session-balance'` = zcode 的会话亲和 / 无 sessionId 随机分摊；
+    //    其余 provider 保持手动顺序优先（既有语义）。
+    //    ⚠️ 总开关是**池里的面板开关**（`sessionBalanceEnabled`，Jet Hub 页头
+    //    可切，落 `state.json`）：**每次现读**，关掉时连 `getAvailableAccountForSession`
+    //    都不进，与手动顺序路径逐字节同语义。池未实现该方法（单测替身）时
+    //    退回环境变量 `DSH_ZCODE_SESSION_BALANCE`（默认开）—— 两条判据只在
+    //    「结构化替身」这一条路径上并存，生产 `AccountPool` 恒走面板开关。
+    const poolSwitch = typeof deps.pool.sessionBalanceEnabled === 'function'
+      ? deps.pool.sessionBalanceEnabled()
+      : sessionBalanceEnabled()
+    const available = config.accountSelection === 'session-balance'
+      && poolSwitch
+      && deps.pool.getAvailableAccountForSession !== undefined
+      ? await deps.pool.getAvailableAccountForSession(providerId, modelId ?? '', sessionId, tried)
+      : await deps.pool.getAvailableAccount(providerId, modelId ?? '', tried)
     // ④ 回报「池的决策结果」——**未命中时也报 `undefined`**（见 `reportAccount` 契约）。
-    deps.reportAccount?.(available?.entry.id ?? undefined)
+    report(available?.entry.id ?? undefined)
     /**
      * ⚠️ **这里的 `as` 是刻意保留的、已知的取舍**（缺陷史见下），不是顺手写的。
      *

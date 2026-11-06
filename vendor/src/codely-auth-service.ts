@@ -110,10 +110,32 @@ export class CodelyAuth extends Service {
   }
 
   /**
+   * 记一条 warn。
+   *
+   * ⚠️ 为什么裹这么多可选链 + try：cordis 的 `ctx.logger` 在测试桩里可能整个不存在，
+   *    而这里只是想留一条排查线索 —— 因为打日志把续期流程打崩，比不打日志糟得多。
+   */
+  private warn(message: string): void {
+    try {
+      this.ctx?.logger?.warn?.(`[codely-auth] ${message}`)
+    } catch { /* 日志不可用不得影响续期 */ }
+  }
+
+  /**
    * 续期某一个账号（守卫要求的方法）。
    *
    * @param refName 凭据 ref（`codely.account.<id>` 之类，直接交给凭据库）
    * @param _accountId 池里的账号 id（用于可选的池回写）
+   *
+   * ## ⚠️ 三处早退拆成**四条** warn（2026-10-24 补，2026-10-31 审计修正计数）
+   *
+   * 原来都是裸 `return`：凭据库没注入、读不到凭据、凭据在但没有 refresh_token、
+   * 上游续期失败 —— 四种**性质完全不同**的原因在现象上完全一致 ——
+   * 「续期永远不发生，日志零字」。这正是 A1/A5 那一轮要治的失效形态
+   * （静默失败比报错更难查）。别家在同类早退会把账号标成不可续期
+   * （`cline-auth.ts`）或至少记 warn（`modelscope-auth.ts`）。
+   * ⚠️ 四条 warn 有行为守卫（`codely-auth-service.spec.ts` 的
+   * 「续期早退必须留痕」describe），删掉任一调用点会红。
    */
   async refreshAccountCredential(
     refName: string,
@@ -121,13 +143,31 @@ export class CodelyAuth extends Service {
     accountId: string,
   ): Promise<void> {
     const store = this.options.credentials
-    if (store === undefined) return
+    if (store === undefined) {
+      // 这是**接线错误**（构造时没注入 credentials），不是账号问题 —— 它会让本实例的
+      // 续期功能整体失效，必须显眼。不抛是因为抛会打断宿主整个续期轮次。
+      this.warn(`credentials 未注入，本实例续期功能整体不可用（账号 ${accountId} 已跳过）`)
+      return
+    }
     const current = await readCodelyCredential(refName, store)
-    if (current === undefined || current.refresh_token.length === 0) return
+    if (current === undefined) {
+      this.warn(`账号 ${accountId} 读不到凭据（ref=${refName}），跳过续期`)
+      return
+    }
+    if (current.refresh_token.length === 0) {
+      // 属**账号级**问题：这个号没有 refresh_token，只能重新登录，续期救不了。
+      this.warn(`账号 ${accountId} 没有 refresh_token，无法续期，需重新登录`)
+      return
+    }
     const next = await refreshCodelyCredential(current.refresh_token, {
       ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
     })
-    if (next === undefined) return
+    if (next === undefined) {
+      // 三种原因同形：401（令牌彻底失效）/ 网络异常 / 上游协议变更。不记账、不锁号
+      // （与换发侧 A1 的 `transient` 处理同纪律），但必须留痕，否则无从判断是哪一种。
+      this.warn(`账号 ${accountId} 续期失败（上游返回空；可能为 401 / 网络异常 / 协议变更），未记账`)
+      return
+    }
     const updated: CodelyCredential = {
       ...current,
       access_token: next.accessToken,

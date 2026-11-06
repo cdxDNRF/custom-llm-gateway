@@ -22,8 +22,10 @@
  *
  * - **推理网关**：`https://codely-litellm.tuanjie.cn/v1`（OpenAI 兼容），
  *   鉴权为 `sk-` CLI API Key + `X-Codely-Signature`（HMAC 签名）。
- *   ⚠️ **签名密钥尚未取得**（见 `codely-adapter.ts` 模块头），故本渠道
- *   当前**只有目录、没有推理**。
+ *
+ *   ✅ **已接通**：签名密钥已还原（见 `codely-sign.ts` 的 `CODELY_SIGNING_SECRET`），
+ *   推理默认走 **HTTP 自签直连**（见 `codely-adapter.ts` 模块头），CLI 子进程
+ *   只是测试兜底路径，不是主链路。
  *
  * ## 为什么是独立接口（平行而非继承）
  *
@@ -53,9 +55,12 @@ export interface CodelyProduct {
   /**
    * 推理网关基址（OpenAI 兼容）。
    *
-   * ⚠️ **当前不可用**：网关要求 `X-Codely-Signature`（HMAC），签名密钥未取得
-   * （见 `codely-adapter.ts`）。保留字段是为了让「通道在哪」这件事有单一落点，
-   * 不是声明它已接通。
+   * ✅ **当前可用**：HMAC 签名密钥已在 `codely-sign.ts` 还原，`chatHost` 是
+   * **生产推理通道**（默认路径）。CLI 子进程仅作测试兜底。
+   *
+   * ⚠️ 此处曾写「签名密钥未取得、本渠道只有目录没有推理」—— 那是 2026-10-20
+   *    密钥还原之前的实况，之后实现翻了而注释未同步。这类注释会让后续审计
+   *    把一条**已接通**的通道当成没接通（A7，pr1 对抗审计点名）。
    */
   chatHost: string
   /** 官方插件自报的身份头。 */

@@ -8,8 +8,20 @@
  *
  * | 产品              | endpoint                    | platform       | genieVersion |
  * |-------------------|-----------------------------|----------------|--------------|
- * | CodeBuddy（中国） | https://copilot.tencent.com | ide            | —            |
- * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.5.2        |
+ * | CodeBuddy（中国） | https://copilot.tencent.com | ide            | 4.12.2       |
+ * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.9.4        |
+ *
+ * ⚠️⚠️ **`genieVersion` 是本表最关键的一列**：客户端发出去的 `X-IDE-Version` 与
+ * `User-Agent` 里的版本**都取它**（反编译实证见 `CODEBUDDY.clientVersion` 的注释）。
+ * 它来自客户端 `product.json` 的 `genieVersion`，**不是**同文件的 `version`
+ * （后者是 VS Code 基底版本，只在 `genieVersion` 缺失时兜底）。
+ * 实测值来源（2026-10-30）：
+ * - CodeBuddy：`CodeBuddy CN/resources/app/product.json` → `version=1.106.1`、`genieVersion=4.12.2`
+ * - WorkBuddy：`WorkBuddyAI/resources/app.asar.unpacked/cli/product.json` → `genieVersion=5.9.4`
+ *
+ * ⚠️ **本仓仍缺一个客户端会发的头：`X-Product-Version`**（= 客户端的
+ * `productVersion`，与 `platformVersion` 是两个量）。官方拦截器会发它，我们没发。
+ * 当前不发也能 200（实测），故先登记为缺口、不擅自新增未验证的信号。
  *
  * 关于「模型列表为何不能共用」：两者的**路径与响应解析完全相同**
  * （`GET /v3/config` → `data.data.models` / `data.data.agents`），
@@ -67,8 +79,8 @@ export interface BuddyUserAgentRule {
  * 虽在国际版池中也可见，但仍沿用国内客户端形态（`WorkBuddy/<ver> WorkBuddy/...`），
  * 与 realm 无关。
  */
-const WORKBUDDY_UA_INTL = 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2'
-const WORKBUDDY_UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2'
+const WORKBUDDY_UA_INTL = 'WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4'
+const WORKBUDDY_UA_CN = 'WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4'
 
 /** 一个 CodeBuddy 系产品的全部差异配置。 */
 export interface BuddyProduct {
@@ -212,7 +224,7 @@ export interface BuddyProduct {
  * `src/buddy.ts` / `src/buddy-auth.ts` 改为从本模块取值后即可删除）：
  * - `platform: 'ide'`          ↔ `src/buddy.ts`  `PLATFORM`
  * - `productCode: 'codebuddy'` ↔ `src/buddy.ts`  `BUDDY_PRODUCT_CODE`
- * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
+ * - `userAgent: 'CodeBuddyIDE/4.12.2'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
  * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts`  `BUDDY_CREDENTIAL_REF`
  * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts`  `API_ENDPOINT` / `API_DOMAIN`
  *
@@ -332,11 +344,32 @@ export const CODEBUDDY: BuddyProduct = {
   webBase: 'https://www.workbuddy.cn',
   displayName: 'CodeBuddy (腾讯)',
   productCode: 'codebuddy',
-  userAgent: 'CodeBuddyIDE/1.106.1',
+  userAgent: 'CodeBuddyIDE/4.12.2',
   // 中国版只有一条产品线，无需按模型分档：全部模型沿用 IDE UA。
   userAgentByModelFamily: [],
   attributionName: 'CodeBuddy',
-  clientVersion: '1.106.1',
+  // ⚠️⚠️ **本值 = 客户端 `product.json` 的 `genieVersion`**（2026-10-30 反编译实证，
+  // 不是猜的）：`extensions/genie` 的 `getPlatformVersion()` 实现是
+  // ```js
+  // const product = JSON.parse(readFileSync(join(env.appRoot, 'product.json')))
+  // if (product.genieVersion) return product.genieVersion   // ← 优先
+  // return version                                          // 兜底 = product.json.version
+  // ```
+  // 而 `CustomHeadersHttpProxyInterceptor` 里：
+  // ```js
+  // if (ci.platformVersion) {
+  //   headers['X-IDE-Version'] = ci.platformVersion
+  //   setCodeBuddyVersion(ci.platformVersion)   // ← UA 用同一个值
+  // }
+  // ```
+  // ⇒ `X-IDE-Version` 与 `User-Agent` **同源**（都取 `genieVersion`）。
+  // ⚠️ 本机 `CodeBuddy CN/resources/app/product.json` 实测：
+  // `version = 1.106.1`（VS Code 基底）而 **`genieVersion = 4.12.2`**（产品版本）
+  // ⇒ 发 `1.106.1` 是**发错了字段**（那是兜底值，只有在 `genieVersion` 缺失时才用）。
+  // ⚠️ 交叉验证：`WorkBuddyAI/.../cli/product.json` 的 `genieVersion = 5.9.4`，
+  // 与客户端「关于」里显示的 `版本: 5.9.4 (fa0a0901)` 一致 ⇒ 该字段确实是
+  // **对外报的版本**。⇒ 本仓 `WORKBUDDY.clientVersion` 的权威取值就是它。
+  clientVersion: '4.12.2',
   cliVersion: '2.137.1',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
   appendSessionParams: false,
@@ -480,7 +513,7 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
 /**
  * WorkBuddy 国际版（腾讯 WorkBuddy AI），platform = workbuddy-ai。
  *
- * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.5.2）的 cli/product.json：
+ * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.9.4）的 cli/product.json：
  * - `applicationName` = "workbuddy-ai"
  * - `endpoint` = "https://www.workbuddy.ai"（**与中国版不同**，模型池随区域变化）
  * - `authentication.attributes.platform` = "workbuddy-ai"
@@ -533,11 +566,11 @@ export const WORKBUDDY: BuddyProduct = {
     { match: 'minimax-', ua: WORKBUDDY_UA_CN },
   ],
   attributionName: 'WorkBuddy',
-  clientVersion: '5.5.2',
-  cliVersion: '5.5.2',
+  clientVersion: '5.9.4',
+  cliVersion: '5.9.4',
   defaultCredentialRef: 'WORKBUDDY_ACCESS_TOKEN',
   appendSessionParams: true,
-  pluginVersion: '5.5.2',
+  pluginVersion: '5.9.4',
   // 国际版登录站与 API 域都是 www.workbuddy.ai（本机 5 条真实凭据的 iss 全是此值，
   // 且本产品的 `apiDomain` 自引入起就从未是 `.cn`）。
   // ⚠️ 这里列的是 `.ai` 的各 realm 主机形态。**没有 `.cn` 条目**：本机与 git 历史

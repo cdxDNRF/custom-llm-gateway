@@ -5,11 +5,13 @@ import type { BuddyProduct } from './product.js'
 import { createJetHubStore, clearRejectionLayer, DEFAULT_PANEL_ENTRY, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePanelEntry, sanitizePermanentLocks, sanitizeProviderClosed, withAllowed, withoutAllowed } from './jet-hub-store.js'
 import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PanelEntry, PermanentLockMap, ProviderClosedMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
-import type { PermanentLockStore } from './permanent-lock-store.js'
+import type { PermanentLockRead, PermanentLockStore } from './permanent-lock-store.js'
 import { normalizeOpencodeGeneration } from './opencode-auth.js'
 import { maskProxyPassword } from './proxy-mask.js'
 // ⚠️ `model-queue.ts` **零 import**（纯函数模块，见其模块头）⇒ 不引入环。
 import { nextUtc8DayStartMs } from './model-queue.js'
+import { readTokenLedgerDayMap, utc8DayKey } from './token-ledger.js'
+import { accountLoadIndex, overflowRequestsThreshold, rankAccountsBySessionWithOverflow, shuffleAccounts } from './session-balance.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
@@ -288,6 +290,23 @@ export function proxyLogText(value: unknown): string {
   return maskProxyPassword(raw)
 }
 
+/**
+ * 该账号是否**被上游策略封禁**（账号级，Gitee issue IKS2MV）。
+ *
+ * ⚠️ 判据与 `modelRateLimits` **刻意不同**：
+ * - 限流是**逐模型**的（`candidateAccounts` 按目标模型比对 `modelRateLimits[modelId]`）；
+ * - 封禁是**整个账号**的（11140 的实测语义：同一账号在 2 个模型上 200、在 4 个模型上
+ *   403/11140 —— 拦截按账号生效）。故这里**不看任何模型**，只要标记存在就排除。
+ *
+ * ⚠️ 值域走 `isValidResetAtMs`：备份文件可编辑，脏值（`'x'` / `1e308`）若被当成
+ * 真值会让账号**永久不可选**（比逐模型脏值更狠）。
+ */
+export function isPolicyBlockedAccount(
+  entry: Pick<ProviderAccountEntry, 'policyBlockedAtMs'>,
+): boolean {
+  return isValidResetAtMs(entry.policyBlockedAtMs)
+}
+
 export class AccountPool {
   /** 持久化后端；两个后端都不可用时是仅内存实现。 */
   private readonly store: JetHubStore
@@ -393,6 +412,17 @@ export class AccountPool {
    */
   private nativeWebSearchCache = true
   /**
+   * 「ZCode 会话负载均衡」开关的进程内副本。
+   *
+   * 缺键语义是**启用**（与 {@link nativeWebSearchCache} 同一方向）：老文档没有
+   * 本键时保持会话亲和，不会因读取失败而静默改回「手动顺序压一个号」
+   *（那正是 2026-10-30 用户要求修掉的形态）。
+   *
+   * ⚠️ 与 {@link nativeWebSearchCache} 同级、**不需要**独立文档：丢失本键的
+   * 唯一后果是回到手动顺序，用户再开一次即可。
+   */
+  private sessionBalanceCache = true
+  /**
    * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
    *
    * 缺键语义是 `'sidebar'`「仅侧栏」（与 {@link nativeWebSearchCache} 同一方向）：
@@ -496,8 +526,20 @@ export class AccountPool {
   /** 首次访问时从后端载入账号列表、黑名单与锁定表。 */
   private ensureLoaded(): void {
     if (this.loaded) return
-    this.loaded = true
+    // ⚠️⚠️ **`loaded` 必须在 `load()` 成功之后才置位**（2026-11-05 三审 P0-1）。
+    //
+    // `load()` 在读盘失败时会**抛错**（`FileStore` 与 `SettingsStore` 均如此），
+    // 目的正是让「读不出来」与「没有文件」可区分。若先置位再读，一次瞬时
+    // 故障（文件被占用 / 磁盘错误 / settings 作用域抛错）就会让 `loaded`
+    // 永久为真而缓存保持空表，接着任何一次 `writeModels` / `writeAccounts`
+    // 的 `queueStoreSave()` 都会把这份**空缓存整体落盘**
+    // ⇒ 账号列表、模型黑名单、关闭意图、网关开关**永久丢失**，且本进程
+    // **永不**再读盘，全程零报错。
+    //
+    // 现在的语义：读失败 ⇒ 抛给调用方（RPC 层转成用户可见错误）⇒
+    // `loaded` 仍为假 ⇒ 下一次访问会重试读盘。
     const state = this.store.load()
+    this.loaded = true
     if (state !== undefined) {
       // ⚠️ 这里的 `state.accounts` **已经过去重**：两种后端（SettingsStore /
       // FileStore）的 `load()` 都经 `sanitizeAccounts`，而它按 id 去重。
@@ -520,6 +562,8 @@ export class AccountPool {
       this.gatewayAllowLanCache = state.gatewayAllowLan === true
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
+      // 会话负载均衡开关同理：老文档没有该键 → 保持默认启用。
+      this.sessionBalanceCache = state.sessionBalanceEnabled !== false
       // 面板入口同理：老文档没有该键（或值是脏值）→ 回到默认「仅侧栏」。
       // 过一遍 sanitize：store 层的 load 已归一，这里再判一次是因为老契约
       // 后端可能绕过 schema 直接给出原始文档。
@@ -627,6 +671,10 @@ export class AccountPool {
         //    重启后静默回到只绑回环（用户会以为开关坏了）。
         gatewayAllowLan: this.gatewayAllowLanCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
+        // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
+        //    漏键会让用户明确关闭的「会话负载均衡」在任何一次其它写入时被抹掉，
+        //    重启后静默回到开启。
+        sessionBalanceEnabled: this.sessionBalanceCache,
         // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
         //    漏键会让用户改过的面板入口在**任何**一次账号/黑名单/网关/顺序写入时
         //    被静默清掉，重启后入口又变回默认「仅侧栏」。
@@ -795,9 +843,16 @@ export class AccountPool {
    * ⇒ 语义定为：**「打开任意一个模型」= 用户想让这个供应商可用** ⇒ 清除意图，
    * 之后由派生判据（黑名单是否覆盖全目录）如实反映「还剩几个关着」。
    *
-   * ⚠️ 三个打开入口（`setModelDisabled(false)` / `clearModelsDisabled` /
+   * ⚠️ **三个**打开入口（`setModelDisabled(false)` / `clearModelsDisabled` /
    * `clearDisabledModels`）都在**本类内部**调用它 —— 调用方（RPC 层）不需要
    * 记得清，这正是「收口到一个实现」的目的。
+   *
+   * ⚠️ **第四个入口刻意不走这里**：`clearModelsWithProviderClosed`（见下）必须
+   * 「清黑名单 + 清意图」**一次落盘**（Gitee issue IKP8OF —— 分两次会在两次
+   * `replace` 之间留下「黑名单空 + 意图真」，重启后该供应商的模型选择器恒空）。
+   * 所以它**内联** `delete providerClosedCache[provider]`，而不是调本方法
+   *（本方法走 `setProviderClosed` ⇒ 独立落盘）。**这不是漏收口，是刻意的**：
+   * 谁要在这条路径上「顺手统一」成分两步的写法，就会把 IKP8OF 原样挖回来。
    */
   private async clearProviderClosed(provider: string): Promise<void> {
     if (this.providerClosedCache[provider] !== true) return
@@ -1143,6 +1198,37 @@ export class AccountPool {
   }
 
   /**
+   * 「ZCode 会话负载均衡」开关当前是否启用。
+   *
+   * 缺键语义为**启用**（见 {@link sessionBalanceCache}）。
+   *
+   * ⚠️ 调用方（`credential-resolver.ts` 与 `zcode-adapter.ts` 的选号路径）
+   * **必须每次现读**，不能缓存返回值：用户随时可能在 Jet Hub 页头切换。
+   */
+  sessionBalanceEnabled(): boolean {
+    this.ensureLoaded()
+    return this.sessionBalanceCache
+  }
+
+  /**
+   * 打开/关闭「ZCode 会话负载均衡」并落盘。
+   *
+   * 关闭后 ZCode 回到「手动顺序首个可用账号」的既有语义 —— 与开关加入前
+   * 逐字节同路径（`getAvailableAccount`），不经过 session 排序。
+   */
+  async setSessionBalanceEnabled(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.sessionBalanceCache === enabled) return
+    this.sessionBalanceCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，会话负载均衡开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
    * 「面板入口」的当前取值：Jet Hub 的唯一入口位置。
    *
    * 缺键语义为 `'sidebar'`「仅侧栏」（见 {@link panelEntryCache}）。
@@ -1250,6 +1336,11 @@ export class AccountPool {
    * "键存在且为 true 即隐藏"，配置文件也不会随开关操作无限膨胀。
    */
   async setModelDisabled(provider: string, modelId: string, disabled: boolean): Promise<void> {
+    // ⚠️ 六个写入方法里**只有这一处**曾漏掉 `ensureLoaded()`（2026-11-05 三审
+    // P0-2）：`model.setDisabled` 是 RPC 直入口（`src/jet-hub-rpc.ts:8948`），
+    // 脚本 / AI 助手可能直接调用而从未先跑 `list`。冷缓存下拿空表改一处再
+    // `writeModels` ⇒ 其它供应商的黑名单与关闭意图被整份抹掉。
+    this.ensureLoaded()
     const next: ModelDisableMap = { ...this.modelCache }
     const perProvider = { ...(next[provider] ?? {}) }
     if (disabled) perProvider[modelId] = true
@@ -1460,12 +1551,36 @@ export class AccountPool {
    *
    * @param provider - provider id
    * @param modelIds - 要**追加**进黑名单的 id（已有的关闭项不受影响）
-   * @param closed - 目标关闭意图（`true` 写入 / `false` 删除该键）
+   * @param closed - 目标关闭意图：`true` 写入 / `false` 删除该键 / `'keep'` **不动该键**
+   *
+   * ## ⚠️⚠️ 为什么必须有 `'keep'` 这一态（2026-11-04 真机报障）
+   *
+   * 用户报障：「为什么更新插件后供应商状态会发生变化，比如停用的供应商会被启用」。
+   *
+   * 本方法的第三参原本只有 `true` / `false`，而 `false` 被实现成
+   * **`delete providerClosed[provider]`**（删掉关闭意图）。于是「模型列表屏点一次
+   * 全关」（`model.setAllDisabled` 的 `closeProvider: false` 分支，本意是
+   * 「只关这家的模型、**不碰**供应商开关」）会**把用户先前用「关闭供应商」设下的
+   * 意图一起删掉**：
+   *
+   * ```
+   * ① 用户点「关闭供应商」 ⇒ providerClosed={accio:true} + 全量黑名单   ← 稳定
+   * ② 之后在模型列表屏对同一家点「全关」 ⇒ 删意图 ⇒ providerClosed={}
+   * ③ 插件更新 / 目录变长 ⇒ 派生判据 disabled!==total ⇒ 翻回「启用」
+   * ```
+   *
+   * 实测现场：用户的 `providerClosed` 只剩 `{accio:true}`，其余靠「关闭供应商」
+   * 关过的全都不见了 —— 它们在后续的「全关」里被静默删除。
+   *
+   * ⇒ `false` 只该由「打开供应商」路径使用（`provider.setEnabled(true)` 走
+   * `clearModelsWithProviderClosed`，语义确实是「清掉意图」）；**模型级的批量
+   * 关闭**必须传 `'keep'`：它既不该写意图（那会把整家关掉），也**不该删意图**
+   * （那会让用户先前设下的关闭状态失效）。
    */
   async writeModelsWithProviderClosed(
     provider: string,
     modelIds: readonly string[],
-    closed: boolean,
+    closed: boolean | 'keep',
   ): Promise<void> {
     this.ensureLoaded()
     const next: ModelDisableMap = { ...this.modelCache }
@@ -1475,10 +1590,14 @@ export class AccountPool {
       next[provider] = perProvider
     }
     this.modelCache = next
-    const nextClosed: ProviderClosedMap = { ...this.providerClosedCache }
-    if (closed) nextClosed[provider] = true
-    else delete nextClosed[provider]
-    this.providerClosedCache = nextClosed
+    // ⚠️ `'keep'` ⇒ 连 `providerClosedCache` 的浅拷贝都不做，让「不动」可验证
+    //（不是「拷一份再写回同一个值」那种看起来没变的实现）。
+    if (closed !== 'keep') {
+      const nextClosed: ProviderClosedMap = { ...this.providerClosedCache }
+      if (closed) nextClosed[provider] = true
+      else delete nextClosed[provider]
+      this.providerClosedCache = nextClosed
+    }
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单与关闭状态变更未落盘')
@@ -1585,11 +1704,77 @@ export class AccountPool {
   async setPermanentLocked(provider: string, locked: boolean): Promise<void> {
     if (provider.length === 0) return
     this.ensureLoaded()
-    const next: PermanentLockMap = { ...this.permanentLockCache }
+    /**
+     * ⚠️⚠️ **写前重读磁盘并按 provider 合并**（2026-11-01 三审实测的 D1）：
+     * 同机多 profile（desktop + web 共用一个 `$DSH_HOME`，正是本文件拆出独立
+     * 文档的既定场景）各自载入后，直接「读内存 → 改 → 整份写」会让**后写者
+     * 用自己那份陈旧内存覆盖先写者**。
+     *
+     * 实测（两个真实 node 进程）：A 锁 `magicrew`、B 锁 `magicrewintl`，后写的
+     * 一方把文件写成只剩自己那一个键 ⇒ **另一站的锁定静默消失**。而锁定消失
+     * 的后果不是显示问题，是**继续消耗永久积分，且烧掉不可撤回**。
+     *
+     * 故基线 = 磁盘现值 ∪ 本进程内存（本进程刚改的键可能还没被别的进程看到），
+     * 冲突时以**本次操作的那个 provider** 为准。
+     *
+     * ⚠️ 刻意**只解决写**、不加周期重读：让 `permanentLocked` 去 stat/读文件会
+     * 把「内存里刚改的新值」在落盘失败后被磁盘旧值覆盖（方向又反了）。
+     * 跨进程**读**的可见性仍是已知边界，见 `docs/agent-notes/protocol-wire.md`。
+     *
+     * ⚠️⚠️ **方向在四审改过一次，别改回去**（2026-11-01）：早先写的是
+     * `{ ...disk, ...memory }` —— 锁定值时域只有字面 `true`（`sanitizePermanentLocks`
+     * 只留 `true`、解锁是删键），所以那样合并恒等于**并集**：钱的方向安全
+     *（磁盘上的锁永不丢），但会**复活别的进程刚删掉的键** —— 实测：
+     * A 进程刚把 `buddy` 解锁 ⇒ 磁盘 `{}`；B 进程再锁别的 provider 时按自己那份
+     * 陈旧内存合并 ⇒ 磁盘又变回 `{ buddy: true }` ⇒ **用户解不开**。
+     *
+     * 现在的规则：**磁盘存在就以磁盘为准**（它是最新事实，能反映别的进程的解锁），
+     * 本进程内存只在「文档不存在」时兜底 —— 那时无法判断是「真的没锁」还是
+     * 「文档被删」，按「钱不可逆」的方向保留内存里的锁，绝不静默解锁。
+     */
+    const disk = this.reloadLocksFromDisk()
+    /**
+     * ⚠️⚠️ **`degraded` 时以内存为基线**（2026-11-02，PR #168 对抗审计 B3 实测）：
+     * 主文件与 `.bak` 都读不出来时，那份空表**不是事实**。旧实现只看 `disk.exists`
+     * ⇒ 用户再锁任意一家，其余几家的锁定就被这份空表覆盖，**并连同 `.bak` 一起**
+     * 写死 ⇒ 重启后 fail-open 被持久化、不可恢复（症状：永久积分照烧、无提示）。
+     */
+    const useDisk = disk.exists && disk.degraded !== true
+    const next: PermanentLockMap = useDisk ? { ...disk.locks } : { ...this.permanentLockCache }
     if (locked) next[provider] = true
     else delete next[provider]
+    /**
+     * ⚠️⚠️ **落盘失败必须回滚内存**（2026-11-02，对抗审计 B4 实测）：
+     * 旧实现先改内存再 `await persistLocks()`，一次并发写失败（`EPERM`/`ENOENT`，
+     * 两进程共用 `$DSH_HOME` 时真实存在）会让内存**领先磁盘**；用户随后再动
+     * 任意一家的锁，那条「内存有、磁盘没有」的记录就被「磁盘优先」删掉
+     * ⇒ 锁定静默失效（实测：`magicrew` 从 `true` 变 `false`）。
+     * 回滚后磁盘与内存始终一致，失败的锁定对用户是**可见的报错**而不是隐身状态。
+     */
+    const previous = this.permanentLockCache
     this.permanentLockCache = next
-    await this.persistLocks()
+    try {
+      await this.persistLocks()
+    } catch (error) {
+      this.permanentLockCache = previous
+      throw error
+    }
+  }
+
+  /**
+   * 直接读一次权威文档（不触碰内存表、不做迁移）。
+   *
+   * 存在的唯一理由是 `setPermanentLocked` 的写前合并；读失败返回空表 ——
+   * 合并语义下「读不到 = 没有别人的键可保留」，比抛错让按钮失败更合适
+   * （真正的落盘保护在 `FileLockStore`：损坏时回落 `.bak`）。
+   */
+  private reloadLocksFromDisk(): PermanentLockRead {
+    try {
+      return this.lockStore.load()
+    } catch (error) {
+      this.ctx.logger?.warn?.(`[jet-hub] 锁定表重读失败（按本进程内存处理）: ${String(error)}`)
+      return { exists: false, locks: {} }
+    }
   }
 
   /**
@@ -1654,10 +1839,11 @@ export class AccountPool {
       }
       results.push(status)
     }
-    // 稳定视图排序：可用在前、限流中沉底（Array.prototype.sort 在现代引擎是稳定的）。
+    // 稳定视图排序：可用在前、限流中与**被封禁**沉底（Array.prototype.sort 在现代引擎是稳定的）。
     const now = Date.now()
     const isLimited = (a: ProviderAccountStatus) =>
-      Object.values(a.modelRateLimits ?? {}).some(resetAtMs => resetAtMs > now)
+      isPolicyBlockedAccount(a)
+      || Object.values(a.modelRateLimits ?? {}).some(resetAtMs => resetAtMs > now)
     return results.sort((a, b) => Number(isLimited(a)) - Number(isLimited(b)))
   }
 
@@ -2129,16 +2315,23 @@ export class AccountPool {
    * @param provider - provider id（如 `zcode`）。
    * @param field - 凭据里用作身份判据的字段名（如 `user_id`）。
    * @param identity - 要比对的值（空串直接返回 `''`，调用方据空串放弃去重）。
+   * @param excludeAccountId - 可选：跳过这个账号 id。
+   *   ⚠️ **登录后判重的调用点必须传本次新建的占位 id**：新条目的凭据在查重
+   *   **之前**就已写入，不排除它会「自己匹配自己」，而本方法只返回**第一个**
+   *   匹配 ⇒ 判重是否成立取决于条目顺序（一次拖动排序就静默失效，2026-11-03
+   *   对抗审计实测：新条目被重排到前面后两条同账号卡片都保持启用）。
    * @returns 匹配到的账号 id；无匹配返回空串。
    */
   async findAccountIdByIdentityField(
     provider: string,
     field: string,
     identity: string,
+    excludeAccountId?: string,
   ): Promise<string> {
     if (identity.length === 0) return ''
     for (const entry of this.readAccounts()) {
       if (entry.provider !== provider) continue
+      if (excludeAccountId !== undefined && entry.id === excludeAccountId) continue
       const resolved = await this.resolveCredentialByRef(entry.credentialRef)
       if (resolved === undefined) continue
       const value = resolved[field]
@@ -2250,6 +2443,78 @@ export class AccountPool {
   }
 
   /**
+   * 记账：该账号**被上游策略封禁**（Gitee issue IKS2MV）。
+   *
+   * 与 {@link updateModelRateLimit} 的**分工**（别合并）：
+   * - 限流 = 单个模型、会自己好、有明确重置时刻 ⇒ 写 `modelRateLimits` 那本账；
+   * - 封禁 = 整个账号、只能重新登录 / 人工解封、上游**不给时刻** ⇒ 写本方法。
+   *
+   * 调用点在 `buddy-adapter.ts` 的 `markPolicyBlockedAccount`（6 处 11140 命中）。
+   * 那里**同时**保留 30 分钟逐模型冷却 —— 那个解决「本轮别反复重撞」，
+   * 与「状态展示 / 账号级排除」是两件事（issue 作者明确要求不要动冷却）。
+   *
+   * ⚠️ `policyBlockedAtMs` 取**首次**观测时刻（幂等）：用户排查时最需要知道
+   * 「什么时候开始被封的」，反复写入会把那一刻冲掉。
+   */
+  async markAccountPolicyBlocked(accountId: string, message?: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) return
+    const current = accounts[idx]!
+    const wasBlocked = isValidResetAtMs(current.policyBlockedAtMs)
+    const trimmed = typeof message === 'string' && message.trim().length > 0 ? message.trim().slice(0, 200) : undefined
+    /**
+     * 已标记且报文未变 ⇒ **直接返回，不写盘**。
+     *
+     * ⚠️ 这是响应写放大的（对抗审计 E4 实测：同一账号连撞 3 次 11140 = **6 次落盘**，
+     * 每次事件两笔账各写一次，且第 2 次起状态根本没变）。封禁账号虽已被选号侧排除，
+     * 但「手动探活 / 多实例并发」仍可能重复命中同一条报文 —— 每次都是全量
+     * accounts 的读-改-写，没必要为「同一个事实」重复付。
+     */
+    if (wasBlocked && (trimmed === undefined || trimmed === current.policyBlockedMessage)) return
+    const atMs = wasBlocked ? current.policyBlockedAtMs : Date.now()
+    const next = [...accounts]
+    next[idx] = {
+      ...current,
+      policyBlockedAtMs: atMs,
+      ...trimmed === undefined ? {} : { policyBlockedMessage: trimmed },
+    }
+    await this.writeAccounts(next)
+    this.ctx.logger?.warn?.(
+      `[jet-hub] 账号 ${accountId} 被上游策略封禁（${message ?? '上游未给原因'}）`
+      + ' —— 已标记为「需重新登录」，面板会显示红色徽标；实测通过或手动重置后自动清除。',
+    )
+  }
+
+  /**
+   * 清除封号标记。
+   *
+   * 三个调用点（与 `ProviderAccountEntry.policyBlockedAtMs` 的注释一一对应）：
+   * 实测成功（`account.retest` 的「全部标记模型都通过」判据）、
+   * 用户手动重置（`account.reset` / `account.resetAll`）、账号删除（随条目一起没了）。
+   *
+   * ⚠️ **不含 `account.test`**：它只测一个模型（且优先挑最老的那个限流键），
+   * 判据强度不足以证明「账号没被封」（2026-11-01 对抗审计实测会洗白）。
+   *
+   * @returns 是否真的清掉了一条标记（没有标记时 `false`，调用方可据此决定要不要写日志）。
+   */
+  async clearAccountPolicyBlocked(accountId: string): Promise<boolean> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) return false
+    const current = accounts[idx]!
+    if (!isPolicyBlockedAccount(current)) return false
+    const next = [...accounts]
+    const updated = { ...current }
+    delete updated.policyBlockedAtMs
+    delete updated.policyBlockedMessage
+    next[idx] = updated
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 已清除账号 ${accountId} 的封禁标记（实测通过 / 手动重置）`)
+    return true
+  }
+
+  /**
    * 获取指定 provider + 模型的下一个可用账号。
    *
    * `modelId` 为空串时**不做限流过滤**——调用方（provider 的
@@ -2310,16 +2575,7 @@ export class AccountPool {
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
   ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
-    const candidates = this.readAccounts()
-      .filter(a => a.provider === provider && a.enabled)
-      .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
-      .filter(a => {
-        // 空 modelId（未知目标模型）：无可比对的键，保持候选不变。
-        if (modelId.length === 0) return true
-        if (!a.modelRateLimits) return true
-        const resetAt = a.modelRateLimits[modelId]
-        return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
-      })
+    const candidates = this.candidateAccounts(provider, modelId, excludeAccountIds)
     if (candidates.length === 0) return null
     // 候选顺序即**用户在 Jet Hub 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
     //
@@ -2327,12 +2583,119 @@ export class AccountPool {
     // 那个排序会让手动顺序形同虚设 —— 用户把某账号拖到首位，只要另一个
     // 账号的限流重置时间更早，实际选中的仍是后者，拖拽变成纯 UI 装饰。
     // 现在的语义是「手动顺序优先，限流豁免」：顺序完全由用户决定，
-    // 而当前正处于限流期的账号已被上面的 filter 排除，不会选到。
+    // 而当前正处于限流期的账号已被候选筛排除，不会选到。
     //
     // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
     // 顺序，故这里天然就是手动顺序，无需任何排序。
-    //
-    // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
+    return await this.resolveFirstCredential<TCredential>(provider, candidates)
+  }
+
+  /**
+   * 按 **sessionId** 选号（ZCode 专用，2026-10-30 用户要求）。
+   *
+   * - `sessionId` 非空：用 rendezvous 哈希把同一会话**稳定映射**到同一个候选
+   *   账号（会话亲和），不同会话自动分散到不同账号；账号集合变化时只迁移
+   *   原本落在该账号上的会话。
+   * - `sessionId` 为空/未传：随机洗牌后取第一个可用账号（本地 OpenAI 网关等
+   *   不带 DSH 会话标识的请求，随机均衡）。
+   *
+   * ⚠️ 本方法**刻意覆盖手动顺序** —— 这是 ZCode 用户明确要求的负载均衡语义。
+   * 其余 provider 继续走 {@link getAvailableAccount}（手动顺序优先），不受影响。
+   *
+   * `excludeAccountIds` 与 {@link getAvailableAccount} 同义：请求级换号时
+   * 排除刚失败的账号，避免拿回同一个。
+   */
+  async getAvailableAccountForSession<TCredential = CodeArtsCredential | BuddyCredential>(
+    provider: string,
+    modelId: string,
+    sessionId?: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
+    const candidates = this.candidateAccounts(provider, modelId, excludeAccountIds)
+    if (candidates.length === 0) return null
+    const ordered = sessionId !== undefined && sessionId.length > 0
+      ? // ⚠️ 溢出均衡（2026-10-31 用户报障「每个账号的负载并不太均衡」）。
+        //
+        // 语义是**上限（cap）不是均衡器**：账号今日请求数达阈值后整组沉底，
+        // 于是**新会话**落到还有余量的号上；而一个**正在跑的会话**，一旦它所在
+        // 账号越过阈值，下一次请求就会迁移 —— 本修法正是靠这次迁移把长会话摊开的
+        // （**不是**「已有会话保持亲和」，初版这么写是错的，见
+        // `session-balance.ts` 的 `rankAccountsBySessionWithOverflow` 长注释）。
+        //
+        // 阈值 env `DSH_ZCODE_SESSION_BALANCE_OVERFLOW_REQUESTS`（缺省 300，0=关闭）。
+        // 负载数据源 = token-ledger 日聚合（纯内存读，零网络请求，实测 ~1 µs）。
+        //
+        // ⚠️ 账本读取**不得反噬推理**（与 `src/index.ts` 记账处同一条纪律）：
+        // 记账后端是外部注入点，`load()` 抛错不该让选号整体失败 —— 失败时按
+        // 「读不到负载」处理，即全员 fresh，退回纯哈希亲和（与没装这个功能逐字节
+        // 同语义）。**不要**为了「看得见错误」把它改成 rethrow：那会让一次统计
+        // 故障变成整条推理链路不可用。
+        rankAccountsBySessionWithOverflow(
+          candidates,
+          sessionId,
+          provider,
+          this.sessionLoadIndex(provider),
+          overflowRequestsThreshold(),
+        )
+      : shuffleAccounts(candidates)
+    return await this.resolveFirstCredential<TCredential>(provider, ordered)
+  }
+
+  /**
+   * 今日账号负载索引（`provider` 维度）；任何读取异常都退化为**空表**。
+   *
+   * 抽成方法是为了让「失败兜底」只有一份实现（`getAvailableAccountForSession`
+   * 与将来的调用点共用），也让单测能单独验证兜底语义（见
+   * `tests/unit/session-balance.spec.ts` 的「账本读取抛错」用例）。
+   */
+  private sessionLoadIndex(provider: string): ReturnType<typeof accountLoadIndex> {
+    try {
+      return accountLoadIndex(readTokenLedgerDayMap(), provider, utc8DayKey(Date.now()))
+    } catch {
+      return new Map()
+    }
+  }
+
+  /**
+   * 选号候选：`provider` + `enabled` + 不在 `excludeAccountIds` + 目标模型未限流。
+   *
+   * 与 {@link getAvailableAccount} / {@link getAvailableAccountForSession} 共用，
+   * 避免同一判据出现两份实现（两份必然漂移）。
+   */
+  private candidateAccounts(
+    provider: string,
+    modelId: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): ProviderAccountEntry[] {
+    return this.readAccounts()
+      .filter(a => a.provider === provider && a.enabled)
+      .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
+      // 封禁是**账号级**：11140 判的是账号（issue IKS2MV 的实测表：11 个账号里
+      // 8 个被 11140 限制、1 个 429、2 个正常；报文语义是「账号存在异常行为」）。
+      // 故这里**不看模型**，只要标记存在就排除整个账号。
+      // ⚠️ 该判据有**两份**实现：本方法与 `credential-resolver.ts` 的 `candidatesOf`
+      //    （主请求路径走后者），改动必须同步（对抗审计 E8 实测过只改一份的后果）。
+      // 清除路径见 `clearAccountPolicyBlocked`（实测通过 / 手动重置）。
+      .filter(a => !isPolicyBlockedAccount(a))
+      .filter(a => {
+        // 空 modelId（未知目标模型）：无可比对的键，保持候选不变。
+        if (modelId.length === 0) return true
+        if (!a.modelRateLimits) return true
+        const resetAt = a.modelRateLimits[modelId]
+        return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+      })
+  }
+
+  /**
+   * 按给定顺序逐个解析凭据，返回第一个可用账号；坏的跳过并记录原因。
+   *
+   * 抽成私有方法是为了让「手动顺序」与「sessionId / 随机顺序」共用**同一份**
+   * 凭据解析与日志语义 —— 否则两条选号路径对「凭据损坏」的处理会分叉。
+   */
+  private async resolveFirstCredential<TCredential>(
+    provider: string,
+    candidates: readonly ProviderAccountEntry[],
+  ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
     const failures: string[] = []
     for (const entry of candidates) {
       let resolved

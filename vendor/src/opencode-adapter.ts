@@ -45,12 +45,14 @@ import {
 import { listIdentitySlots, type IdentitySlot } from './opencode-auth.js'
 import { deriveRequestId, deriveSessionId, opencodeHeaders, opencodeUserAgent } from './opencode.js'
 import { buildOpencodeRequest } from './opencode-messages.js'
+import { bunTlsFetch, BunTlsUnavailableError } from './opencode-bun-tls.js'
 import { normalizeOpencodeResponse } from './opencode-stream.js'
 import {
   getOpencodeCapabilitiesSync, opencodeEffortName, supportsOpencodeImage,
   type OpencodeModelCapability,
 } from './opencode-capability.js'
 import { proxyFetch } from './opencode-proxy.js'
+import type { NormalizedProxy } from './opencode.js'
 import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
@@ -663,19 +665,31 @@ export class OpencodeAdapter extends LlmAdapter {
       body: JSON.stringify(request.payload),
       ...options.signal !== undefined ? { signal: options.signal } : {},
     }
-    // ⚠️ 走 `proxyFetch` 而不是裸 `fetch`：有代理时它会把请求交给**与
-    // dispatcher 同源**的 undici fetch。用全局 fetch 会造成跨实例 handler
-    // 契约冲突（Node 22/24 上恒失败），详见 `opencode-proxy.ts` 的 `proxyFetch`。
-    // 它内部处理「无代理时退回全局 fetch」，故这里不再自行分支。
+    // ⚠️ 传输层：**可用时走 Bun 指纹**（`bunTlsFetch`），不可用时回退 `proxyFetch`。
+    //
+    // 为什么需要 Bun 指纹：上游免费档按**传输层**识别客户端，Node/curl 的
+    // OpenSSL 握手在 body 与头完全一致时仍恒 429（2026-10-26 真机实测，
+    // 对照矩阵见 `opencode-bun-tls.ts` 的文件头）。免费与付费**共用同一条
+    // 请求路径**，故这里不分叉：两条都会先试 Bun 指纹。
+    //
+    // ⚠️ 回退**只对**「模块加载不到」这一类（`BunTlsUnavailableError`）：
+    // 那时请求**还没发出去**，重发是安全的。若把「请求真的失败了」也回退，
+    // 401/429 会被静默重发一次（同一次失败记两笔账、还可能多烧一次额度）。
+    //
+    // ⚠️ 仍走 `proxyFetch` 而不是裸 `fetch`：有代理时它把请求交给**与
+    // dispatcher 同源**的 undici fetch，跨实例 handler 契约冲突会导致
+    // Node 22/24 上恒失败（见 `opencode-proxy.ts` 的 `proxyFetch`）。
     // 只约束响应头等待；头到达即撤销定时器，不能误杀长回答。
     const headerController = new AbortController()
     const headerTimer = setTimeout(() => headerController.abort(new LlmError('opencode: 等待响应头超时', 'TIMEOUT')), OPENCODE.chatHeaderTimeoutMs)
+    const url = `${OPENCODE.baseUrl}${OPENCODE.chatPath}`
+    const bounded: RequestInit = {
+      ...init,
+      signal: options.signal === undefined ? headerController.signal : AbortSignal.any([options.signal, headerController.signal]),
+    }
     let response: Response
     try {
-      response = await proxyFetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, {
-        ...init,
-        signal: options.signal === undefined ? headerController.signal : AbortSignal.any([options.signal, headerController.signal]),
-      }, slot.proxy)
+      response = await this.fetchWithBunFingerprint(url, bounded, slot.proxy)
     } catch (error) {
       if (headerController.signal.aborted) throw headerController.signal.reason
       throw error
@@ -716,6 +730,45 @@ export class OpencodeAdapter extends LlmAdapter {
     } finally {
       // 共享消费器只 releaseLock；提前结束、取消与抛错都由本渠道释放前置流/上游。
       await normalized.body?.cancel().catch(() => {})
+    }
+  }
+
+  /**
+   * 传输层：先用 Bun 指纹发，**模块加载不到时**才回退常规 fetch。
+   *
+   * ## 为什么免费与付费共用这一条（不分叉）
+   *
+   * 两者的请求形状**逐字节相同**，差别只在「用哪个槽 / key 能不能过免费判定」
+   * （见 `pickSlot`）。传输层若按付费/免费分叉，等于凭一个未经证实的假设
+   * 分两套判据 —— 本仓库的红线。实测旁证：付费模型名 + 匿名 key 回的是
+   * **401 `AuthError`**（鉴权层拒绝，不是门禁层），说明两条通道的门禁位置不同，
+   * 但都受益于「更像官方客户端」。
+   *
+   * ## 回退的边界（只这一种）
+   *
+   * 只接 {@link BunTlsUnavailableError}：它意味着**请求还没发出去**
+   * （模块解析失败），重发不会产生双份副作用。其它错误一律原样抛给轮换层 ——
+   * 把 401/429 也回退会让同一次失败既记账又重发。
+   *
+   * ## ⚠️ 这里**刻意不调 `warn`**
+   *
+   * 回退是**静默**的。理由：本方法在 `streamVia` 里逐请求调用，而
+   * `warn` 在本仓库是**协议层诊断**的通道 —— 响应层剔调用时的用例用
+   * `toHaveBeenCalledTimes(1)` 精确计数（`opencode-stream.spec.ts` 多处）。
+   * 传输层往里插一条会让那些计数变成 2、把「剔除留痕」的判据淹成噪音。
+   * 可观测性改由 {@link bunTlsUnavailableReason} 对外暴露，由接线层
+   * （`index.ts`）在**启动期**读一次并记日志。
+   */
+  private async fetchWithBunFingerprint(
+    url: string,
+    init: RequestInit,
+    proxy: NormalizedProxy | undefined,
+  ): Promise<Response> {
+    try {
+      return await bunTlsFetch(url, init, proxy)
+    } catch (error) {
+      if (!(error instanceof BunTlsUnavailableError)) throw error
+      return await proxyFetch(url, init, proxy)
     }
   }
 }

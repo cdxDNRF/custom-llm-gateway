@@ -44,7 +44,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { codeartsAcceptsImage, codeartsVisionModel, PROVIDER } from './llm-adapter.js'
+import { codeartsVisionModel } from './llm-adapter.js'
 // ⚠️ 工具名与「该不该给这个路由」的判据**唯一定义在叶子模块** `codearts-vision.ts`：
 //    注册期包装（`llm-register-compat.ts` 逐请求从非 codearts 路由的工具表里摘掉
 //    本工具）要用同一份判据，而它不能 import 本文件/`llm-adapter.ts`（会成环）。

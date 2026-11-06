@@ -129,7 +129,7 @@ export interface CheckinStatus {
  * 回答**「我这条结果覆盖的是不是今天这一轮」：
  * - `coversToday` 缺省视为 `true` ⇒ 绝大多数渠道（每日签到语义）一行不用改；
  * - 观察到的是「刷新前的那一轮」时置 `false`。
- * 于是记账方（`auto-checkin.ts` 的 `shouldMarkToday`）根本不需要知道任何渠道的
+ * 于是记账方（`auto-checkin.ts` 的逐渠道水位线）根本不需要知道任何渠道的
  * 日界细节，只要数「有几条能证明今天已被处理」。
  *
  * ⚠️ 判据只能由**看得见该渠道刷新语义的那一层**给出（当前是 `qoder-credits.ts`），
@@ -199,6 +199,16 @@ export interface CreditPackage {
   remaining: number
   /** 本计费周期总额度（精确值） */
   total: number
+  /**
+   * `total` 是否是**上游真实下发的周期总额**。
+   *
+   * 缺失/`true` = 总额已知，面板可以显示 `remaining / total`；
+   * `false` = 上游只给当前余额，**没有**初始总额。此时 `total` 只能冗余填
+   * `remaining`（类型要求 number），面板**不得**把两者并列显示 ——
+   * 否则每次消耗后都会出现 `100/100 → 98/98` 这种「分母跟着余额跑」的假读数
+   * （用户 2026-11-05 报障）。
+   */
+  totalKnown?: boolean
   /** 本计费周期已用额度（精确值） */
   used: number
   /**
@@ -215,6 +225,13 @@ export interface CreditPackage {
   cycleEndTime: string
   /** 该包自身的失效时间（可能为空 = 无固定失效时间） */
   expiredTime: string
+  /**
+   * 无法归一成时间戳、但平台确实给出的到期说明（如「每日 00:00（UTC+8）过期」）。
+   *
+   * 仅用于展示；`deductionEndTime` / `expiredTime` 都没有时，用它替代「长期」。
+   * ⚠️ 不要把猜测的零点写进来 —— 只有平台文档/响应明确给出时才填。
+   */
+  expiryNote?: string
   /**
    * 该包的**扣费截止时间**（毫秒时间戳；实测缺失或 0 = 服务端未下发）。
    *
@@ -423,6 +440,23 @@ export interface CreditBalance {
    *    只是**逐包到期信息不可用**。故它不能替代 `error`（后者表示「连总额都没拿到」）。
    */
   degraded?: boolean
+  /**
+   * 本周期**用量**（可选；与 `total` / `packages` 无关，**不是**可用额度）。
+   *
+   * ## 为什么单开一个字段（2026-11-02 三审 F🟡-8）
+   *
+   * 百智云的用量接口会给「本月消耗」，而当时把它塞进了 `packages`（并标
+   * `active: false`）—— 结果面板把它渲染成「[**已失效**] 本月消耗: 0 / 364.95」：
+   * 量词完全错了（用量不是一个「失效了的资源包」），而且它会参与
+   * 资源包个数统计（`N/M 个资源包有效`）与临期档折算。
+   * 用量不属于「额度」任何一类 ⇒ 它只能走独立通道。
+   */
+  usage?: {
+    /** 展示名（如「本月消耗」）。 */
+    label: string
+    amount: number
+    unit: string
+  }
 }
 
 /**

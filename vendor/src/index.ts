@@ -42,7 +42,7 @@ import { foldReasonErrors } from './locked-error-text.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES, type ImageRequestTarget } from './image-budget.js'
-import { buildRaccoonNickname, registerJetHubRpc, type JetHubAuthLike } from './jet-hub-rpc.js'
+import { buildRaccoonNickname, registerJetHubRpc, type JetHubAuthLike, type ModelCatalogSource } from './jet-hub-rpc.js'
 import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
@@ -97,6 +97,13 @@ import { fetchQoderBalanceDetailed, fetchQoderCreditBalance } from './qoder-cred
 // ⚠️ astudio 的 `fetchAstudioCreditBalance` 是 2026-10-20 为「永久积分锁定」新增的
 //    薄封装（压平 `fetchAstudioBalanceDetailed` 的 `{balance, error?}` 成
 //    `CreditBalance | null`）。两个变体**都接**（见上方长注释），选号器优先用 Detailed。
+import { MagicrewAuth } from './magicrew-auth.js'
+import type { MagicrewCredential } from './magicrew-auth.js'
+import { fetchMagicrewBalance, fetchMagicrewBalanceDetailed } from './magicrew-credits.js'
+import { MagicrewService } from './magicrew.js'
+import { MAGICREW, MAGICREW_INTL } from './magicrew-product.js'
+import type { MagicrewProduct } from './magicrew-product.js'
+import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { fetchAstudioBalanceDetailed, fetchAstudioCreditBalance } from './astudio-credits.js'
 // ⚠️ MiniMax 两站的 `fetchMinimaxCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
 //    它是 `fetchMinimaxCreditBalanceDetailed` 的薄封装。两个变体**都接**。
@@ -117,6 +124,8 @@ import { fetchAutoclawBalanceDetailed, fetchAutoclawCreditBalance } from './auto
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
+// ⚠️ 2026-10-24 本地试验版：journal 落盘根目录（`~/.dsh`，与 state.json 同源）。
+import { resolveJetHubHome } from './jet-hub-store.js'
 // ⚠️ MiniMax 国际站的**账号出口代理**解析器（与 gemini 同款：实例住在被依赖
 //    方向的下游，避免 `index → jet-hub-rpc → index` 的 ESM 环 —— 那条环会把
 //    引用变成 TDZ ⇒ 静默恒直连）。
@@ -189,6 +198,39 @@ import { ModelscopeAuth } from './modelscope-auth.js'
 import { ModelscopeAdapter, registerModelscopeLlm } from './modelscope-adapter.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import { modelscopeModelsUrl, modelscopeHeaders, type ModelscopeCredential } from './modelscope.js'
+// ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 qiniu）。七牛云 AI 与 modelscope
+// **同格**：OpenAI 兼容 + 长期有效的静态 API Key（无 refresh、无余额端点），
+// 故整套实现是 modelscope 范式的镜像。见 `src/qiniu-product.ts` 模块头的出处表。
+import { QiniuAuth } from './qiniu-auth.js'
+import { QiniuAdapter, registerQiniuLlm } from './qiniu-adapter.js'
+import { QINIU } from './qiniu-product.js'
+import { qiniuModelsUrl, qiniuHeaders, type QiniuCredential } from './qiniu.js'
+// MonkeyCode（`monkeycode` / `monkeycodeintl`，2026-11-02）：**本 fork 独有**。
+// 无 OAuth，但**主路径是浏览器登录**（`loginViaBrowser()` 开窗读 cookie；四审
+// H-3 更正：此前这里写成「粘贴静态 Key、无登录」），粘贴 Key 只是备用入口。
+// 协议层是 **Anthropic Messages**（两条通道都是），故消息/SSE 复用
+// `src/minimax-messages.ts`。
+// ⚠️ 两条通道的**模型清单来源不同**：白泽有 `GET /v1/models`（动态拉、
+// 失败回退内置表），网关**没有列出接口**（405）⇒ 用 `MONKEYCODE_GATEWAY_MODELS`。
+import { MonkeycodeAuth } from './monkeycode-auth.js'
+import { MonkeycodeAdapter, registerMonkeycodeLlm } from './monkeycode-adapter.js'
+import { MONKEYCODE, MONKEYCODE_INTL, type MonkeycodeProduct } from './monkeycode-product.js'
+// 百智云（`baizhi`，2026-11-02）：凭据是长期静态 `sk-…`（实测 67 位），**主路径**
+// 是浏览器登录后从「大模型商店」取
+// （`https://ai-models.app.baizhi.cloud/console/api-keys`，四审 H-3 更正：此前
+// 这里写成「用户手工粘贴」），手工粘贴只是备用；直连
+// `https://ai-models.app.baizhi.cloud/api/anthropic`（Anthropic Messages 协议），
+// **按量计费**、无每日额度/签到 —— 与 MonkeyCode 两站是不同产品线。
+import { BaizhiAuth } from './baizhi-auth.js'
+import { BaizhiAdapter, registerBaizhiLlm } from './baizhi-adapter.js'
+import { BAIZHI } from './baizhi-product.js'
+import type { BaizhiCredential } from './baizhi.js'
+import {
+  monkeycodeHeaders,
+  monkeycodeGatewaySignature,
+  monkeycodeSigningPrompt,
+  type MonkeycodeCredential,
+} from './monkeycode.js'
 import type { ZcodeCredential } from './zcode.js'
 import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -708,6 +750,69 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       product: MODELSCOPE,
       // ⚠️ 不传 `warn`：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
       //    此处**没有 `ctx`**。与 cline / lobsterai 的 probe 条目同款。
+    }),
+  },
+  // 七牛云 AI（**本 fork 独有**）—— 与 modelscope 同格：静态 API Key、OpenAI 兼容。
+  // 探测同样只喂**这一份凭据**（单槽），不需要池；`fetchRemoteCatalog` 留空
+  // （`/v1/models` 实测免鉴权也回 200 ⇒ 目录探测不构成「凭据有效」的证据）。
+  qiniu: {
+    createProbeAdapter: (ref, credential) => new QiniuAdapter({
+      credentialRef: credentialRef(ref),
+      slots: async () => [{ id: QINIU.id, apiKey: (credential as QiniuCredential).access_token }],
+      product: QINIU,
+    }),
+  },
+  // MonkeyCode（**本 fork 独有**）—— 粘贴静态 Key 型渠道，探测只喂**这一份凭据**。
+  //
+  // ⚠️ **不传 `fetchRemoteModels`**：探测要判的是「这份凭据能不能推理」，而
+  //    白泽模型目录**实测免鉴权也回 200**（与 qiniu `/v1/models` 同款性质）
+  //    ⇒ 目录能读到**不构成**凭据有效的证据。探测直接用内置清单 + 真实补全请求。
+  // ⚠️ 不传 `warn`：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
+  //    此处**没有 `ctx`**。
+  monkeycode: {
+    createProbeAdapter: (ref, credential) => new MonkeycodeAdapter({
+      credentialRef: credentialRef(ref),
+      slots: async () => [{
+        // ⚠️ `accountId` 只用于限流标记；探测路径没有池，给一个固定占位
+        //    （不会写进任何池 —— 适配器只在 `accountPool !== undefined` 时才写）。
+        accountId: MONKEYCODE.id,
+        credential: credential as MonkeycodeCredential,
+      }],
+      product: MONKEYCODE,
+    }),
+  },
+  // MonkeyCode 国际站（`monkeycodeintl`）—— 与国内站逐行同构，只差 `product`。
+  //
+  // ⚠️ 必须**单独一条**：`probeById` 是按 provider id 取工厂的，漏了这一条
+  //    ⇒ 国际站账号卡片上的「重测」按钮点了没反应（`probeAdapter` 查不到
+  //    就直接回「不支持探测」，全程静默）。
+  monkeycodeintl: {
+    createProbeAdapter: (ref, credential) => new MonkeycodeAdapter({
+      credentialRef: credentialRef(ref),
+      slots: async () => [{
+        accountId: MONKEYCODE_INTL.id,
+        credential: credential as MonkeycodeCredential,
+      }],
+      product: MONKEYCODE_INTL,
+    }),
+  },
+  // 百智云（`baizhi`）—— 静态 `sk-` Key 直连，无平台登录态、无每日额度。
+  //
+  // ⚠️ 必须**单独一条**：`probeById` 是按 provider id 取工厂的，漏了这一条
+  //    ⇒ 百智云账号卡片上的「重测」按钮点了没反应（查不到就直接回「不支持
+  //    探测」，全程静默）。
+  // ⚠️ 不传 `warn`：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
+  //    此处**没有 `ctx`**。
+  baizhi: {
+    createProbeAdapter: (ref, credential) => new BaizhiAdapter({
+      credentialRef: credentialRef(ref),
+      slots: async () => [{
+        // ⚠️ `accountId` 只用于限流标记；探测路径没有池，给一个固定占位
+        //    （不会写进任何池 —— 适配器只在 `accountPool !== undefined` 时才写）。
+        id: BAIZHI.id,
+        apiKey: (credential as BaizhiCredential).access_token,
+      }],
+      product: BAIZHI,
     }),
   },
   // ZCode（智谱）→ Anthropic Messages 体 + 阿里云 captcha 参数。
@@ -1905,10 +2010,16 @@ export function apply(ctx: Context): void {
    *
    * ## ⚠️ 位置约束（与 astudio 那处同理）
    *
-   * 本函数放在 `loomyLockedError` **之前**是有意的：`loomy-balance-error-contract.spec.ts`
-   * 用「`const loomyLockedError` 到 `const buddy = new BuddyAuth`」切片来核对 Loomy 的
-   * 错误码（Loomy 用可重试的 `TRANSPORT`，本家必须用不可重试的 `QUOTA_EXCEEDED`）。
-   * 插进那个区间会让该用例把本家的码当成 Loomy 的核对而**必然变红**。
+   * 本函数放在 `loomyLockedError` **之前**，理由是**可读性**（同一屏内与 autoclaw 等
+   * 同样使用 `QUOTA_EXCEEDED` 的锁定错误排在一起），**不是**为了躲某个切片。
+   *
+   * ⚠️⚠️ **原先这里写的是「插进 Loomy 区间会让 `loomy-balance-error-contract.spec.ts`
+   * 必然变红」—— 那是错的**（2026-11-01 二审实测）：该 spec 的终点锚点早在
+   * 2026-10-20 就从 `const buddy = new BuddyAuth` 换成了 `'\n  const '`（下一个同级
+   * 声明），它自己的注释 `:35-47` 明写「就是为了别人插 const 时不再被迫挪顺序」。
+   * 实测在该区间插一个用 `'QUOTA_EXCEEDED'` 的同级 const，那个切片**逐字节不变**。
+   * ⇒ 位置的真正守卫是 `tests/unit/magicrew-lock-wiring.spec.ts` 的
+   * `expect(mine).toBeLessThan(loomy)`，不要再靠「会变红」这种口耳相传的理由排序。
    */
   const autoclawLockedError = (displayName: string) =>
     (reason: BuddyNoAccountReason): Error => {
@@ -1986,6 +2097,144 @@ export function apply(ctx: Context): void {
         + '积分（AutoClaw 的**带到期时间的发放批次** —— 钱包流水里那些'
         + '带有效期的「每日签到 / 登录奖励」等发放）都已用尽。'
         + '**永久桶**（流水里**不带到期时间**的那些发放）在锁定状态下动不到它们'
+        + ' —— 这是锁定的预期效果。'
+        + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待下一次签到 / 活动发放。`,
+        'QUOTA_EXCEEDED',
+      )
+    }
+
+  /**
+   * Magicrew（国内 `magicrew` / 国际版 `magicrewintl`）的
+   * 「锁定永久积分 + 无可用账号」报错文案（2026-11-01 用户要求加锁定）。
+   *
+   * ## 本家的积分形状（决定文案能说什么、不能说什么）
+   *
+   * `GET /api/v1/quota/points/total` 只给两样东西：`total_points` 与
+   * `expiring_quota_details[]`（**带到期时间**的批次）。两者的差额是上游
+   * **不下发任何到期时间**的积分 —— 也就是用户口径的**永久积分**
+   *（取证：国内 2661 total / 1661 批次 / 残差 1000；国际 347 / 247 / 100，
+   * 见 `magicrew-credits.ts` 的合成包注释）。⇒ 文案里可以说「永久积分」
+   *（判据是**有没有到期时间**，不是某个池名），但**不得**点名任何积分池
+   *（上游不下发池名，那会是 AutoClaw 那次「编池名」的同型缺陷）。
+   *
+   * ## 与领居家四份的差异（**不是漏抽公共函数**）
+   *
+   * buddy / qoder / astudio / minimax / autoclaw 五家的 `exhausted` 文案都在描述
+   * 「活动赠送 / 签到包」这类**有名字的桶**。本家**没有桶名**，只有一个
+   * 「到期时间有无」的判据 ⇒ 强行共用会写出一句无从核实的话
+   *（`foldReasonErrors` 那类公共部分已复用，`lockedError` 文案逐家独有是本仓惯例）。
+   *
+   * ## 错误码取 `QUOTA_EXCEEDED`
+   *
+   * 与其余五家一致：这确实是额度问题，且它**不在**宿主
+   * `DEFAULT_RETRYABLE_CODES` 里 ⇒ 不会被白重试（锁定是**确定性**结果）。
+   * ⚠️ `unknown` 档文案写「请重试」而该码不可重试 —— 这是**全仓既有**的自相矛盾
+   *（`autoclawLockedError` 的注释里已登记过同样的六家口径），本次**跟随多数派、
+   * 不单独开例外**；要修应六家一起改，属独立任务。
+   *
+   * ## 位置约束
+   *
+   * 本函数放在 `loomyLockedError` **之前**，理由是**可读性**（同一屏内与 autoclaw 等
+   * 同样使用 `QUOTA_EXCEEDED` 的锁定错误排在一起），**不是**为了躲某个切片。
+   *
+   * ⚠️⚠️ **原先这里写的是「插进 Loomy 区间会让 `loomy-balance-error-contract.spec.ts`
+   * 必然变红」—— 那是错的**（2026-11-01 二审实测）：该 spec 的终点锚点早在
+   * 2026-10-20 就从 `const buddy = new BuddyAuth` 换成了 `'\n  const '`（下一个同级
+   * 声明），它自己的注释 `:35-47` 明写「就是为了别人插 const 时不再被迫挪顺序」。
+   * 实测在该区间插一个用 `'QUOTA_EXCEEDED'` 的同级 const，那个切片**逐字节不变**。
+   * ⇒ 位置的真正守卫是 `tests/unit/magicrew-lock-wiring.spec.ts` 的
+   * `expect(mine).toBeLessThan(loomy)`，不要再靠「会变红」这种口耳相传的理由排序。
+   */
+  const magicrewLockedError = (displayName: string) =>
+    (reason: BuddyNoAccountReason): Error => {
+      const days = buddyExpiringWindowDays()
+      if (reason.kind === 'unknown') {
+        return new LlmError(
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+          + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
+          + '的积分 —— 请重试。'
+          /**
+           * ⚠️⚠️ **「先按括号里的原因办」，不要把用户第一时间引向凭据**（2026-11-04 真机）。
+           *
+           * 原句只有「若持续失败…检查凭据是否失效」，而真机上九个账号全部是
+           * **HTTP 403**（网关层拒绝，火山 WAF）—— 凭据一个都没坏。
+           * 用户照着那句去重登，做完仍然报错，**且看不出自己白做了一轮**。
+           *
+           * 本档的 `errors` 现在来自详细变体（`fetchMagicrewBalanceDetailed`），
+           * 含状态码 / 「网络异常」/ 上游业务码 ⇒ 括号里**已经**是原因。
+           * 于是把凭据与组织码两条**降级为「原因不明确时」的兜底**，并点明
+           * 403/405 这一格的正确动作（不要重登）。
+           *
+           * ⚠️⚠️⚠️ **别再断言「境外出口」**（2026-11-04 七审更正）：完整出口矩阵
+           * （10 组，含 Clash 全退出的真境内家宽）实测国内站对**所有**出口回 403、
+           * 国际站回 405，而第三方境外代理能 200 ⇒ 「地区封锁」已被证伪，真因是
+           * 「本机这条出口被上游网关按 IP 段 / 网络环境拒掉」，插件无法辨别、
+           * 也不能绕过。⇒ 文案只说已实测的事：网关层拒绝、不是凭据问题、
+           * 直连与多个代理出口都无效，再往上只能换网络环境或等服务方放行。
+           */
+          + '⚠️ 处理顺序：括号里的原因**来自余额接口本身**，请先按它办 —— '
+          + '若写的是 HTTP 403 / 405 或网络异常，那是**上游网关（WAF）拒绝了本机请求**，'
+          // ⚠️ 点 `403 / 405` 两个码而**不是**只点 403（2026-11-04 四审建议 ③(1)）：
+          //    真机上海外出口下**国内站回 403、国际站回 405**（2026-11-04 取证），
+          //    本档是两站共用的（`magicrewLockedError('超级麦吉')` / `…('MagiCrew (国际版)')`），
+          //    只写 403 会让国际站用户在锁定态看到与卡片上不符的码、以为说的是另一件事。
+          + `不是凭据问题、也不是积分用尽（真机实测直连与多个代理出口都回 403 / 405，`
+          + '可先在代理软件里给该站点加一条直连规则再试一次，仍不行就换一个网络环境'
+          + '（如手机热点）重试；持续如此只能等服务方放行），**不用重新登录**。'
+          + `原因不明确时，再在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
+          + '（本家的推理凭据是定期轮换的 `mgw_` key，JWT 过期后需要重新登录）；'
+          // ⚠️ 点名 `organizationCode` 是可诊断性的唯一出路：`fetchMagicrewBalance`
+          //    没有「缺组织码」前置守卫（签到侧有，用的是 `product.needsOrgOnGateway`）
+          //    ⇒ 缺组织码时请求照发、上游回 `code 2182`（用户所在组织不存在）⇒ 落到本档，
+          + '需要网关组织码的站点，还要确认该账号登录时选过组织（`organizationCode` 已记录）。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        // ⚠️ **不得照抄 buddy 系那句「或全部账号都在本次请求的模型上受限」**（2026-11-01 二审）：
+        //    `candidatesOf()` 只用两个条件筛候选 —— `a.enabled` 与
+        //    `modelRateLimits[modelId]` 未过期。而本家**从不写** `modelRateLimits`：
+        //    写它的是各适配器里的 `updateModelRateLimit()` 调用，而
+        //    `src/magicrew-adapter.ts` / `src/magicrew.ts` / `src/magicrew-credits.ts`
+        //    里该调用 **0 处** ⇒ 第二个条件恒放行 ⇒ 本档只可能是「没有启用中的账号」。
+        //
+        //    ⚠️ **不要**用 `rateLimit` 当理由：两站在 `src/provider-registry.ts` 里
+        //    都写的是 `rateLimit: false`（2026-11-01 三审更正 —— 本条原写「国内站
+        //    省略该字段」，实测已不成立），而该字段管辖的是「重测 / 重置」按钮，
+        //    **不驱动** `modelRateLimits` 的写入。写进文案就是让用户排查一个不可能
+        //    存在的方向。
+        return new LlmError(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有**启用中**的账号）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认至少有一个账号处于启用状态；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'credential-only') {
+        // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+        //    撤回地消耗永久积分，而本情形的根因在凭据、与积分无关。
+        return new LlmError(
+          `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+          + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+          + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地消耗它们）。'
+          + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`,
+          'QUOTA_EXCEEDED',
+        )
+      }
+      /**
+       * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy / AStudio / MiniMax / AutoClaw 五份同型）：
+       * 走到这里**只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+       * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+       * `TS2322`，而不是静默落进「积分都已用尽」—— 那句会把用户推向
+       * **不可撤回**的解锁操作。
+       */
+      const exhaustedOnly: { kind: 'exhausted' } = reason
+      void exhaustedOnly
+      return new LlmError(
+        `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        + '积分（上游 `expiring_quota_details` 里那些**带到期时间**的批次）都已用尽。'
+        + '**永久积分**（上游**不下发到期时间**的那部分）在锁定状态下动不到它们'
         + ' —— 这是锁定的预期效果。'
         + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待下一次签到 / 活动发放。`,
         'QUOTA_EXCEEDED',
@@ -3095,7 +3344,14 @@ export function apply(ctx: Context): void {
         pool.minimaxXff(),
       ),
   })
-  const minimax = new MinimaxAuth(ctx)
+  const minimax = new MinimaxAuth(ctx, {
+    // ⚠️ 2026-10-24 本地试验版：续期/身份 journal（`refresh-journal.jsonl`）。
+    journalHome: resolveJetHubHome(ctx),
+  })
+  // ⚠️ 2026-10-24 本地试验版：记住「上一次选中的账号」，401/临期续期时
+  //    **精准续它** —— 旧写法续的是「池内第一个可用账号」，那可能是另一个号
+  //    （选号器与 401 时刻之间隔着一整轮请求，池序没变但账号状态变了）。
+  let lastPickedMinimaxAccount = ''
   const minimaxAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX.defaultCredentialRef),
     // provider 实参用 MINIMAX 而非字面量：写死字面量在改名/多产品场景下
@@ -3103,7 +3359,10 @@ export function apply(ctx: Context): void {
     // ⚠️ 只从 minimax 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用其它 provider 的凭据。
     resolveCredential: createCredentialResolver<MinimaxCredential>(
-      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX.id, id) } },
+      { pool, reportAccount: (id) => {
+          if (id !== undefined) lastPickedMinimaxAccount = id
+          if (id !== undefined) reportLedgerAccount(MINIMAX.id, id)
+        } },
       {
         product: MINIMAX,
         // ⚠️ 与选号器**共用同一个**解析器（原先这里是一份内联的匿名箭头，
@@ -3151,20 +3410,22 @@ export function apply(ctx: Context): void {
       // ⚠️ MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
       // 这里是真续期（与 Loomy 的「只能探测有效性」不同）。
       //
-      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
-      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
-      const available = await pool.getAvailableAccount(MINIMAX.id, '')
-      if (available) {
+      // ⚠️ 2026-10-24 本地试验版：**精准续期** —— 优先续「上一次选中的账号」
+      //（401/临期预判都发生在它身上），找不到才退「池内第一个可用账号」。
+      //
+      // ⚠️ 走 `refreshAccountCredential`（lead-aware，1h 窗口）而不是
+      //    `renewEntry(force)`：① 它是 H2 契约的桩点（`refreshAccountCredential`
+      //    被替换成记录器时本闭包必须仍可驱动）；② 1h lead 窗口在巡检
+      //    （5-15min margin ⇒ 续后剩余恒 ~60min）下**恒命中**，401 时必发 grant，
+      //    与旧行为逐字节等价。抢断式强刷已由 `renewEntry` 的巡逻/兜底承担。
+      const entries = await pool.listAccounts(MINIMAX.id)
+      const target = entries.find((e) => e.id === lastPickedMinimaxAccount)
+        ?? (await pool.getAvailableAccount(MINIMAX.id, ''))?.entry
+      if (target !== undefined) {
         // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
-        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
-        //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
-        //
-        // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
-        // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
-        // `available.id` / `available.credentialRef`（那是 `undefined`，
-        // 会让续期**静默写不回账号池**）。
+        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息。
         await minimax.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
+          target.credentialRef, pool, target.id,
         )
       } else {
         await minimax.refresh()
@@ -3215,13 +3476,19 @@ export function apply(ctx: Context): void {
   const minimaxIntl = new MinimaxAuth(ctx, {
     product: MINIMAX_INTL,
     fetchFor: minimaxIntlFetchForAccount,
+    journalHome: resolveJetHubHome(ctx),
   })
+  // ⚠️ 与中国版同因（2026-10-24）：记住「上一次选中的账号」，精准续期。
+  let lastPickedMinimaxIntlAccount = ''
   const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),
     // ⚠️ provider 实参必须是 MINIMAX_INTL：写死 MINIMAX 会让国际站永远查不到
     // 自己的账号（本插件在 workbuddy 上踩过同类坑）。
     resolveCredential: createCredentialResolver<MinimaxCredential>(
-      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id) } },
+      { pool, reportAccount: (id) => {
+          if (id !== undefined) lastPickedMinimaxIntlAccount = id
+          if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id)
+        } },
       {
         product: MINIMAX_INTL,
         // ⚠️ 与中国版**共用同一个**解析器（见 `resolveMinimaxCredentialByRef` 的说明）。
@@ -3247,13 +3514,14 @@ export function apply(ctx: Context): void {
       },
     ),
     refresh: async () => {
-      // 同中国版：刷新**解析凭据时所用的那一个**账号，不是默认单凭据 ref。
-      const available = await pool.getAvailableAccount(MINIMAX_INTL.id, '')
-      if (available) {
-        // ⚠️ **必须传 pool + entry.id**（两层结构）：否则续期成功后新 `expiresAt`
-        // 写不回账号池，UI 会一直显示「已过期」而实际能正常发消息。
+      // 同中国版（2026-10-24 本地试验版）：**精准续期** —— 优先续「上一次选中
+      // 的账号」，走 `refreshAccountCredential`（lead-aware + 抢救链），理由见上。
+      const entries = await pool.listAccounts(MINIMAX_INTL.id)
+      const target = entries.find((e) => e.id === lastPickedMinimaxIntlAccount)
+        ?? (await pool.getAvailableAccount(MINIMAX_INTL.id, ''))?.entry
+      if (target !== undefined) {
         await minimaxIntl.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
+          target.credentialRef, pool, target.id,
         )
       } else {
         await minimaxIntl.refresh()
@@ -3546,6 +3814,105 @@ export function apply(ctx: Context): void {
     // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
     // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
     accountPool: pool,
+    /**
+     * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（真实缺陷）。
+     *
+     * ## 缺陷与证据
+     *
+     * `autoclaw-adapter.ts:636` 的 401 重试判据是
+     * `if (!response.ok && (401 || 403) && this.options.refresh)` ——
+     * **没有本回调时整段不执行**（既不续期、也不重发）。
+     * 而本实例（与国际版）自 `6da5505`（AutoClaw 首次接入）起**从未传过它**
+     * （`git log -S"autoclawAdapter"` 只命中那一个提交）。
+     *
+     * ⇒ 401 直接落到 `isAutoclawAuthError` 命中 `'invalid token'` ⇒ 归 `AUTH`
+     *   ⇒ 而 `AUTH` 会被 DSH 客户端**换成固定文案「API 密钥无效」并丢掉原文**
+     *   （本仓库自记：`autoclaw.ts:555-556` / `docs/agent-notes/client-ui.md`）。
+     *   这正是用户报「模型经常报错 API 密钥无效」的**直接来源**。
+     *
+     * ## 为什么「经常」（触发窗口）
+     *
+     * 定时 `refreshAll`（注册表派生，覆盖本家）本身是工作的 —— 实测凭据
+     * AT 的 `iat` 已刷新、RT 还剩 24.5 天，说明续期成功过。但定时器有 **30 分钟
+     * 粒度**：AT 过期到下一轮成功续期之间存在窗口（宿主关闭/重启、某一轮失败
+     * 都会拉长它），窗口内任何请求都 401 且**无按需自愈** ⇒ 每次过期边界附近
+     * 都可能撞上。补上本回调后，401 会先续期再原样重发一次，请求级自愈。
+     *
+     * ## 形态（⚠️ 2026-10-27 审计修：**不再自己问池要号**）
+     *
+     * 修前是 `pool.getAvailableAccount(AUTOCLAW.id, '')` —— 续到的号与请求实际
+     * 用的号**不是同一个**，而这是本 PR **目标没达成**的直接原因：
+     *
+     * | 判据 | 请求用的号（`createCredentialResolver` + `balance` 分档） | 修前的续期号 |
+     * |---|---|---|
+     * | 排序 | 按到期档位（`pickBuddyAccount`） | 用户手动序第一个 |
+     * | 限流过滤 | 按真 `modelId` | 传 `''` ⇒ **整体短路** |
+     *
+     * 实测（真跑 `createCredentialResolver` + 复刻池逻辑）：分档选中 B 号，
+     * 而 `getAvailableAccount` 返回 A 号 ⇒ 续 A、重发仍用 B 的旧 token ⇒
+     * 401 原样复现，A 被白轮换一把 RT。端到端三次请求 `["AUTH","AUTH","AUTH"]`。
+     *
+     * ⇒ 现在用适配器传进来的 `used`（**本次实际发请求的那份凭据**）：
+     *   ① 按 `access_token` 反查它在池里的条目（与适配器自己的记账判据同源）；
+     *   ② 续它、并**把新凭据返回给适配器重发**（不再 `resolveCredential` 重选号）。
+     *
+     * ⚠️ 反查不到（单凭据路径 / 池里没有这个 token）⇒ 退默认单凭据 ref。
+     * ⚠️ 仍传 `pool + entry.id`，否则新 `expiresAt` 写不回池（issue !IKIRTT）。
+     */
+    refresh: async (used) => {
+      const token = used?.access_token ?? ''
+      // ⚠️ 反查的第二参是**凭据内容**（access_token）而不是 ref 名 ——
+      //    传 ref 名会恒匹配失败且**静默**（本仓库已复发多次）。
+      const accountId = token.length > 0
+        ? await pool.findAccountIdByCredential(AUTOCLAW.id, token).catch(() => '')
+        : ''
+      const entry = accountId.length > 0
+        ? (await pool.listAccounts(AUTOCLAW.id)).find((item) => item.id === accountId)
+        : undefined
+      if (entry !== undefined) {
+        return await autoclaw.renewCredentialForRef(entry.credentialRef, pool, entry.id)
+      }
+      /**
+       * ⚠️⚠️ **反查失败必须当场留痕**（2026-10-27 第二轮审计打穿的 P0，两位审计员独立命中）。
+       *
+       * ## 为什么诊断要写在这里而不是下面那条「退默认 ref」的分支
+       *
+       * 修前把 warn 放在 `renewCredentialForRef(defaultCredentialRef)` 返回
+       * `undefined` 之后 —— 但那条分支**几乎不可达**：该 ref 全仓无写入点，
+       * 而 `renewCredentialForRef` 在「凭据未配置」时是**抛错**（不是返回
+       * `undefined`）⇒ 真正发生的是「抛错被适配器的 `catch` 静默吃掉」，
+       * 那条精心写好的 warn **一次都不会执行**（实测确认）。
+       *
+       * ⇒ 现在把诊断**前移到反查失败当场**：无论后续走哪条分支（抛错 / 空转 /
+       *   退默认 ref），日志里都已经有「为什么找不到可续期的账号」。
+       *
+       * ⚠️ 这条路径**可达**：`pool.findAccountIdByCredential` 会 `continue` 掉
+       *   `!entry.enabled` 的条目 ⇒ 请求用的账号若在 grant 期间被停用，
+       *   反查返回 `''` 就落到这里。
+       */
+      if (token.length > 0) {
+        ctx.logger.warn(
+          '[autoclaw] 401 后按 access_token 反查不到账号：'
+          + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+          + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）',
+        )
+      }
+      /**
+       * 池里没有这个 token（单凭据路径 / 账号被删）⇒ 退默认单凭据 ref。
+       *
+       * ⚠️ **不能抛错**（第二轮审计打穿的 P0）：适配器那一侧的 401 重发是
+       * `try { … } catch { /* 忽略重试失败 *\/ }` —— 抛出去的异常被**静默吃掉**。
+       * 现在只记日志 + 让 `renewCredentialForRef` 自己决定抛或返回；
+       * 适配器那侧的 `catch` 也已补 warn，两处合起来保证**不再静默**。
+       */
+      return await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef).catch((error: unknown) => {
+        ctx.logger.warn(
+          '[autoclaw] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+          + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`,
+        )
+        return undefined
+      })
+    },
   })
 
   // ===== AutoClaw 国际版（autoclawintl）=====
@@ -3564,9 +3931,10 @@ export function apply(ctx: Context): void {
   //    实测佐证：拿国内签发的 token 打国际基址，`wallets` / `user-profile`
   //    一律 `410000 用户未登录`、推理 `401 Invalid token` ⇒ 用户体系物理隔离。
   //
-  // ⚠️ **当前登录**：Z.ai OAuth 尚未接入（`state.nh` 来源未知，
-  //    见 `AUTOCLAW_INTL` 的注释）⇒ 本 provider 目前只能手工注入 token 使用。
-  //    接入后它会自己有一条 `login.startOAuth` 分支。
+  // ⚠️ **登录**：Z.ai OAuth **已于 2026-11-02 接入**（接入前本渠道只能手工注入 token）。
+  //    实现形态是**本地 flow 页里的授权链接 + `/auth/callback-zai` 回调**
+  //    （见 `AUTOCLAW_INTL` 的注释与 `src/autoclaw-oauth.ts`），
+  //    ⚠️ **不是** `login.startOAuth` 分支 —— 原先这里预告的形态是错的。
   const autoclawIntl = new AutoclawAuth(ctx, { product: AUTOCLAW_INTL })
   const autoclawIntlAdapter = registerAutoclawLlm(ctx, {
     resolveCredential: createCredentialResolver<AutoclawCredential>(
@@ -3597,6 +3965,49 @@ export function apply(ctx: Context): void {
     // ⚠️⚠️ 同国内版（2026-10-23 迁移）：黑名单与关闭意图由共享骨架从账号池读。
     //    两个站点**各一条** `accountPool`，漏一处即该站静默失效（本仓库的既有纪律）。
     accountPool: pool,
+    /**
+     * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（与国内版同因同源）。
+     *
+     * 证据与形态**逐字同国内版那条**（见上）：`autoclaw-adapter.ts` 的 401
+     * 重试判据带 `&& this.options.refresh`，而两个实例自 `6da5505` 起都没传它
+     * ⇒ 401 不续期不重发 ⇒ 归 `AUTH` ⇒ 客户端换成「API 密钥无效」。
+     * 两个站点**各补一条**（本仓库既有纪律：双站点每处都要到位）。
+     *
+     * ⚠️ 形态与国内版**逐字同构**（含「按 `used.access_token` 反查」与
+     * 「返回新凭据供重发」）：两站的选号规则差异（都接了 `balance` 分档）
+     * 完全一样，照抄国内版才是同一条纪律；各写一套必然漂移。
+     */
+    refresh: async (used) => {
+      const token = used?.access_token ?? ''
+      const accountId = token.length > 0
+        ? await pool.findAccountIdByCredential(AUTOCLAW_INTL.id, token).catch(() => '')
+        : ''
+      const entry = accountId.length > 0
+        ? (await pool.listAccounts(AUTOCLAW_INTL.id)).find((item) => item.id === accountId)
+        : undefined
+      if (entry !== undefined) {
+        return await autoclawIntl.renewCredentialForRef(entry.credentialRef, pool, entry.id)
+      }
+      // ⚠️ 同国内版：**诊断前移到反查失败当场**（那条「退默认 ref 后看返回值」
+      //    的分支几乎不可达 —— `renewCredentialForRef` 在未配置时是抛错不是返回
+      //    `undefined`，故旧写法里那段 warn 一次都不会执行，实测确认）。
+      if (token.length > 0) {
+        ctx.logger.warn(
+          '[autoclawintl] 401 后按 access_token 反查不到账号：'
+          + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+          + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）',
+        )
+      }
+      // ⚠️ 同国内版：**不得抛错**（抛出去会被适配器的 catch 静默吃掉 ⇒
+      //    「一次上游都不发 + 日志零字」）。只记日志并返回 undefined。
+      return await autoclawIntl.renewCredentialForRef(AUTOCLAW_INTL.defaultCredentialRef).catch((error: unknown) => {
+        ctx.logger.warn(
+          '[autoclawintl] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+          + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`,
+        )
+        return undefined
+      })
+    },
   })
 
   const accio = new AccioAuth(ctx)
@@ -3683,6 +4094,292 @@ export function apply(ctx: Context): void {
   // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
   // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
   const astudio = new AstudioAuth(ctx)
+  // 超级麦吉（Magicrew 国内站，2026-10-29）。MagicrewAuth 构造时自 provide（服务名 magicrewAuth）。
+  const magicrewAuth = new MagicrewAuth(ctx)
+  /**
+   * **MagiCrew 国际站**（`magicrewintl`，2026-11-01 用户要求）。
+   *
+   * ⚠️ 服务名由 `MagicrewAuth` 构造里 `super(ctx, `${product.id}Auth`)` **自动派生**
+   *    为 `magicrewintlAuth` ⇒ 这里**不需要**再 `ctx.provide`。
+   * ⚠️ 两站是同一个 Go 服务的两个**数据面**（账号体系物理隔离）⇒ 必须是两个实例：
+   *    共用一个实例会让 `states` 按 ref 串号、`currentCredential()` 互相覆盖。
+   */
+  const magicrewIntlAuth = new MagicrewAuth(ctx, { product: MAGICREW_INTL })
+  /**
+   * 两站共用的**读图桥接**（`ctx.attachments.readImage` → 适配器的
+   * `{data, mediaType}`）。
+   *
+   * ⚠️ 必须**惰性** `ctx.get('attachments')`，不能写 `ctx.attachments` ——
+   *    后者是 cordis 的 inject 服务，在同步代码里直接访问会抛
+   *    `cannot get property "…" without inject` 并**打断整个 `apply()`**
+   *    （实测：在 `ctx.provide('accountPool', …)` 之后被打断，minimax 的
+   *    巡检定时器读不到它 ⇒ `wiring-lifecycle-guards.spec.ts` 两条红）。
+   *    惰性取时缺服务返回 `undefined` ⇒ 适配器抛 `INVALID_REQUEST`（可见失败，
+   *    不是静默降级：静默降级会让模型「看不到图却以为看到了」，那是幻觉源）。
+   */
+  const magicrewReadImage = async (attachment: unknown) => {
+    const attachments = ctx.get('attachments') as
+      | { readImage?: (a: unknown) => Promise<{ ref: { mediaType: string }, data: Uint8Array }> }
+      | undefined
+    if (attachments?.readImage === undefined) return undefined
+    const stored = await attachments.readImage(attachment)
+    if (stored === undefined) return undefined
+    // 形状转换：宿主给 `{ ref, data }`，适配器要 `{ data, mediaType }`（拼 data URL 用）。
+    return { data: stored.data, mediaType: stored.ref.mediaType }
+  }
+  /**
+   * 适配器**必须**拿到 `resolveCredential` 与 `fetchRemoteModels`：
+   * 缺前者 ⇒ 每条请求抛 `AUTH`「账号未登录」（已登录用户也看到，且 AUTH 吞文案）；
+   * 缺后者 ⇒ 目录只剩静态兜底（静默退化，用户看到的是过期 ctx/档位）。
+   */
+  /**
+   * ⚠️⚠️ **必须走 `createCredentialResolver(pool)`**（2026-10-29 最终审查 K2）。
+   *
+   * 直接传 `() => magicrewAuth.currentCredential()` 会落到**固定默认 ref**
+   * （`MAGICREW_ACCESS_TOKEN`），而全仓**没有任何代码写那个 ref** ——
+   * 池里真正存的是 `MAGICREW_ACCOUNT_*`，适配器**永远读不到**：
+   *   ① 多账号不可用；② `mgw_` key 仅 **2 小时**，到期后 `refreshAll` 在池里
+   *   找不到账号 ⇒ **不自愈** ⇒ 此后每条请求 `AUTH`（token无效）直到手工换凭据。
+   *
+   * 走 resolver 还白拿**请求级换号**与**限流排除**（其余 23 家同款）。
+   */
+  /**
+   * Magicrew 国内站的**余额分档选号器**（2026-11-01 用户要求「加锁定 / 解锁永久积分」）。
+   *
+   * ## 为什么复用 `BuddyBalanceSelector` 而不是新写一个
+   *
+   * 分档判据只读通用的 `packages[].{ active, remaining, deductionEndTime }`，
+   * 而 `fetchMagicrewBalance` 返回的**就是** `CreditBalance` —— 天生满足它要的形状。
+   * 本仓库对这类「同族判定」既有明确裁定：**优先扩 `buddy-balance-rank.ts`，
+   * 不要再开第三份**（见该文件头部）。TRAE / LobsterAI / Qoder / AStudio / MiniMax /
+   * AutoClaw 六家走的就是这条复用路线，magicrew 只是第七家。
+   *
+   * ⚠️ **非 buddy product 时 `fetchBalance` 是编译期必填的**（`FetchBalanceRule`）：
+   *    漏传 `tsc` 会报错。这是刻意的 —— 缺省实现会拿 `TraeProduct` 那类没有
+   *    `endpoint` 的 `product` 拼出 `undefined/...` 的畸形 URL，症状是
+   *    「余额恒查不到 ⇒ 锁定时永远报无法确认」且**零日志**。
+   * ⚠️ **第三参 `ctx`（出口代理）本家不需要**：magicrew 两站都不按出口 IP 分流，
+   *    故只写两参。若将来接入按账号代理，必须同时补这里与
+   *    `BuddySelectionDeps.fetchFor`，否则只有 `fetchBalance` 那条腿有出口。
+   * ⚠️ **`?? null` 是契约差异**：`fetchMagicrewBalance` 用 `undefined` 表达「读不到」，
+   *    而选号器契约是 `null`（两者同义，但 `undefined` 会被当成「没实现」）。
+   */
+  const magicrewBalanceSelector = new BuddyBalanceSelector<MagicrewProduct, MagicrewCredential>({
+    product: MAGICREW,
+    resolveCredential: (refName) => magicrewAuth.currentCredential(refName),
+    fetchBalance: async (credential, product) => await fetchMagicrewBalance({
+      jwt: credential.jwt,
+      organizationCode: credential.organizationCode,
+      product,
+    }) ?? null,
+    /**
+     * ⚠️⚠️ **详细变体必接**（2026-11-04 真机报障）：只接 `fetchBalance` 时，
+     * 锁定永久积分的那句报错拿到的是 `null` ⇒ 说成「余额查询失败（凭据失效或
+     * 响应异常）」，把用户引去重登一个本来没问题的号。真机取证：本机代理全局
+     * 模式把流量送出国境，上游火山 WAF 回 **HTTP 403**（国际站 405），九个账号
+     * 全中 —— 与凭据、组织码都无关。
+     * ⇒ 详细变体把「HTTP 403 / 网络异常 / 上游业务码」原样带进报错。
+     * 同款教训见 `src/index.ts:76` 那段长注释（Qoder `!136` 的回归）。
+     *
+     * ⚠️ 接口注释里「两个变体必须同时收 `ctx`」那条规则对本家不适用：
+     *    这两站都不按出口 IP 分流，故两参写法与上面的 `fetchBalance` 一致。
+     */
+    fetchBalanceDetailed: async (credential, product) => await fetchMagicrewBalanceDetailed({
+      jwt: credential.jwt,
+      organizationCode: credential.organizationCode,
+      product,
+    }),
+  })
+  const magicrewResolver = createCredentialResolver<MagicrewCredential>(
+    { pool: pool as never },
+    {
+      product: MAGICREW,
+      // 按 ref 读 ⇒ 池里的 `MAGICREW_ACCOUNT_*` 与手工塞的默认 ref 都能读。
+      readCredential: (refName) => magicrewAuth.currentCredential(refName),
+      // 兜底固定 ref（手工塞凭据 / 迁移场景，与其余 11 家同款）。
+      fallback: { kind: 'ref', refName: MAGICREW.defaultCredentialRef },
+      /**
+       * ⚠️ **必须传**（2026-10-29 最终审查 I5 连带）：不传时「全部账号被该模型限流」
+       *    会降级成**误导性的「未登录」**（`MISSING_CREDENTIAL`），用户会去重登一个
+       *    本来没问题的号（issue IKKHL5 的同型症状）。`ratelimit-locked-misreport`
+       *    的「走了工厂却没接限流判定」那条守卫会直接点名 magicrew。
+       */
+      throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+      /**
+       * ## `balance` —— 锁定永久积分的**唯一执行路径**（2026-11-01）
+       *
+       * ⚠️⚠️ **没有这一段就是「假开关」**：`provider-registry.ts` 的
+       * `permanentLock: true` 只让面板渲染出按钮、让 `credits.permanentLock`
+       * RPC 接受写入，**没有任何代码去执行那张锁定表** —— 用户点了锁定，
+       * 凭据照旧烧永久积分，且**没有任何用例会红**（officeace 的原始缺陷，
+       * 见 Gitee IKLTHB 与 `permanent-lock-execution.spec.ts` 的文件头）。
+       *
+       * `kind: 'buddy'` 的含义是「沿用 `pickBuddyAccount` 的编排」：
+       * `credential-resolver.ts` 读 `pool.permanentLocked(providerId)` ⇒
+       * 传 `allowPermanent` ⇒ 只剩永久桶时 `select()` 返回不可用 ⇒
+       * 落到本行的 `lockedError` 报错（**绝不**回落 `getAvailableAccount`）。
+       *
+       * ⚠️ **`isFreeModel: NO_FREE_MODEL` 是刻意的保守取舍**：免费模型
+       *    （`input_points === 0`）本不该受锁定约束，但本家的免费判定在**适配器**
+       *    内部（远端计费表 `magicrewIsFree(wirePoints)`），没有可注入的
+       *    「modelId → 是否免费」查询点。宁可让免费模型也走一次余额分档
+       *    （代价：一次余额请求；锁定 + 只剩永久时会被误拦），也不在这里
+       *    猜一个判据 —— 猜错的代价是免费模型静默绕开锁定、真烧掉永久积分。
+       *    将来适配器若暴露倍率查询，这里应改成真实判据（与 buddy 系同款）。
+       */
+      balance: {
+        kind: 'buddy',
+        selector: magicrewBalanceSelector,
+        lockedError: magicrewLockedError('超级麦吉'),
+        isFreeModel: NO_FREE_MODEL,
+        /**
+         * ⚠️⚠️ **本家是本开关唯一的开启者**（2026-11-04 真机报障「模型都选不了了」）。
+         *
+         * 本家的余额接口会被上游网关**整片拒绝**（真机国内站 HTTP 403 空 body、
+         * 国际站 405 + WAF 页，九个账号无一幸免，官方 magpie 同时刻也 403/405）。
+         * 此时锁定态下每个账号都落到 `unknown` ⇒ 抛 `lockedError` ⇒ **整个 provider
+         * 的模型列表被清空**，模型选择器里只剩一大段错误文案，用户一个模型都选不了。
+         *
+         * 开这个开关的含义：**查不到余额时放宽一次**（允许消耗永久积分），
+         * 余额查得到时锁定语义逐字不变。取舍是「可能消耗**永久**积分」换「渠道可用」——
+         * 不降级的代价是「完全用不了」，明显更坏。
+         *
+         * ⚠️⚠️ 风险是「永久」不是「临期」（2026-11-05 三审回归面 P2-1）：`expiring > 0`
+         * 的账号在锁定态本就可用、永远进不了降级分支；能进分支的只有 `expiring = 0`
+         * 的账号。故 `BuddyBalanceSelector.select` 额外加了 `definitive` 守卫 ——
+         * 池里存在「余额查得到且只剩永久」的账号时报 `exhausted`，不再降级。
+         */
+        degradeLockedWhenUnknown: true,
+      },
+    },
+  )
+  const magicrewService = new MagicrewService({
+    /**
+     * ⚠️ **必须显式传**（2026-11-01 三审 D5）：`src/magicrew.ts` 的构造器有
+     * `?? MAGICREW` 缺省，省略在这里**行为正确但形态不对称** —— 后人照着国内站
+     * 抄去接第三个站点时会**静默打回国内基址**（与 `src/provider-expiry.ts`
+     * 「漏传 product ⇒ 恒 UNUSABLE ⇒ 聚合候选静默消失」是同型风险）。
+     */
+    product: MAGICREW,
+    // ⚠️ 必填：`login()` 的实现在 auth 层（`account.create` 只拿得到 `JetHubAuths`）。
+    auth: magicrewAuth,
+    resolveCredential: magicrewResolver,
+    /**
+     * ⚠️ 桥接宿主读图入口。**必须用 `ctx.get()` 惰性取**，不能写 `ctx.attachments` ——
+     *    后者是 cordis 的 inject 服务，在同步代码里直接访问会抛
+     *    `cannot get property "…" without inject` 并**打断整个 `apply()`**
+     *    （实测：在 `ctx.provide('accountPool', …)` 之后被打断，minimax 的
+     *    巡检定时器读不到它 ⇒ `wiring-lifecycle-guards.spec.ts` 两条红）。
+     *    惰性取时缺服务返回 `undefined` ⇒ 适配器抛 `INVALID_REQUEST`（可见失败，
+     *    不是静默降级）。
+     */
+    readImage: magicrewReadImage,
+    fetchRemoteModels: async () => {
+      const credential = await magicrewAuth.currentCredential()
+      if (credential === undefined) return []
+      return await magicrewAuth.fetchCatalogModels(credential.jwt, credential.organizationCode)
+    },
+    /**
+     * ⚠️ 桥接宿主读图入口。缺了它，vision 模型发图会**抛 INVALID_REQUEST**
+     *（刻意的可见失败）—— 静默降级会让模型「看不到图却以为看到了」，那是幻觉源。
+     */
+    /**
+     * ⚠️⚠️ **必须传**（与 astudio 的 IKP8OF 同因）：不传时 `createModelCatalog` 的
+     *    deps 里 `accountPool` 缺席 ⇒「用户在 Jet Hub 关掉的模型照样出现在选择器里」
+     *    且关闭整个供应商无效（`disabledModelsFor` / `providerClosedFor` 全走 `?.`
+     *    静默跳过）。**更严重的是**：`MagicrewAdapter` 构造时若读 `ctx.accountPool`
+     *    会抛 `cannot get property "accountPool" without inject` ⇒ **打断整个 `apply()`**，
+     *    后续 provider 的定时器/接线全部不执行（实测：minimax 两站巡检因此没启动，
+     *    `wiring-lifecycle-guards.spec.ts` 两条红）。
+     */
+    accountPool: pool,
+  })
+  const magicrewAdapter = magicrewService.adapter
+  // 与 accio / aggregate 同款幂等注册（`llm-register-compat.ts` 负责记账与剔除包装）。
+  registerAdapterIdempotent(ctx.llm, [MAGICREW.id], magicrewAdapter)
+  /**
+   * ## MagiCrew 国际站（`magicrewintl`，2026-11-01 用户要求）
+   *
+   * 与国内版**共用全部实现**，只有 `product` 常量不同 —— 判据与理由见
+   * `src/magicrew-product.ts` 的 `MAGICREW_INTL` 注释（账号体系物理隔离、
+   * host 不同、网关强制 org）。
+   *
+   * 下面这一整块与国内版逐行同构，**故意不抽公共工厂**：两处差异点（product /
+   * auth 实例）都出现 5 次以上，抽工厂会让「哪一处漏改」变得不可见 ——
+   * 而本仓库记录过多次「一份语义两处实现，改一处漏一处」的缺陷
+   *（`minimaxintl` / `autoclawintl` 都选了同样的显式两份 —— 各有一份 resolver 工厂）。
+   */
+  /**
+   * MagiCrew 国际站的余额分档选号器 —— 与国内版**逐行同构**，只有 `product`
+   * 与 auth 实例不同（判据见 `magicrew-product.ts` 的 `MAGICREW_INTL` 注释）。
+   *
+   * ⚠️ **不能两站共用一个 selector 实例**：`BuddyBalanceSelector` 的缓存按
+   * `account.id` 索引、且 `product` 在构造期固定 ⇒ 共用会让国际站账号用国内
+   * 基址查余额（症状：国际站余额恒查不到 ⇒ 锁定时永远报「无法确认」，
+   * 面板却还能刷新 —— 与 `provider-expiry.ts` 那次漏传 `product` 同型）。
+   */
+  const magicrewIntlBalanceSelector = new BuddyBalanceSelector<MagicrewProduct, MagicrewCredential>({
+    product: MAGICREW_INTL,
+    resolveCredential: (refName) => magicrewIntlAuth.currentCredential(refName),
+    fetchBalance: async (credential, product) => await fetchMagicrewBalance({
+      jwt: credential.jwt,
+      organizationCode: credential.organizationCode,
+      product,
+    }) ?? null,
+    /**
+     * ⚠️⚠️ **两站必须各接一份**（同国内站，2026-11-04 真机报障）：
+     * 国际站在同一台机器上回的是 **HTTP 405 + WAF 错误页**（国内站是 403 空 body），
+     * 只接 `fetchBalance` 时用户同样只看到「凭据失效或响应异常」而无从下手。
+     * ⚠️ 漏接不会有任何用例变红（锁定时只是文案退化）⇒ 与国内站成对存在。
+     */
+    fetchBalanceDetailed: async (credential, product) => await fetchMagicrewBalanceDetailed({
+      jwt: credential.jwt,
+      organizationCode: credential.organizationCode,
+      product,
+    }),
+  })
+  const magicrewIntlResolver = createCredentialResolver<MagicrewCredential>(
+    { pool: pool as never },
+    {
+      product: MAGICREW_INTL,
+      readCredential: (refName) => magicrewIntlAuth.currentCredential(refName),
+      fallback: { kind: 'ref', refName: MAGICREW_INTL.defaultCredentialRef },
+      // ⚠️ 同上：不传会把「全部账号被限流」误报成「未登录」。
+      throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+      /**
+       * ⚠️ **必须与国内版同格**（2026-11-01）：两站各自登记 `permanentLock: true`
+       * ⇒ 各自的 `lockedError` 缺一段就是**假开关**（面板有按钮、点了没用）。
+       * `displayName` 必须**逐站区分**：两站账号体系物理隔离，用户要知道去
+       * 哪个面板解锁（`credits.permanentLock` 也是按 provider id 写同一张锁定表）。
+       * `isFreeModel` 取 `NO_FREE_MODEL` 的取舍与后果（免费模型也会走一次余额
+       * 分档、锁定 + 只剩永久时会被误拦）见国内版那段注释 —— 两站同源，这里不重复。
+       */
+      balance: {
+        kind: 'buddy',
+        selector: magicrewIntlBalanceSelector,
+        lockedError: magicrewLockedError('MagiCrew (国际版)'),
+        isFreeModel: NO_FREE_MODEL,
+        /** ⚠️ 与国内站成对存在，理由见上方国内站那段注释（国际站 405）。 */
+        degradeLockedWhenUnknown: true,
+      },
+    },
+  )
+  const magicrewIntlService = new MagicrewService({
+    product: MAGICREW_INTL,
+    auth: magicrewIntlAuth,
+    resolveCredential: magicrewIntlResolver,
+    readImage: magicrewReadImage,
+    fetchRemoteModels: async () => {
+      const credential = await magicrewIntlAuth.currentCredential()
+      if (credential === undefined) return []
+      return await magicrewIntlAuth.fetchCatalogModels(credential.jwt, credential.organizationCode)
+    },
+    // ⚠️ 必须传（与国内版同因）：缺了会让「关掉的模型照样出现在选择器里」，
+    //    且在构造期读 `ctx.accountPool` 会抛错打断整个 `apply()`。
+    accountPool: pool,
+  })
+  const magicrewIntlAdapter = magicrewIntlService.adapter
+  registerAdapterIdempotent(ctx.llm, [MAGICREW_INTL.id], magicrewIntlAdapter)
   /**
    * 按凭据 ref 解析 AStudio 凭据（供**选号器查余额**与最终取凭据共用）。
    *
@@ -3939,6 +4636,176 @@ export function apply(ctx: Context): void {
     // 那会让「同一语义两套判据」重现（本仓库红线），且会掩盖池没接上的缺陷。
   })
 
+  // ===== 七牛云 AI（Qiniu）—— **本 fork 独有** =====
+  //
+  // 与 modelscope **同格**：OpenAI 兼容协议 + 长期有效的静态 API Key ⇒ 无 OAuth、
+  // 无 refresh 端点、无余额端点（`credits.balance: false`）。故整套实现是
+  // modelscope 范式的逐字镜像（`src/qiniu-*.ts` 七个文件）。
+  //
+  // ⚠️ 与 modelscope 的**唯一实质差异**：`slots()` 里模型级限流判据完全一致，但
+  //    `fetchRemoteCatalog` 打在 `/v1/models` 上 —— 该端点**实测免鉴权也回 200**
+  //    ⇒ 「目录能读到」**不构成**凭据有效的证据（本仓库对这条一贯的要求，
+  //    见 officeace / opencode 的登记）。凭据有效性只由推理请求的真实结果判定。
+  //
+  // 服务名由 QiniuAuth 依 product.id 派生，注册为 ctx.qiniuAuth。
+  const qiniu = new QiniuAuth(ctx)
+  const qiniuAdapter = registerQiniuLlm(ctx, {
+    // 单凭据回退 ref：池里没有 qiniu 账号时用它（与其余 provider 同约定）。
+    credentialRef: credentialRef(QINIU.defaultCredentialRef),
+    // 槽序列由**接线层**解析好传进来（适配器不直接读凭据）。
+    // `modelId` 透传：据此过滤「该模型正处于限流窗口」的账号。
+    slots: async (modelId?: string) => {
+      const entries = await pool.listAccounts(QINIU.id)
+      const usable = await Promise.all(entries.map(async (entry) => {
+        if (!entry.enabled) return undefined
+        // ⚠️ 模型级限流标记：`modelId` 缺省时**不查**（目录路径刻意不传 ——
+        //    传了会让被限流的账号把整个目录一起拖空）。
+        if (modelId !== undefined && modelId.length > 0) {
+          const resetAt = entry.modelRateLimits?.[modelId]
+          if (typeof resetAt === 'number' && resetAt > Date.now()) return undefined
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (!resolved) return undefined
+        try {
+          const parsed = JSON.parse(resolved.value) as QiniuCredential
+          if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) return undefined
+          return { id: entry.id, apiKey: parsed.access_token }
+        } catch {
+          return undefined
+        }
+      }))
+      return usable.filter((s): s is { id: string; apiKey: string } => s !== undefined)
+    },
+    accountPool: pool,
+    product: QINIU,
+    // 限流标记的**写入端**。⚠️ 读端（上面 `slots()` 里的 `modelRateLimits` 判据）
+    // 与写端必须成对存在 —— 只读不写 ⇒ 那段判据恒不命中（死代码）；
+    // 只写不读 ⇒ 标记写进池却永远不影响选号。与 modelscope / opencode 同款。
+    markLimited: async (slotId, modelId, resetAtMs) => {
+      await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
+    },
+    // 远端目录：`GET https://api.qnaigc.com/v1/models`。失败回退
+    // `QINIU_FALLBACK_MODELS`（适配器的 `loadQiniuCatalog` 内部兜底，不会抛）。
+    // ⚠️ **必须带超时**：桌面版到外部域名的 fetch 可能永不 settle（opencode 的
+    //    真机事故 2026-10-02：没有超时 ⇒ listModels 永不返回 ⇒ 模型列表与徽标
+    //    同时空白）。超时后回退兜底表，UI 立刻可用。
+    fetchRemoteCatalog: (apiKey: string, signal?: AbortSignal) => fetch(qiniuModelsUrl(QINIU), {
+      headers: qiniuHeaders(apiKey),
+      signal: signal ?? AbortSignal.timeout(10_000),
+    }),
+    // 图片走 `readImage` 单一路径，逐模型按目录下发的模态声明（七牛云 `/v1/models`
+    // **不下发 modalities** ⇒ 见 `parseQiniuCatalog` 的说明：一律按文本声明，
+    // 宁可不给图也不静默幻觉 —— 与 accio 的纪律同源）。
+    readImage: makeReadImage(ctx),
+    // ⚠️ **黑名单与「关闭供应商」一律由共享骨架从账号池读走**（与 modelscope
+    //    2026-10-23 迁移同款）：不要在这里加回 `disabledModels` /
+    //    `providerClosed` 两个回调 —— 那会让「同一语义两套判据」重现（本仓库红线），
+    //    且会掩盖池没接上的缺陷。
+  })
+
+  // ===== MonkeyCode（`monkeycode` + `monkeycodeintl`）—— **本 fork 独有** =====
+  //
+  // 两个**独立部署**的站点（2026-11-02 实测）：国内 `monkeycode-ai.com` 与国际
+  // `monkeycode-ai.net` 各有独立账号池 —— 国内 cookie 打国际站回 401、两站的
+  // 网关路径（`/v1/messages`）逐字节同形但凭据互不通用 ⇒ **必须两个 provider
+  // id**，不能靠凭据里的字段区分（同一张卡片混着两站的号，额度/签到会串）。
+  //
+  // 实现完全共用（`MonkeycodeAuth` / `MonkeycodeAdapter` / `monkeycode-credits`），
+  // 只在 `product` 上分叉：`MONKEYCODE_PRODUCTS` 是站点清单的唯一真相源。
+  //
+  // 与 qiniu **同格**的部分：粘贴静态 Key 建账号、没有 OAuth、没有 refresh 端点。
+  // ⚠️ 与 qiniu 的**实质差异**：协议是 **Anthropic Messages**（`POST /v1/messages`
+  //    + SSE），不是 OpenAI 兼容（网关的 `/v1/chat/completions` 实测 404）；
+  //    且网关通道每个请求都要 `X-OhMyAgent-Signature`（HMAC-SHA256 over prompt），
+  //    缺它恒 403 —— 签名在适配器里算。
+  //
+  // 服务名由 MonkeycodeAuth 依 product.id 派生 ⇒ 分别注册为
+  // `ctx.monkeycodeAuth` / `ctx.monkeycodeintlAuth`。
+  const createMonkeycode = (product: MonkeycodeProduct) => {
+    const auth = new MonkeycodeAuth(ctx, { product })
+    const adapter = registerMonkeycodeLlm(ctx, {
+      // 单凭据回退 ref：池里没有该站账号时用它（与其余 provider 同约定）。
+      credentialRef: credentialRef(product.defaultCredentialRef),
+      // 槽序列由**接线层**解析好传进来（适配器不直接读凭据）。
+      // `modelId` 透传：据此过滤「该模型正处于限流窗口」的账号。
+      slots: async (modelId?: string) => {
+        const entries = await pool.listAccounts(product.id)
+        const usable = await Promise.all(entries.map(async (entry) => {
+          if (!entry.enabled) return undefined
+          // ⚠️ 模型级限流标记：`modelId` 缺省时**不查** —— 传了会让被限流的账号
+          //    把整个目录一起拖空（与 qiniu / modelscope 同款判据）。
+          if (modelId !== undefined && modelId.length > 0) {
+            const resetAt = entry.modelRateLimits?.[modelId]
+            if (typeof resetAt === 'number' && resetAt > Date.now()) return undefined
+          }
+          const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+          if (!resolved) return undefined
+          try {
+            const parsed = JSON.parse(resolved.value) as MonkeycodeCredential
+            if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) return undefined
+            return { accountId: entry.id, credential: parsed }
+          } catch {
+            // ⚠️ 坏 JSON 不该让整个 provider 不可用：跳过这一槽，其余账号照常轮换。
+            return undefined
+          }
+        }))
+        return usable.filter((slot): slot is { accountId: string; credential: MonkeycodeCredential } => slot !== undefined)
+      },
+      accountPool: pool,
+      product,
+      // 图片：网关模型在内置清单里都不声明 `supportsImage`（`GET /v1/models`
+      // 实测 405，拿不到能力表）⇒ 适配器会显式抛 `UNSUPPORTED_CONTENT`，
+      // 而不是把图片静默丢掉。
+      readImage: makeReadImage(ctx),
+    })
+    return { auth, adapter }
+  }
+  const { auth: monkeycode, adapter: monkeycodeAdapter } = createMonkeycode(MONKEYCODE)
+  const { auth: monkeycodeIntl, adapter: monkeycodeIntlAdapter } = createMonkeycode(MONKEYCODE_INTL)
+
+  // ===== 百智云（`baizhi`）—— 静态 Key 直连，**按量计费** =====
+  //
+  // 与 MonkeyCode 的关键差别（都是实测结论，不是设计偏好）：
+  //   * 认证：`x-api-key: sk-…`（**不用** cookie、**不签** HMAC）；
+  //   * 额度：没有每日额度、没有积分、没有签到接口 ⇒ 注册表里**不写
+  //     `credits`**，积分面板不出现这一家；
+  //   * 目录：`GET /api/anthropic/v1/models` 实测可用（45 条），故走
+  //     `RemoteCatalogGate` 动态拉取 + 内置 15 条兜底；
+  //   * 续期：Key 是静态材料 ⇒ `isBaizhiRefreshable()` 恒 false，不进
+  //     `SELF_HEAL_REFRESHABLE_PROVIDERS`。
+  const baizhi = new BaizhiAuth(ctx)
+  const baizhiAdapter = registerBaizhiLlm(ctx, {
+    credentialRef: credentialRef(BAIZHI.defaultCredentialRef),
+    // 槽序列由**接线层**解析好传进来（适配器不直接读凭据）。
+    // `modelId` 透传：据此过滤「该模型正处于限流窗口」的账号。
+    slots: async (modelId?: string) => {
+      const entries = await pool.listAccounts(BAIZHI.id)
+      const usable = await Promise.all(entries.map(async (entry) => {
+        if (!entry.enabled) return undefined
+        // ⚠️ 模型级限流标记：`modelId` 缺省时**不查** —— 传了会让被限流的账号
+        //    把整个目录一起拖空（与 monkeycode / qiniu 同款判据）。
+        if (modelId !== undefined && modelId.length > 0) {
+          const resetAt = entry.modelRateLimits?.[modelId]
+          if (typeof resetAt === 'number' && resetAt > Date.now()) return undefined
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (!resolved) return undefined
+        try {
+          const parsed = JSON.parse(resolved.value) as BaizhiCredential
+          if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) return undefined
+          return { id: entry.id, apiKey: parsed.access_token }
+        } catch {
+          // ⚠️ 坏 JSON 不该让整个 provider 不可用：跳过这一槽，其余账号照常轮换。
+          return undefined
+        }
+      }))
+      return usable.filter((slot): slot is { id: string; apiKey: string } => slot !== undefined)
+    },
+    accountPool: pool,
+    product: BAIZHI,
+    readImage: makeReadImage(ctx),
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -4097,6 +4964,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
        * 回归断言见 `buddy-ratelimit-misreport.spec.ts` 的「zcode 同型缺陷判定」段。
        */
       fallback: { kind: 'custom', resolve: async () => await zcode.current() },
+      // ZCode 用户要求（2026-10-30）：按 DSH sessionId 做账号亲和（同一会话
+      // **优先**落同一账号；账号今日负载达阈值后会被沉底，正在跑的会话会迁移一次
+      // 以摊平「长会话独占一个号」，见 `session-balance.ts` 的溢出均衡），没有
+      // sessionId 的请求（如本机 OpenAI 网关的一次性调用）随机分摊。
+      // 其余 provider 不设本项，继续走手动顺序。
+      accountSelection: 'session-balance',
     },
   ),
   refresh: async () => {
@@ -4315,6 +5188,32 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`)
   })
 
+  // ===== MiniMax 专属 60s 续期巡检 =====
+  //
+  // ⚠️⚠️ **这是本次重构的核心**：全局 30min 调度器对 MiniMax 已改为
+  // **只对账**（`MinimaxAuth.refreshAll` 不再发 grant，见该方法注释），
+  // MiniMax 的轮换改由这里承担 —— margin 5min + 账号散列抖动 ⇒
+  // 各账号续期时刻天然错开，旧形态「全池同秒过期」的结构性根因被拆除。
+  //
+  // ⚠️ 两个站点**各一条**（同 repair 的双站点纪律，漏一处即该站静默不续期）。
+  //
+  // ⚠️⚠️ **必须挂 `ctx.effect` 回收**（2026-10-27 审计修）。
+  //    修前这两行是裸调用：`startRenewPatrol` 装了一个 60s `setInterval`，
+  //    而**没有任何 clear 路径**（`unref` 只保证「不阻止进程退出」，不保证
+  //    「fiber 卸载后停手」）。实测 `fiber.dispose()` 后推进 130s ⇒ 巡检 tick
+  //    照跑，而旧实例读的是**共享 credentials 后端**（不是快照）⇒ 它会继续对
+  //    **新池**发 grant；插件热重载时旧实例没死 + 新实例已起 ⇒ **两个实例并发
+  //    轮换同一批一次性 RT**，输家拿到 `invalid_grant` 并把好号标死
+  //    （`refreshable:false` 是单向门）—— 恰好是本 PR 自己声称要修的形态。
+  //    ⚠️ 回收点必须与 `refreshScheduler.stop()`（下方 `ctx.effect`）同处：
+  //    那是本文件既有的生命周期约定，别另开一套。
+  ctx.effect(() => () => {
+    minimax.stopRenewPatrol()
+    minimaxIntl.stopRenewPatrol()
+  })
+  void minimax.startRenewPatrol(pool)
+  void minimaxIntl.startRenewPatrol(pool)
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -4406,6 +5305,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   const refreshScheduler = new MultiAccountRefreshScheduler({
     refresh: refreshAllCredentials,
     intervalMs: REFRESH_INTERVAL_MS,
+    /**
+     * 首轮延后 15s（issue #20）：宿主启动时插件并发初始化，立即对全量账号
+     * 发续期会和启动路径抢网络/凭据存储，日志里常见一串冷启动 `fetch failed`。
+     * 周期定时器仍然立刻武装；只有首轮让路。
+     */
+    initialDelayMs: 15_000,
     isPoolEmpty: async () => (await pool.listAllAccounts()).length === 0,
     // ⚠️ 可选链：`logger` 在极简 profile 下可能缺席，而日志不该成为续期的
     // 单点故障（与仓库既有的 `ctx.logger?.warn?.()` 一致）。
@@ -4473,6 +5378,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcodeAdapter.stop()
     // AStudio（讯飞）的 stop() 置 active=false，阻止在途刷新回写凭据。
     astudio.stop()
+    // MonkeyCode 两站 + 百智云：`stop()` 置 `active=false`，阻止在途的
+    // 浏览器登录在卸载之后继续收窗/写回凭据（`loginViaBrowser` 每轮都判它）。
+    monkeycode.stop()
+    monkeycodeIntl.stop()
+    baizhi.stop()
   }, 'jet-hub: multi-account refresh scheduler')
 
   // 保留旧的 stop scheduler（兼容旧命令）
@@ -4491,6 +5401,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcodeAdapter.stop()
     // 同上：AStudio 的在途刷新必须随插件一起回收。
     astudio.stop()
+    // MonkeyCode 两站 + 百智云：`stop()` 置 `active=false`，阻止在途的
+    // 浏览器登录在卸载之后继续收窗/写回凭据（`loginViaBrowser` 每轮都判它）。
+    monkeycode.stop()
+    monkeycodeIntl.stop()
+    baizhi.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== OfficeAce（华为 ModelArts MaaS，云端直连）=====
@@ -5099,7 +6014,23 @@ async function fetchBalanceReading(
       return adapter
     }
   }
-  const modelAdapters: Record<string, { listAllModels(): readonly { id: string; name: string }[] }> = {
+  // ⚠️⚠️ 类型必须是 **`ModelCatalogSource`**，不能写成 `{ listAllModels() }`（二审 P3-1）。
+  //
+  //    写成「只带 `listAllModels` 的结构类型」是**合法赋值**（`catalogReadyForBulkWrite`
+  //    是可选成员），所以 TypeScript **不会**报错。
+  //
+  // ⚠️ **但类型收敛只保护「必需」成员**（2026-11-05 三审回归面 P2-2 订正）：
+  //    `catalogReadyForBulkWrite` 至今仍是**可选**成员（`src/jet-hub-rpc.ts` 的
+  //    `ModelCatalogSource` 里带 `?`）⇒ 把它**改名或删除仍然是合法赋值、仍然零
+  //    编译错误**。类型收敛的真实收益只有「必需成员 `listAllModels` 的签名不兼容
+  //    会报错」这一条，**不要**据此以为「有类型保护了，不用加运行时守卫」。
+  //    真正锁住接线的是行为级用例（`tests/unit/jet-hub-rpc.spec.ts` 里对
+  //    `aggregate` 冷帧 `notReady` 的那组），**不是**这个类型别名。
+  //
+  //    本仓库「缺一处就静默失效」的形态已经复发过多次（`SELF_HEAL_REFRESHABLE_PROVIDERS`、
+  //    `WIRED_EXPIRY_PROVIDERS` 等）⇒ 凡是「靠可选成员挂钩」的表，**判据必须打在
+  //    行为上**，源码/类型级断言只能当辅助。
+  const modelAdapters: Record<string, ModelCatalogSource> = {
     // `codearts` 是 registerCodeArtsLlm 返回的**适配器实例**（与 CodeArtsAuth
     // 服务实例 `service` 不同名，故这里可以简写）。
     codearts: pruned(CODEARTS_PROVIDER, codearts),
@@ -5129,6 +6060,31 @@ async function fetchBalanceReading(
     //    退化到 `llm.listModels`（已按黑名单过滤）⇒ 「关闭整个 provider」时
     //    漏写黑名单 ⇒ 出现「provider 显示已关闭、模型却仍可选用」的矛盾态。
     modelscope: pruned(MODELSCOPE.id, modelscopeAdapter),
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）。必须进这张表，理由与 modelscope
+    //    逐条相同：`provider.status` 的「已关闭」判据是 `total > 0 &&
+    //    disabled === total`，读的是 `listAllModels()` 那份**不套黑名单**的全量
+    //    目录。表里缺它 ⇒ 退化到已过滤的 `llm.listModels` ⇒「关闭整个 provider」
+    //    时漏写黑名单 ⇒「provider 显示已关闭、模型却仍可选用」的矛盾态。
+    qiniu: pruned(QINIU.id, qiniuAdapter),
+    // ⚠️ MonkeyCode（2026-11-02）：必须进这张表，理由与 modelscope / qiniu 逐条
+    //    相同 —— `provider.status` 的「已关闭」判据是 `total > 0 &&
+    //    disabled === total`，读的是 `listAllModels()` 那份**不套黑名单**的全量
+    //    目录。表里缺它 ⇒ 退化到已过滤的 `llm.listModels` ⇒「关闭整个 provider」
+    //    时漏写黑名单 ⇒「provider 显示已关闭、模型却仍可选用」的矛盾态。
+    //    ⚠️ 它的目录是「白泽远端 + 网关常量」两段合并（`mergeWithGatewayModels`）
+    //    ⇒ 即便白泽目录拉失败也有 9 条网关常量兜底，不会出现 `total === 0`。
+    monkeycode: pruned(MONKEYCODE.id, monkeycodeAdapter),
+    // ⚠️ 国际站同样必须进这张表：理由与国内站逐条相同 —— 「关闭整个 provider」
+    //    依赖 `listAllModels()` 那份**不套黑名单**的全量目录，漏了会漏写黑名单。
+    monkeycodeintl: pruned(MONKEYCODE_INTL.id, monkeycodeIntlAdapter),
+    // ⚠️ 百智云同样必须进这张表：理由与 monkeycode 逐条相同 ——
+    //    `provider.status` 的「已关闭」判据读的是 `listAllModels()` 那份
+    //    **不套黑名单**的全量目录，表里缺它 ⇒「关闭整个 provider」时漏写
+    //    黑名单 ⇒「provider 显示已关闭、模型却仍可选用」的矛盾态。
+    baizhi: pruned(BAIZHI.id, baizhiAdapter),
+    magicrew: pruned(MAGICREW.id, magicrewAdapter),
+    // MagiCrew 国际站（2026-11-01）：与国内版同款剪枝，目录/黑名单逻辑共用。
+    magicrewintl: pruned(MAGICREW_INTL.id, magicrewIntlAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
     // AStudio（上游 MAAS 云端直连）：目录来自 model-manager 远端 + 兜底表，同其余渠道。
@@ -5507,6 +6463,33 @@ async function fetchBalanceReading(
       // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
       //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效。
       ['modelscope', modelscope],
+      // ⚠️ **本 fork 独有**的 provider（qiniu，2026-10-29）。
+      //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效
+      //    （`provider-runtime.ts` 的注册表是按本数组逐个 `registerProviderRuntime`
+      //    建的；主循环本身不需要改）。
+      ['qiniu', qiniu],
+      // ⚠️ MonkeyCode（2026-11-02）：漏加这一行 = 它不出现在注册表里 ⇒
+      //    续期 / 积分 / 探测三条链路全部**静默失效**（`provider-runtime.ts` 的
+      //    注册表是按本数组逐个 `registerProviderRuntime` 建的，主循环本身
+      //    不需要改）。
+      ['monkeycode', monkeycode],
+      // ⚠️ 国际站必须**单独一行**（2026-11-02）：`provider-runtime-wiring.spec.ts`
+      //    与续期/积分/探测三条链路都按 provider id 取实例，漏了它 = 国际站账号
+      //    的过期检测、积分刷新、重测按钮全部静默失效（与 magicrewintl 同型）。
+      ['monkeycodeintl', monkeycodeIntl],
+      // ⚠️ 百智云（2026-11-02）：漏加这一行 = 它不出现在注册表里 ⇒
+      //    续期 / 积分 / 探测三条链路全部**静默失效**（`provider-runtime.ts`
+      //    的注册表是按本数组逐个 `registerProviderRuntime` 建的）。
+      ['baizhi', baizhi],
+      // ⚠️ 超级麦吉（Magicrew，2026-10-29）：值必须是 `registerJetHubRpc` 的
+      //    `auths.magicrew` 是**同一个对象**，否则守卫用例布在该实例上的 spy
+      //    收不到本循环的调用（本仓库复发过 6 次）。
+      //    漏加这一行 = 它不进注册表 ⇒ 续期/积分/探测三条链路全部静默失效。
+      ['magicrew', magicrewAuth],
+      // ⚠️ 国际站必须**单独一行**（2026-11-01）：`provider-runtime-wiring.spec.ts`
+      //    与续期/积分/探测三条链路都按 provider id 取实例，漏了它 = 国际站账号
+      //    的 token 永不过期检测、积分永不刷新、重测按钮点了没反应（全静默）。
+      ['magicrewintl', magicrewIntlAuth],
     ]
     for (const [id, auth] of registry) {
       const descriptor = descriptorOf(id)
@@ -5693,6 +6676,31 @@ async function fetchBalanceReading(
     //    「客户端已登记但宿主没有同名键」⇒ zcode-wiring 的守卫会红，
     //    且 Jet Hub 的 modelscope 面板所有 RPC 全部 `unknown provider`。
     modelscope,
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：同款陷阱第 **六** 次。漏加 ⇒
+    //    客户端的 qiniu 面板所有 RPC 报 `unknown provider`，且
+    //    `credits-balance-self-heal.spec.ts` 的反向守卫（JetHubAuths 每个键
+    //    必须在自愈表或豁免表里）会红。
+    qiniu,
+    // ⚠️ MonkeyCode（2026-11-02）：值必须是 `registerProviderRuntime` 那个
+    //    registry 数组里 `['monkeycode', monkeycode]` 的**同一个实例**，否则
+    //    `provider-runtime-wiring.spec.ts` 布在该实例上的 spy 收不到调用。
+    //    漏加 ⇒ 客户端的 monkeycode 面板所有 RPC 报 `unknown provider`。
+    monkeycode,
+    // ⚠️ 国际站同款陷阱：值必须是 `registerProviderRuntime` 那个 registry 数组里
+    //    `['monkeycodeintl', monkeycodeIntl]` 的**同一个实例**，否则
+    //    `provider-runtime-wiring.spec.ts` 布在该实例上的 spy 收不到调用。
+    monkeycodeintl: monkeycodeIntl,
+    // ⚠️ 百智云：值必须是上面 registry 数组里 `['baizhi', baizhi]` 的**同一个
+    //    实例**，否则 `provider-runtime-wiring.spec.ts` 布在该实例上的 spy
+    //    收不到调用。漏加 ⇒ 客户端的 baizhi 面板所有 RPC 报 `unknown provider`。
+    baizhi,
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）：值必须是 `registerProviderRuntime` 那个
+    //    registry 数组里 `['magicrew', magicrewAuth]` 的**同一个实例**，否则
+    //    `provider-runtime-wiring.spec.ts` 布在该实例上的 spy 收不到调用。
+    magicrew: magicrewAuth,
+    // ⚠️ MagiCrew 国际站（2026-11-01）：必须与上面 `['magicrewintl', magicrewIntlAuth]`
+    //    是**同一个实例**，否则 spec 布在该实例上的 spy 收不到调用。
+    magicrewintl: magicrewIntlAuth,
   }, modelAdapters)
 
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已

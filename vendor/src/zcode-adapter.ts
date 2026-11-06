@@ -77,6 +77,7 @@ import {
   shouldFallbackToOtherChannel,
   type ZcodeChannel,
 } from './zcode-transport.js'
+import { zcodeInferenceAppVersion } from './zcode-upstream.js'
 import {
   buildZcodeSystemBlocks,
   withCallerSystem,
@@ -123,6 +124,7 @@ import {
   readZcodeBusinessCodeFromBody,
 } from './zcode-diagnostics.js'
 import { planSessionTitleThinking } from './session-title.js'
+import { sessionBalanceEnabled } from './session-balance.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -214,8 +216,12 @@ function resolveRequestTimeoutMs(product: ZcodeProduct): number {
 export interface ZcodeAdapterOptions {
   /** 单凭据回退 ref（无账号池时）。 */
   credentialRef: CredentialRef
-  /** 解析当前可用凭据。 */
-  resolveCredential: (modelId?: string) => Promise<ZcodeCredential | undefined>
+  /** 解析当前可用凭据（第二参是 DSH 会话 id；zcode 用它做账号亲和）。 */
+  resolveCredential: (
+    modelId?: string,
+    sessionId?: string,
+    picked?: { accountId?: string },
+  ) => Promise<ZcodeCredential | undefined>
   /**
    * 凭据失效时的处理。
    *
@@ -901,8 +907,9 @@ export class ZcodeAdapter extends LlmAdapter {
      * 里那次 add + 写进池的 `modelRateLimits`），**单点删除任一处行为断言仍全绿**，
      * 故必须直接断言「首次切号时 `tried` 含失败账号、且标记已写下」。
      */
-    let credential = await this.resolveCredentialOrThrow(options)
-    let activeAccountId = this.options.currentAccountId?.()
+    const resolved = await this.resolveCredentialOrThrow(options)
+    let credential = resolved.credential
+    let activeAccountId = resolved.accountId ?? this.options.currentAccountId?.()
     if (activeAccountId !== undefined && activeAccountId.length > 0) tried.add(activeAccountId)
 
     /**
@@ -1427,6 +1434,14 @@ export class ZcodeAdapter extends LlmAdapter {
             status: response.status,
             shape: describeZcodeRequestShape(body.system, body.messages),
             /**
+             * ★ 实际发出的客户端版本（Issue #45）。
+             *
+             * 3012 的判据是「版本号与身份块**同代**」⇒ 只报身份块字符数不够，
+             * 必须把版本一并打出来。取值与真实请求头**同源**
+             * （{@link zcodeInferenceAppVersion}），不另写门控。
+             */
+            appVersion: zcodeInferenceAppVersion(credential),
+            /**
              * ★ `logid` —— 上游侧排障的**唯一凭据**（2026-10-12 新增）。
              *
              * ⚠ **双来源**：体优先、头兜底。边缘 HTML 页的体里没有 `logid`，
@@ -1565,11 +1580,15 @@ export class ZcodeAdapter extends LlmAdapter {
    * 抽成方法是因为它现在出现在**切号循环之外**（凭据由循环内的切号逻辑更新），
    * 而「拿不到 → refresh → 再拿」这套顺序必须与既有实现逐字一致。
    */
-  private async resolveCredentialOrThrow(options: GenerateOptions): Promise<ZcodeCredential> {
-    let credential = await this.options.resolveCredential(options.model)
+  private async resolveCredentialOrThrow(
+    options: GenerateOptions,
+  ): Promise<{ credential: ZcodeCredential; accountId: string | undefined }> {
+    /** 本次请求私有的「实际选中账号」出口；不读进程级 Map，避免并发会话串号。 */
+    const picked: { accountId?: string } = {}
+    let credential = await this.options.resolveCredential(options.model, options.sessionId, picked)
     if (credential === undefined) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential(options.model)
+      credential = await this.options.resolveCredential(options.model, options.sessionId, picked)
     }
     if (credential === undefined) {
       throw new LlmError(
@@ -1578,7 +1597,7 @@ export class ZcodeAdapter extends LlmAdapter {
         'MISSING_CREDENTIAL',
       )
     }
-    return credential
+    return { credential, accountId: picked.accountId }
   }
 
   /**
@@ -1687,7 +1706,22 @@ export class ZcodeAdapter extends LlmAdapter {
       tried.add(activeAccountId)
     }
 
-    const next = await pool.getAvailableAccount<ZcodeCredential>(this.product.id, options.model, tried)
+    // ⚠ 生产 `AccountPool` 一定有 `getAvailableAccountForSession`；单测里的
+    //    结构化替身可能只实现 `getAvailableAccount`，故保留同语义的回落。
+    //    ⚠ 总开关 = **池里的面板开关**（Jet Hub 页头，每次现读）；替身没实现
+    //    `sessionBalanceEnabled` 时退回环境变量 `DSH_ZCODE_SESSION_BALANCE`
+    //    （默认开）。与 `credential-resolver.ts` ③ 处同一套判据，不会分叉。
+    const poolSwitch = typeof pool.sessionBalanceEnabled === 'function'
+      ? pool.sessionBalanceEnabled()
+      : sessionBalanceEnabled()
+    const next = poolSwitch && typeof pool.getAvailableAccountForSession === 'function'
+      ? await pool.getAvailableAccountForSession<ZcodeCredential>(
+          this.product.id,
+          options.model,
+          options.sessionId,
+          tried,
+        )
+      : await pool.getAvailableAccount<ZcodeCredential>(this.product.id, options.model, tried)
     if (next === null || next === undefined || tried.has(next.entry.id)) return undefined
     tried.add(next.entry.id)
     return {

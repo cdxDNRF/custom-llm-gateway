@@ -13,6 +13,7 @@
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status /
  *           nativeSearch.getEnabled / nativeSearch.setEnabled /
+ *           sessionBalance.getEnabled / sessionBalance.setEnabled /
  *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
@@ -121,6 +122,11 @@ import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
 import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname } from './autoclaw.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import type { ModelscopeAuth } from './modelscope-auth.js'
+// ⚠️ **本 fork 独有**（qiniu，2026-10-29）。
+import type { QiniuAuth } from './qiniu-auth.js'
+// ⚠️ **本 fork 独有**（monkeycode，2026-11-02）：第二家吃「粘贴 Key」的渠道
+//    （主路径是浏览器登录，手工 Key 只是备用，见 `src/monkeycode-auth.ts`）。
+import type { MonkeycodeAuth } from './monkeycode-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
 // AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 凭据是客户端登录后
@@ -130,6 +136,17 @@ import { ACCIO } from './accio-product.js'
 //    `isAstudioRefreshable` 与凭据类型在 `astudio.ts`（产品常量在 `astudio-product.ts`）。
 import { ASTUDIO } from './astudio-product.js'
 import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
+import {
+  magicrewCredentialFingerprint,
+  magicrewDisplayNickname,
+  magicrewExpiresAtMs,
+  parseMagicrewCredential,
+  type MagicrewAuth,
+  type MagicrewCredential,
+} from './magicrew-auth.js'
+// ⚠️ 2026-11-01：MagiCrew 国际版（`magicrewintl`）接入 —— 登录/导入/轮询分支
+//    两站共用同一份实现，只差这个 `product` 常量（host / webOrigin / 凭据 ref 前缀）。
+import { MAGICREW, MAGICREW_INTL } from './magicrew-product.js'
 import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
 import { loginNeedsExternalAction } from './login-failure.js'
 import {
@@ -143,6 +160,15 @@ import {
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
+// ⚠️ **本 fork 独有**（qiniu，2026-10-29）。
+import { QINIU } from './qiniu-product.js'
+import { maskQiniuKey } from './qiniu.js'
+// ⚠️ **本 fork 独有**（monkeycode，2026-11-02）：`maskMonkeycodeKey` 在宿主侧
+//    打码（不下发明文）；`inferMonkeycodeChannel` 让卡片显示「白泽 / 网关」，
+//    `parseMonkeycodeCredential` 供既有凭据的容错解析。
+import { MONKEYCODE, MONKEYCODE_INTL } from './monkeycode-product.js'
+import { maskMonkeycodeKey, type MonkeycodeCredential } from './monkeycode.js'
+import { parseMonkeycodeCredential } from './monkeycode-auth.js'
 import { CODELY_PROVIDER_ID, startCodelyDeviceLogin, decodeCodelyJwtExpMs } from './codely-auth.js'
 import type { CodelyAuth } from './codely-auth-service.js'
 import { CODERLY } from './codely-product.js'
@@ -277,6 +303,16 @@ import { handleGeminiRpc } from './gemini-rpc.js'
 import { handleQoderRpc } from './qoder-rpc.js'
 import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
+import { handleQiniuRpc } from './qiniu-rpc.js'
+import { handleMonkeycodeRpc, monkeycodeSlotNamesOf } from './monkeycode-rpc.js'
+// ⚠️ **本 fork 独有**（baizhi，2026-11-02）：第三家吃「粘贴 Key」的渠道
+//    （主路径是浏览器登录 + 大模型商店取 `sk-`，手工粘贴只是备用）。
+import type { BaizhiAuth } from './baizhi-auth.js'
+import { BAIZHI } from './baizhi-product.js'
+// ⚠️ `maskBaizhiKey` 在宿主侧打码（与 monkeycode / qiniu 同款）：客户端拿不到
+// 凭据，打码规则散到客户端必然与宿主漂移。
+import { maskBaizhiKey, type BaizhiCredential } from './baizhi.js'
+import { parseBaizhiCredential, handleBaizhiRpc, baizhiSlotNamesOf } from './baizhi-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
@@ -365,6 +401,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
+  RpcSessionBalanceGetEnabledResponse,
+  RpcSessionBalanceSetEnabledRequest,
+  RpcSessionBalanceSetEnabledResponse,
   RpcPanelEntryGetResponse,
   RpcPanelEntrySetRequest,
   RpcPanelEntrySetResponse,
@@ -1112,7 +1151,14 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
         accountId = entry.id
         nickname = entry.nickname
         let resolved = await deps.resolve(credentialRef(entry.credentialRef))
-        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+        // ⚠️ `product` 在生产调用点是 `undefined` ⇒ 必须可选链，否则「凭据未配置」那一格会抛
+        //    `Cannot read properties of undefined (reading 'id')`。**旧码**
+        //    （变异验证时还原成这个）：`(product as { id?: string }).id === ASTUDIO.id`。
+        //    ⚠️ 本处症状**在界面上看不出来**：下面的 `catch` 把异常吞成 `status = null`
+        //    + 一条 warn，与「查询失败」同形 ⇒ 判据只能打在 `deps.warn` 上
+        //    （断言 `status === null` 在变异态下恒绿，实测过）。
+        //    长注释与影响面见 `collectCreditBalances` 同名处。
+        if (resolved === undefined && (product as { id?: string } | undefined)?.id === ASTUDIO.id) {
           resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
         }
         if (resolved !== undefined) {
@@ -1352,7 +1398,38 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
     if (balance === null) {
       try {
         let resolved = await deps.resolve(credentialRef(entry.credentialRef))
-        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+        /**
+         * ⚠️⚠️ **`product` 是 `undefined`，必须用可选链读 `.id`**（2026-11-02 真机报障修）。
+         *
+         * **`src/` 里的生产调用点都传 `undefined`**（`collectCreditBalances(accounts, undefined, {...})`，
+         * product 由各 provider 的 impl 闭包住）。⚠️ 别写成「所有调用点」——
+         * `tests/unit/jet-hub-rpc.spec.ts` 里有一批老用例传的是 `WORKBUDDY`（真值），
+         * 正因为如此这个缺陷**逃过了既有用例**（它们走不进 `resolved === undefined` 那一格）。
+         * 而 `resolved === undefined` 恰恰是「**凭据未配置**」—— 最典型的来源是
+         * **新建账号时的占位条目（面板显示「登录中…」）**：它已经在池里、但凭据还没落盘。
+         *
+         * **旧码**（变异验证时还原成这个）：
+         * `(product as { id?: string }).id === ASTUDIO.id` —— 短路求值到右边就抛
+         * `Cannot read properties of undefined (reading 'id')` ⇒ 被下面 `catch` 转成
+         * 「积分：Cannot read properties of undefined (reading 'id')」直接显示在面板上
+         * （用户 2026-11-02 的截图：AutoClaw 国际版「登录中…」卡片，积分行就是这串）。
+         * 影响面 = **所有经本函数取余额的 provider**（任何「占位条目 / 凭据丢失」的账号都会这样），
+         * 只是以前没人盯着 pending 卡片的积分行看。⚠️ 别在这里写具体家数：
+         * 本文件的「家数」随 `PROVIDER_REGISTRY` 变动，写死必然腐坏。
+         *
+         * ⚠️ 同因的另一处是 `collectCreditsStatus`（**签到状态**，不是 `collectClaimResults` ——
+         * 后者体内没有这个写法，别照着改错地方）。那处的症状不同：`catch` 把它吞成
+         * `status = null` + 一条 warn，界面上与「查询失败」同形 ⇒ 它的判据只能打在 warn 上。
+         *
+         * ⚠️⚠️ **这个 ASTUDIO 兜底分支本身当前恒不可达**（2026-11-02 审查用 git 证实）：
+         * 调用点早在 `ea5e64d`（2026-10-10）就改成传 `undefined`，而兜底是
+         * `96f2001`（2026-10-17）才引入 ⇒ **自引入起就永远进不去**；一旦被触及
+         * （product 为 `undefined` / `null`）它只会抛，正是这次的报障。所以本次 `?.`
+         * 的净效果是「把抛中止」，**不是**「让兜底生效」—— 要不要恢复兜底是另一个决定
+         * （得让调用点把 product 传进来；通用分派路径上它不可得，见调用点注释）。
+         * 刻意保留死分支而不是删掉：删了将来恢复就没有落点，且删它要动所有调用点。
+         */
+        if (resolved === undefined && (product as { id?: string } | undefined)?.id === ASTUDIO.id) {
           resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
         }
         if (resolved === undefined) {
@@ -1605,6 +1682,28 @@ export interface JetHubAuths {
    * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
    */
   readonly astudio: AstudioAuth
+  /**
+   * 超级麦吉（Magicrew，2026-10-29）。
+   *
+   * ⚠️ 值必须是 `index.ts` 里 `registerProviderRuntime` 那个 `registry` 数组中
+   * `['magicrew', magicrewAuth]` 的**同一个对象**，否则守卫用例布在该实例上的
+   * spy 收不到注册循环的调用（本仓库复发过 6 次）。
+   */
+  readonly magicrew: MagicrewAuth
+  /**
+   * **MagiCrew 国际站**（`magicrewintl`，2026-11-01 用户要求）。
+   *
+   * ⚠️ 与 `magicrew` **共用同一个 `MagicrewAuth` 类**（两站只差产品配置），
+   * 故类型相同、只是**另一个实例** —— 与 `minimax` / `minimaxintl`、
+   * `qoder` / `qodercn` 同型。
+   * ⚠️ 两站账号体系**物理隔离**（同一个 Go 服务的两个数据面）、凭据 ref 前缀不同
+   * （`MAGICREW_*` / `MAGICREWINTL_*`）。若这里的**键与值接错**，症状是
+   * 「国际站账号的续期去刷了国内站凭据」，而 `authOf` 会把国际站账号
+   * 分派到**国内站实例**上。
+   * ⚠️ 值必须是 `index.ts` 里 `registerProviderRuntime` 的 `registry` 数组中
+   * `['magicrewintl', magicrewIntlAuth]` 的**同一个对象**（同 `magicrew` 那条）。
+   */
+  readonly magicrewintl: MagicrewAuth
   readonly autoclaw: AutoclawAuth
   /**
    * **AutoClaw 国际版**（`autoclawintl`）。
@@ -1626,6 +1725,42 @@ export interface JetHubAuths {
    * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
    */
   readonly modelscope: ModelscopeAuth
+  /**
+   * 七牛云 AI（Qiniu）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
+   *
+   * ⚠️ 值是 `QiniuAuth` **Service 实例**，与 modelscope 同款。
+   */
+  readonly qiniu: QiniuAuth
+  /**
+   * MonkeyCode —— **本 fork 独有**（2026-11-02）。
+   *
+   * ⚠️ 值是 `MonkeycodeAuth` **Service 实例**，与 modelscope / qiniu 同款。
+   * ⚠️ 它与 qiniu 都是「无 refresh 端点」的静态 Key 渠道 ⇒ 刻意**不进**
+   * `SELF_HEAL_REFRESHABLE_PROVIDERS`，而是登记在
+   * `tests/unit/credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`
+   * 豁免表里（带可核对理由）。漏登记即红 —— 那张表是反向守卫。
+   */
+  readonly monkeycode: MonkeycodeAuth
+  /**
+   * MonkeyCode 国际站（`monkeycode-ai.net`，2026-11-02）—— 与国内站**独立部署**：
+   * 账号池、会话 cookie、网关凭据完全不通用（实测国内 cookie 打国际站回 401）。
+   *
+   * ⚠️ 与 `monkeycode` 是**同一个类的两个实例**（只差 `product`）⇒
+   * `probeById` / `WRITES_RATE_LIMIT_PROVIDERS` / ref 前缀表 / 积分表每处都要
+   * 两站到位，漏一处静默失效（与 `minimax` / `minimaxintl` 同型）。
+   * ⚠️ 同样**不进** `SELF_HEAL_REFRESHABLE_PROVIDERS`，在
+   * `SELF_HEAL_EXEMPT` 里登记理由。
+   */
+  readonly monkeycodeintl: MonkeycodeAuth
+  /**
+   * 百智云（`baizhi`，2026-11-02）—— 静态 `sk-…` Key 直连
+   * `ai-models.app.baizhi.cloud`，**按量计费**、无每日额度/积分/签到。
+   *
+   * ⚠️ 它与 monkeycode 两站、qiniu 同为「无 refresh 端点」的静态 Key 渠道 ⇒
+   *    刻意**不进** `SELF_HEAL_REFRESHABLE_PROVIDERS`，由
+   *    `tests/unit/credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT` 记录理由。
+   */
+  readonly baizhi: BaizhiAuth
 }
 
 /**
@@ -1640,6 +1775,85 @@ export interface JetHubAuths {
 export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | undefined {
   if (!Object.hasOwn(auths, provider)) return undefined
   return (auths as unknown as Record<string, JetHubAuthLike>)[provider]
+}
+
+/**
+ * 账号卡片的 `expiresAt` 补丁（**唯一一份判据**，见 `magicrewExpiresAtMs`）。
+ *
+ * ⚠️ 拿不到时刻时返回**空对象**（不是 `{ expiresAt: undefined }`）：后者会在内存
+ * 池条目上留下一个「值为 undefined 的键」—— 与「从来没有过这个键」在展示上等价，
+ * 却让「读不到就**不写**」这条纪律在数据里看不出区别。空对象最诚实。
+ */
+function magicrewExpiresAtPatch(credential: MagicrewCredential): { expiresAt?: number } {
+  const expiresAt = magicrewExpiresAtMs(credential)
+  return expiresAt === undefined ? {} : { expiresAt }
+}
+
+/**
+ * 在账号池里找「**同一个超级麦吉账号**」的既有条目 —— **唯一一份判重实现**。
+ *
+ * ## 判据：凭据指纹（`magicrewCredentialFingerprint` = `sha256(jwt)` 前 16 位）
+ *
+ * ⚠️ 账户身份必须按**凭据**判，不能按 ref 名 / 账号 id：`account.create` 每次生成
+ * 新的 `${provider}-${shortId()}` 与 `MAGICREW_ACCOUNT_${suffix}`，而**同一个上游账号**
+ * 反复导入（本机浏览器 → 网页登录 → 再导入）拿到的是同一份 jwt ⇒ 指纹相同。
+ * 这也是**新建之前**判重的意义：不判就会攒出多张指向同一个号的卡片
+ *（用户看到重复卡片 + 积分重复显示），而「读取侧去重 / UI 过滤」是治标。
+ *
+ * ## 三条边界（都在真实数据上踩过）
+ *
+ * 1. **读不到凭据的账号要跳过**（`resolved === undefined`、或值不是合法 JSON、
+ *    或没有 `jwt`）。这是本仓库的既定口径：**无法判定 ≠ 失配** —— 判成「不重复」
+ *    会造出重复卡片，判成「重复」会**覆盖掉别人的凭据**（后者更不可逆）。
+ *    ⚠️ 逐账号按**它自己的** `credentialRef` resolve：多账号广播（拿 A 的凭据判 B）
+ *    在本仓库已复发多次。
+ * 2. **ref 名不参与判据**：`importFromLocalBrowser` 会把凭据写到默认 ref
+ *    （`MAGICREW_ACCESS_TOKEN`），若池里恰好有一条账号用的就是那个 ref / 那份凭据，
+ *    它**照样是命中** —— 因为本函数遍历的是**该 provider 名下全部**条目
+ *    （`pool.listAccountsByProvider(provider)`，`provider` 由调用方按站传入）并各自
+ *    resolve，而不是只看 `MAGICREW_ACCOUNT_*` 形态的 ref。
+ *    ⚠️ 2026-11-01 二审更正：本段此前写「遍历**全部** `provider === 'magicrew'` 的条目」，
+ *    那是接入国际站**之前**的描述。现在按传入的 provider 过滤，两站互不可见
+ *    —— 否则国际站账号会被国内站那条腿判成「已存在」而不落库。
+ * 3. `skipAccountId` 只给**网页版登录**腿用：那条腿先登记了自己的占位条目
+ *    （`login.poll` 要靠它知道这个 id 存在），判重时必须把它自己排除，
+ *    否则「新建的占位条目」会被判成「已存在的同账号」。
+ *
+ * ⚠️ 判据是 **jwt 指纹**，而同一账号**重新登录会拿到新的 jwt**（实测同一账号
+ * 两把 jwt：`iat` 差 56 秒、`jti` 不同）⇒ 这种情形**拦不住**，会各成一张卡。
+ * 这是已知边界，见本次报障报告（要真正闭合需要上游的稳定账号标识）。
+ */
+async function findMagicrewAccountByFingerprint(params: {
+  ctx: Context
+  pool: AccountPool
+  /**
+   * ⚠️ **必填**（2026-11-01 接入国际站时补）：按 provider 分别判重。
+   * 两站的 jwt 来自不同 host（`i-magic-service.letsmagic.cn` / `magic-service.magicrew.ai`），
+   * 指纹本来不会撞；但**不限定 provider 就会跨站扫池** —— 一旦将来指纹口径变化
+   * （例如都退化成「同手机号」），就会出现「登录国际站却把国内站的卡改掉」这种错位。
+   */
+  provider: string
+  fingerprint: string
+  /** 网页版登录腿：跳过**本次自己**的占位条目（见上面边界 ③）。 */
+  skipAccountId?: string
+}): Promise<ProviderAccountEntry | undefined> {
+  const { ctx, pool, provider, fingerprint, skipAccountId } = params
+  if (fingerprint.length === 0) return undefined
+  for (const existing of pool.listAccountsByProvider(provider)) {
+    if (existing.id === skipAccountId) continue
+    const resolved = await ctx.credentials.resolve(credentialRef(existing.credentialRef))
+      .catch(() => undefined)
+    // ⚠️ 边界 ①：读不到 ⇒ 跳过（既不判「重复」也不判「不重复」）。
+    if (resolved === undefined) continue
+    let same = false
+    try {
+      const parsed = JSON.parse(resolved.value) as { jwt?: unknown }
+      same = typeof parsed.jwt === 'string'
+        && magicrewCredentialFingerprint(parsed.jwt) === fingerprint
+    } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号（同上） */ }
+    if (same) return existing
+  }
+  return undefined
 }
 
 /**
@@ -1678,6 +1892,7 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
  *（`tests/unit/credits-runtime-parity.spec.ts` 的 `vi.mock('provider-credits')`）——
  * 断言仍打在**端点响应**上，判别力与原形参方案逐条等价。
  */
+
 export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
@@ -1704,6 +1919,27 @@ export function registerJetHubRpc(
  */
 export interface ModelCatalogSource {
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
+  /**
+   * 「我这份 `listAllModels()` **确认**来自远端完整读取」的适配器自报钩子。
+   *
+   * ## 用途（`model.list` 的「已下架」判据）
+   *
+   * `model.list` 补回黑名单条目时，只补**仍在售**的（否则上游已下架、
+   * 用户曾关掉的模型会永久留在设置页、点开必然 404）。
+   * 但「不在 `listAllModels()` 里」**不足以**证明已下架：冷缓存 / 远端降级时
+   * 它返回的是各家**编译期兜底表**（远端目录的**子集** —— Issue IKJW33 实测
+   * `cline` 冷缓存 3 条 vs 远端 460 条）。拿子集当在售集合会把用户关掉的
+   * **在售**模型判成已下架 ⇒ 从设置页彻底消失、无法重新打开。
+   *
+   * ⇒ 只有本方法返回 `true` 时才允许隐藏；返回 `false` / 未实现（`undefined`）
+   * 一律**放弃判据**（照旧补回）。方向与 `dead-model-store.ts` 的
+   * 「不从残缺目录反推」一致：**宁可留幽灵，不可删在售**。
+   *
+   * ⚠️ **可选**：只有能证明自己目录来源的家实现它（当前只有 codearts ——
+   * 它有两个目录端点、且由接线层的 `catalogComplete` 上报两来源成败）。
+   * 其余家不实现 ⇒ 行为与加这条判据之前逐字节一致。
+   */
+  catalogConfirmedRemote?(): boolean
   /**
    * 聚合目录（**可选** —— 只有聚合适配器实现它）。
    *
@@ -1876,7 +2112,7 @@ export interface ModelCatalogSource {
  *
  * | 调用点 | 需求 | 对「远端那一半缺失」的动作 |
  * |---|---|---|
- * | `model.setAllDisabled` | **必须完整**（要写黑名单） | 判 `complete`：**拒绝且不落盘** |
+ * | `model.setAllDisabled` | **有新增项时必须完整**（要写黑名单） | 判 `complete`：**拒绝且不落盘**；⚠️ 例外：`closeProvider === false`（模型列表屏）且 `notReady === undefined` 时**放行**（只关可见项、传 `'keep'` 不动意图） |
  * | `provider.setEnabled` | **远端读成功即可**（要写黑名单） | 判 `remoteError`：读失败**拒绝**；读到但为空**照常关闭**；**适配器自报未就绪（`notReady`）拒绝** |
  * | `provider.status` | 只要「能否证明已关闭」 | `remoteError` 或 `notReady` ⇒ **保守报未关闭**（安全方向） |
  * | `account.test` | **尽力而为**（只要一个 id 就能测） | 用拿到的那些照常测 |
@@ -1885,7 +2121,12 @@ export interface ModelCatalogSource {
  * 前者是**供应商级**开关，「远端读到但为空」（无账号门控）时并集只剩适配器
  * 兜底表，而该供应商本来就没有账号 ⇒ 模型选择器里一条都选不到，用兜底表写黑名单
  * 不会造成「显示已关闭而模型仍可选」；若按 `complete` 拒绝，**无账号的供应商
- * 将永远无法关闭**。后者是模型级批量操作，语义上要求目录完整，维持原判据。
+ * 将永远无法关闭**。后者是模型级批量操作，语义上要求目录完整 —— **唯一例外是
+ * 「模型列表屏」**（`closeProvider: false`）：那一屏用户的意图就是「关掉这家看得见
+ * 的模型」，而屏幕上那几条恰恰来自适配器兜底表（正是并集本身），拒绝它等于
+ * 「界面列着 5 个、点全关却说没有可关闭的模型」（2026-11-04 真机报障）。
+ * ⚠️ 该例外**必须排除** `notReady`（聚合冷启动，目录只有 `auto` 一条）：那是不确定
+ * 状态，放行会写出残缺黑名单。
  * ⚠️ 两者共用 {@link fullCatalogIds}（目录来源只此一处），差异只在失败时的动作。
  */
 interface FullCatalogResult {
@@ -2006,7 +2247,15 @@ async function fullCatalogIds(
   // ⚠️ 它抛错**不独自决定成败**：远端那一半仍可能成功，故单独吞掉。
   const adapterIds: string[] = []
   try {
-    for (const model of modelAdapters?.[provider]?.listAllModels() ?? []) adapterIds.push(model.id)
+    // ⚠️ **必须校验形状**（2026-11-05 四审端到端 P2-2）：适配器的类型契约是
+    // `LlmModelInfo[]`，但那是**编译期**保证。运行期若某个第三方/桩实现返回
+    // 字符串数组，`.id` 会取到 `undefined` ⇒ 黑名单被写成 `{"undefined":true}`
+    //（静默落盘、且 `total` 随之虚高）。实测：桩返回 `['a','b']` ⇒ 黑名单
+    // `{"a":true,"b":true,"undefined":true}`、状态 `{total:3,disabled:3}`。
+    // 过滤是**零成本**的（正常实现每条都过），故不必区分「该不该防」。
+    for (const model of modelAdapters?.[provider]?.listAllModels() ?? []) {
+      if (typeof model?.id === 'string' && model.id.length > 0) adapterIds.push(model.id)
+    }
   } catch {
     /* 适配器异常不该让整个读取失败：远端目录仍可用 */
   }
@@ -2019,8 +2268,11 @@ async function fullCatalogIds(
   }
   let remoteIds: string[]
   try {
+    // ⚠️ 同样校验形状（理由见上面 `adapterIds` 处；远端那份更值得防 —— 它是
+    // **网络来的**数据，上游一次改契约就会让 `undefined` 混进黑名单）。
     remoteIds = (await withTimeout(llm.listModels(provider), CATALOG_READ_TIMEOUT_MS))
-      .map((model) => model.id)
+      .map((model) => model?.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     return { ids: adapterIds, complete: false, remoteError: `读取模型列表失败：${reason}` }
@@ -2192,14 +2444,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * @param pool - 读黑名单（**在 await 之后**，理由见上）。
  * @param modelAdapters - 设置页目录来源（并集的一半）。
  * @param provider - 目标 provider。
- * @returns 可核对的目录 id 集合；`undefined` = **放弃核对**（三种情况见上）。
+ * @returns `known` = 可核对的目录 id 集合；`undefined` = **放弃核对**（三种情况见上）。
+ *          `catalog` = {@link fullCatalogIds} 的**原始并集结果**（不并黑名单）。
+ *          ⚠️ 两者**不可混用**：`known` 是 `catalog.ids` **并回黑名单**后的派生值，
+ *          拿它判「本次写入是否覆盖该家全量目录」**恒真**（等于「关一个模型就关掉
+ *          整个供应商」）—— 那个判据只能用 `catalog.ids`，见 `model.setDisabledMany`。
+ *          ⚠️ 顺带返回 `catalog` 是为了让关闭方向**不必再取一次目录**
+ *          （`fullCatalogIds` 冷缓存下真的会发远端拉取，多调一次就多一条网络依赖）。
  */
 async function readableCatalogIds(
   ctx: Context,
   pool: AccountPool,
   modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
   provider: string,
-): Promise<ReadonlySet<string> | undefined> {
+): Promise<{ known: ReadonlySet<string> | undefined; catalog: FullCatalogResult }> {
   const catalog = await fullCatalogIds(ctx, modelAdapters, provider)
   // ⚠️⚠️ **目录不可用 ⇒ 整体放弃核对**（判 `complete`，它同时覆盖
   // 「远端读失败」「远端读到但为空」「**适配器自报未就绪**（`notReady`）」三种形态
@@ -2208,7 +2466,7 @@ async function readableCatalogIds(
   // 「该模型可能已被上游下架」。
   // 不得退化成「只用 listAllModels 兜底表」：那会退回第一版的大面积误报。
   // 提示层错了不如不说。
-  if (!catalog.complete) return undefined
+  if (!catalog.complete) return { known: undefined, catalog }
   const known = new Set(catalog.ids)
   // ⚠️ 并回「被关着」的 id —— **必须在 await 之后读**（理由见函数头）。
   // ⚠️ `fullCatalogIds` 的并集**已含**适配器目录里那些被关闭的 id，
@@ -2217,7 +2475,7 @@ async function readableCatalogIds(
   for (const [id, disabled] of Object.entries(pool.listDisabledModels(provider))) {
     if (disabled === true) known.add(id)
   }
-  return known
+  return { known, catalog }
 }
 
 /**
@@ -2279,6 +2537,43 @@ function registerJetHubEndpoints(
     // ⚠️ AutoClaw 国际版（`autoclawintl`）—— 与 `autoclaw` 是**两个实例**。
     autoclawintl,
   } = auths
+  /**
+   * 在飞的目录核实（single-flight 去重，键 = provider id）。
+   *
+   * ⚠️⚠️ **为什么需要**（2026-11-05 四审端到端 P2-1）：`withTimeout` 只
+   * reject 外层 Promise、**不取消**底层请求（`listModels` 不接受 signal，
+   * 见 `withTimeout` 的注释）。而 `provider.status` 会被反复调用
+   *（挂载即发 + 每次 `toggleProvider` 后 + 用户点「重试」），每次都对
+   * 「派生判据说已关闭」的家发一轮核实 ⇒ 上游 5s 才返回时，连发两次就有
+   * **56 个在飞请求**（28 家 × 2 轮，实测：`峰值并发 = 56`、
+   * `listModels 总调用 = 56 次`）。
+   *
+   * 后果是正反馈：请求越多越容易 429，而 429 又会产出 `remoteError`。
+   *
+   * ⇒ 对同一 provider 的在飞核实去重：后来者 `await` 同一个 Promise。
+   * 语义等价（同一时刻的同一份目录），只是不再重复发请求。
+   *
+   * ⚠️ **必须完成后立即清除**（成功与失败都清）：目录是**可变**的，
+   * 缓存超过一次「在飞窗口」就会让用户看到过期目录。
+   * ⚠️ 作用域在 `registerJetHubEndpoints` 内（**不是模块级**）：测试会创建
+   * 多个实例，模块级 Map 会让它们互相复用对方的 Promise（假绿/假红）。
+   */
+  const catalogVerifyInFlight = new Map<string, Promise<FullCatalogResult>>()
+  /**
+   * 对同一 provider 的目录核实做 single-flight（见 `catalogVerifyInFlight`）。
+   *
+   * ⚠️ 只在**同一时刻**去重，不跨请求复用结果 —— 这正是「在飞」而非「缓存」
+   * 的含义。要缓存请另做（本仓库的目录缓存另有其事，见
+   * `src/model-catalog.ts` 的 `invalidateCatalogCache`）。
+   */
+  const verifyCatalogOnce = (provider: string): Promise<FullCatalogResult> => {
+    const existing = catalogVerifyInFlight.get(provider)
+    if (existing !== undefined) return existing
+    const pending = fullCatalogIds(ctx, modelAdapters, provider)
+      .finally(() => { catalogVerifyInFlight.delete(provider) })
+    catalogVerifyInFlight.set(provider, pending)
+    return pending
+  }
   /**
    * 积分能力表。
    *
@@ -2517,6 +2812,19 @@ function registerJetHubEndpoints(
     //    ⚠️ 它之前不在本表里的**真正**原因不是「不需要」，而是「`CodelyAuth` 当时连
     //    契约都没对上（`refreshAll` 是 2 参）」—— 见 A5 的修。
     CODERLY.id,
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）：`mgw_` api_key 寿命 **2 小时**，
+    //    正落在「睡眠/挂起恢复后到定时器补触发那一轮之间」这个窗口内。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh（本家有 `PUT /api/v1/model-gateway/tokens` 端点），且**日志零字**。
+    //    ⚠️ 与 `JetHubAuths.magicrew` 必须**同时**到位（`credits-balance-self-heal.spec.ts`
+    //    有正反两条守卫，只做一个会红另一条）。
+    'magicrew',
+    // ⚠️ MagiCrew 国际版（`magicrewintl`，2026-11-01）：与国内站**同一份实现、
+    //    同一个 2 小时 `mgw_` api_key 寿命、同一个 refresh 端点**
+    //    ⇒ 必须与 `JetHubAuths.magicrewintl` **同时**到位。
+    //    漏登记的症状与国内站逐字相同：积分行报「未登录」而上游其实只需一次
+    //    refresh，且**日志零字**（issue IKKHL5 的形态）。
+    'magicrewintl',
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -2529,6 +2837,15 @@ function registerJetHubEndpoints(
     //    ⚠️ **「余额能读」与「凭据能续」是两件事** —— 正因为余额现在能读了，
     //    才更需要显式留下这条豁免，否则后人会当成「忘了登记」而补进去。
     //    显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`。
+    // ⚠️ **qiniu（七牛云，2026-10-29）同样刻意不在本表里**，理由是 modelscope 那条
+    //    的**加强版**：七牛云的凭据本身就是长期有效的静态 API Key（官方明示
+    //    `sk-` 开头、无过期语义、无 refresh 端点），且 `credits.balance: false`
+    //    （**没有余额端点** ⇒ 积分端点压根不会为它走自愈链）⇒ 两层独立理由都指向
+    //    「无事可做」。它的 `refreshAccountCredential` 只做本地有效期对账、不发
+    //    网络请求，调它等于白跑一趟。
+    //    ⚠️ 显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`
+    //    —— 那张表是**反向守卫**（JetHubAuths 每个键都必须在自愈表或豁免表里），
+    //    漏登记会红。
   ])
 
   /**
@@ -2945,6 +3262,100 @@ function registerJetHubEndpoints(
   }
 
   /**
+   * 收口「网页版登录用户已放弃」留下的 magicrew 占位条目。
+   *
+   * ## 为什么需要（与 OfficeAce 收口同因，但判据**不同**）
+   *
+   * 用户在宿主起的窗口里登到一半直接关掉窗口时：`login.poll` 会收到那一轮任务的
+   * 终态（`waitForCredential` 看到浏览器已退出 ⇒ `undefined` ⇒ `failLogin` 删条目），
+   * 所以**正常路径不需要本收口**。
+   *
+   * 本函数只兜**一种**残留：**宿主进程重启/崩溃**。那时
+   * `magicrewBrowserLoginInFlight` / `magicrewBrowserLoginPendingAt` 是内存表、
+   * 一起消失了，而池里的占位条目还在盘上 ⇒ 它会变成一张「凭据未配置」的幽灵卡片，
+   * 没有任何入口会被清理（与 OfficeAce 那个 issue 的观感逐字相同）。
+   *
+   * ## 判据三条**必须同时**
+   *
+   * | # | 判据 | 漏掉的后果 |
+   * |---|---|---|
+   * | 1 | provider 属于**浏览器登录五家**（`magicrew` / `magicrewintl` / `monkeycode` / `monkeycodeintl` / `baizhi`，见下方 `if`）且**没有在途任务** | 把正在等用户的登录删掉（用户正常登录反而失败） |
+   * | 2 | 中间态缺失**或**已超过 {@link MAGICREW_BROWSER_PENDING_TTL_MS} | 把刚开始的登录删掉（同 1） |
+   * | 3 | 凭据**确实未落库** | 把刚登好的账号连凭据一起删掉（不可逆） |
+   *
+   * ⚠️ 判据 3 复用 `loginCredentialLanded`（**不另写一份**）：`'unknown'` 时同样
+   * **不删** —— 不可逆的删除必须建立在**确证**上（这条取向在 OfficeAce 处有红队取证）。
+   *
+   * @param now 「现在」的注入点（**只供测试**；生产不传即 `Date.now()`）。
+   *   边界用例必须能确定地驱动时刻，不能靠跨毫秒的运气（本仓库记过同型事故）。
+   * @returns 被收口的账号 id 列表（供日志与用例观测）。
+   */
+  async function sweepAbandonedMagicrewBrowserLogins(now: () => number = Date.now): Promise<string[]> {
+    const swept: string[] = []
+    let accounts: readonly ProviderAccountEntry[]
+    try {
+      accounts = await pool.listAllAccounts()
+    } catch {
+      // 读不到池 ⇒ **什么都不做**（不可逆的删除不该建立在一次失败的读上）。
+      return swept
+    }
+    const at = now()
+    for (const entry of accounts) {
+      // ⚠️ 两站都要扫（2026-11-01 接入国际站）：占位条目是**按 provider 建的**，
+      //    只扫国内站会让国际站的「网页登录中途关窗」留下永久幽灵卡片。
+      if (
+        entry.provider !== 'magicrew' && entry.provider !== 'magicrewintl'
+        // ⚠️ MonkeyCode 两站同款：浏览器登录的占位条目若中途关窗就永久残留成
+        //    「凭据未配置」的幽灵卡片。`monkeycode.*` 的三段式也登记了
+        //    `magicrewBrowserLoginPendingAt` ⇒ 这里必须一起收口（否则注释与实现分叉）。
+        && entry.provider !== MONKEYCODE.id
+        && entry.provider !== MONKEYCODE_INTL.id
+        // ⚠️ 百智云同款：它的三段式（`baizhi.startSession` 走的是另一个入口，
+        //    但 `account.create { mode:'browser' }` 那条同样登记了 pendingAt）。
+        && entry.provider !== BAIZHI.id
+      ) continue
+      // 判据 1：有在途任务 ⇒ 用户可能正在窗口里登录，绝不碰。
+      if (magicrewBrowserLoginInFlight.has(entry.id)) continue
+      const pendingAt = magicrewBrowserLoginPendingAt.get(entry.id)
+      /**
+       * 判据 2：**从未登记过中间态**（本进程从没起过它 ⇒ 重启残留）也走这里；
+       * 登记过但还年轻 ⇒ 跳过（同进程里正在登录的那一轮）。
+       *
+       * ⚠️ 但「从未登记过」**不能**单独当成「已中止」的充分条件：`local-browser`
+       * 分支建的账号同样不在表里。⇒ 必须靠判据 3 兜底（凭据在就不删）。
+       * 而 `local-browser` 建的账号**恒有凭据**（它读到才建）⇒ 判据 3 会放行它。
+       */
+      if (pendingAt !== undefined && at - pendingAt <= MAGICREW_BROWSER_PENDING_TTL_MS) continue
+      const landed = await loginCredentialLanded(entry.id)
+      if (landed === 'yes' || landed === 'unknown') {
+        if (landed === 'unknown') {
+          ctx.logger?.warn?.(
+            `[jet-hub] magicrew 收口跳过 ${entry.id}：读凭据失败（无法确证「没有凭据」）`
+            + ' ⇒ 不做不可逆的删除（宁可留一张卡片）',
+          )
+        }
+        continue
+      }
+      try {
+        await pool.removeAccount(entry.id)
+        magicrewBrowserLoginPendingAt.delete(entry.id)
+        swept.push(entry.id)
+      } catch (error) {
+        // ⚠️ 用 `entry.provider` 而非写死「magicrew」：本函数已覆盖五家，
+        //    写死会让百智云 / 国际站的失败日志指向错的助手（三审 F🟢-3）。
+        ctx.logger?.warn?.(`[jet-hub] ${entry.provider} 收口 ${entry.id} 失败：${String(error)}`)
+      }
+    }
+    if (swept.length > 0) {
+      ctx.logger?.info?.(
+        // ⚠️ 不再写「超级麦吉」：五家都会走这条路径（三审 F🟢-3）。
+        `[jet-hub] 已收口 ${swept.length} 个浏览器登录中止留下的占位账号：`
+        + `${swept.join(', ')}（用户未完成登录即关闭窗口 / 宿主重启残留；这些条目没有凭据）`,
+      )
+    }
+    return swept
+  }
+  /**
    * OfficeAce 交换的**单飞表**（accountId → 正在进行的交换结果）。
    *
    * ## 为什么必须有（2026-10-14 独立审计查出的净回归）
@@ -3011,6 +3422,144 @@ function registerJetHubEndpoints(
    * `LOGIN_FAILURE_TTL_MS` / `LOGIN_FAILURE_LIMIT` 兜住。
    */
   const loginFailures = new Map<string, { message: string; at: number }>()
+
+  /**
+   * **超级麦吉网页版登录**的在途表（`accountId` → 那一轮等待的后台任务）。
+   *
+   * ## ⚠️⚠️ 为什么网页版登录必须走**两步式**（`account.create` 只开窗，`login.poll` 收尾）
+   *
+   * 它是全仓**唯一**「用户在**宿主起的那个**浏览器窗口里操作」的登录（其余各家的
+   * 授权页在用户自己的浏览器里，所以宿主能在拿到 URL 后立刻返回）。而用户在窗口里
+   * 扫码 / 输密码要 **2–5 分钟** —— 若在 `account.create` 里同步等：
+   *
+   * | # | 同步等的后果 |
+   * |---|---|
+   * | 1 | `account.create` 是**一条 RPC**，客户端与宿主各有超时/重试语义 ⇒ 分钟级挂住会被判成「网络失败」，用户看到「新建账号失败」而窗口还开着 —— **两边状态彻底错开** |
+   * | 2 | 客户端 `createAccount` 的 `finally` 无条件释放 `creating` 闸门 ⇒ 按钮变可点 ⇒ 再点一次 = **两个浏览器窗口** + 两条登录腿抢同一个派生语义 |
+   * | 3 | 与其余十余家的既有契约（先返回 `accountId` → `login.poll` 三态）不同形 ⇒ 前端要为它写第二套流程（而 `login.poll` 的三态修法 IKLI7J 刚刚才全部收口） |
+   *
+   * ⇒ 走既有两步式：本表存「那一轮等待的后台任务」，`login.poll` **单飞**地
+   * `await` 它（与 `officeAceExchangeInFlight` **同一条纪律**：客户端 `setInterval`
+   * 没有 in-flight 闸门，两拍重叠若各开一轮就会抢同一个 id / 各起一个浏览器）。
+   *
+   * ⚠️ **只在本进程内存里**（不落盘）：宿主重启后这张表空了 ⇒ `login.poll` 退化成
+   * `{done:false}`、由客户端自己的 5 分钟表收口。可接受 —— 那时浏览器窗口也已随
+   * 宿主进程树一起没了（`ChromiumSession` 的 `detached: false` / 进程组语义），
+   * 而占位条目由 {@link sweepAbandonedMagicrewBrowserLogins} 按时间收口。
+   */
+  const magicrewBrowserLoginInFlight = new Map<
+    string,
+    Promise<{ done: boolean, success?: boolean, error?: string }>
+  >()
+
+  /**
+   * 网页版登录**等待中**的中间态（`accountId` → 开始时刻）。
+   *
+   * ⚠️ 与 `magicrewBrowserLoginInFlight` 分开存是刻意的：后者是「那一轮任务」、
+   * 任务一结束就要 `delete`（否则表无界增长），而「这个账号是一个正在等用户的
+   * 占位条目」这个**事实**必须比任务活得久一点 —— 任务结束（成功/失败）时两者
+   * 一起清；只有 `account.list` 的收口需要它来判断「够老了吗」。
+   */
+  const magicrewBrowserLoginPendingAt = new Map<string, number>()
+  /**
+   * 百智云「补登录态」在途表（2026-11-02）。
+   *
+   * ⚠️ **不能**复用 `magicrewBrowserLoginInFlight`：那张表的语义是「占位账号
+   * 正在变成真账号」，会连带影响 `login.poll` 的终态判定；补登录态的账号
+   * **本来就是真账号**，塞进去会让 `login.poll` 误判。
+   */
+  const baizhiSessionInFlight = new Map<string, Promise<void>>()
+
+  /**
+   * 「登录成功但被判定为重复、占位条目已合并进旧卡」的重定向表（2026-11-02 二审 C🟡-2）。
+   *
+   * ## 为什么需要它
+   *
+   * 判重命中时后台任务会 `removeAccount(占位 id)`，把凭据写进旧卡。若这一步发生在
+   * 客户端**首拍 `login.poll` 之前**（用户本来就在登录态，开窗即取到 cookie ⇒ 秒过），
+   * 那么之后每一拍 poll 都会命中 `!entry` ⇒ 回 `{done:false}` ⇒ 前端一路转圈到
+   * 客户端 5 分钟上限，而卡其实早已建好（与 IKLJ7J 同款「静默转圈」形态，只是触发
+   * 条件更窄）。
+   *
+   * ⇒ 合并时记下「占位 id → 旧卡 id」，poll 首拍就能立刻回 `done:true` 并清掉记录。
+   *
+   * ⚠️ 只在 poll 命中时 `delete`，所以正常情况下每个占位 id 最多驻留一拍；
+   *    用户中途关掉面板时残留的那条由 `sweepAbandonedMagicrewBrowserLogins` 按 TTL 清理。
+   */
+  const loginMergedRedirect = new Map<string, { targetId: string; at: number }>()
+
+  /**
+   * `loginMergedRedirect` 的 TTL 与容量上限（2026-11-02 三审 F🟡-6）。
+   *
+   * ⚠️ 为什么必须有：这张表原来是**只增不减**的 —— 正常情况下 `login.poll`
+   * 命中一次就 `delete`，但用户把面板一关、前端不再 poll，那条记录就永久驻留；
+   * 每次「浏览器登录判重合并」都会再添一条 ⇒ 长期使用是缓慢的泄漏，
+   * 而 `at` 字段写了却**零处读取**（写了不读 = 该字段没有存在理由）。
+   * 对照 `loginFailures` 有 `LOGIN_FAILURE_TTL_MS = 30 * 60_000` → 这里取同一个 30 分钟。
+   */
+  const LOGIN_MERGED_REDIRECT_TTL_MS = 30 * 60_000
+
+  /** 容量护栏：即使有人在 30 分钟内刷出成百上千个占位条，也不让这张表无限长。 */
+  const LOGIN_MERGED_REDIRECT_LIMIT = 200
+
+  /**
+   * 记下「占位 id → 旧卡 id」的合并重定向，并顺带清掉过期/超限的记录。
+   *
+   * ⚠️ 调用方**不要**再直接 `loginMergedRedirect.set(...)` —— 直接 set 会绕过 TTL
+   * 与上限，重现 F🟡-6 那个只增不减的形态。
+   */
+  function rememberLoginMergedRedirect(id: string, targetId: string): void {
+    const now = Date.now()
+    for (const [key, value] of loginMergedRedirect) {
+      if (now - value.at > LOGIN_MERGED_REDIRECT_TTL_MS) loginMergedRedirect.delete(key)
+    }
+    while (loginMergedRedirect.size >= LOGIN_MERGED_REDIRECT_LIMIT) {
+      const oldest = loginMergedRedirect.keys().next()
+      if (oldest.done === true) break
+      loginMergedRedirect.delete(oldest.value)
+    }
+    loginMergedRedirect.set(id, { targetId, at: now })
+  }
+
+  /**
+   * 读一条未过期的合并重定向（过期即删）。
+   *
+   * ⚠️ 过期记录**必须**当不存在处理：`login.poll` 拿到一条三天前的记录会
+   * 谎报 `done:true, success:true`，而那张旧卡可能早就被删了。
+   */
+  function takeFreshLoginMergedRedirect(id: string): { targetId: string; at: number } | undefined {
+    const entry = loginMergedRedirect.get(id)
+    if (entry === undefined) return undefined
+    if (Date.now() - entry.at > LOGIN_MERGED_REDIRECT_TTL_MS) {
+      loginMergedRedirect.delete(id)
+      return undefined
+    }
+    return entry
+  }
+
+  /**
+   * 已尝试过**昵称回填**的账号 id（`account.list` 的自愈路径用）。
+   *
+   * ⚠️ 为什么需要这个闸门：回填昵称要**发一次上游资料请求**。若不记，每次
+   * `account.list`（客户端 1 秒一拍、且每个面板挂载都会拉）都会对**同一个**
+   * 取不到昵称的账号重试一次 —— 那是一条稳定的、每秒一次的无用上游流量。
+   * ⇒ 每账号**每进程只试一次**；失败留给下次启动（进程重启即清空）。
+   * ⚠️ 只对**成功**也记：成功后再进这里也没有意义（`credential.nickname` 已存在）。
+   */
+  const magicrewProfileTried = new Set<string>()
+
+  /**
+   * 网页版登录占位条目的**最短保留时长**（收口阈值）。
+   *
+   * 客户端自己的轮询上限是 5 分钟、宿主侧等待上限 4 分钟（
+   * `MAGICREW_BROWSER_LOGIN_TIMEOUT_MS`）⇒ 取 **10 分钟**（2 倍余量）：
+   * 只有「明显超过任何正常等待」的占位条目才收口。
+   *
+   * ⚠️ 与 OfficeAce 的 20 分钟刻意不同：本家没有「交换 code」那一步（凭据不需要
+   * 再换一次），失败是立刻可见的（后台任务自己 `failLogin`），故收口只需要兜
+   * 「宿主崩溃/重启」这一种残留。
+   */
+  const MAGICREW_BROWSER_PENDING_TTL_MS = 10 * 60_000
 
   /** 终态失败记录的保留时长。客户端轮询上限是 5 分钟，留 6 倍余量。 */
   const LOGIN_FAILURE_TTL_MS = 30 * 60_000
@@ -3484,7 +4033,7 @@ function registerJetHubEndpoints(
     let existingDuplicateId = ''
     if (cloudId.length > 0) {
       try {
-        existingDuplicateId = await pool.findAccountIdByIdentityField(OFFICEACE.id, 'accountId', cloudId)
+        existingDuplicateId = await pool.findAccountIdByIdentityField(OFFICEACE.id, 'accountId', cloudId, accountId)
       } catch (error) {
         ctx.logger.warn(
           `[jet-hub] officeace 查重失败（按 accountId 读账号池）⇒ 本次**不做去重**、照常回填：${String(error)}`,
@@ -3794,7 +4343,16 @@ function registerJetHubEndpoints(
         ctx.logger.warn(`[jet-hub] ${String(call.method)} failed: ${message}`)
         return reply(rpcId, {
           ok: false,
-          error: { code: 'jet-hub/handler-failed', message },
+          error: {
+            // ⚠️ **保留底层错误码**（2026-11-05 四审契约 P2-2）：
+            // `EACCES`（改权限）/ `ENOENT`（文件不在）/ `EISDIR` /
+            // `SyntaxError`（文档损坏）的用户动作**完全不同**，全塌成
+            // `handler-failed` 会让客户端无法分支处理，也只能给出「未知故障」。
+            // ⚠️ 客户端目前对 `handler-failed` **零分支**（`grep` 只命中本仓
+            // src 的注释）⇒ 这是纯增量，不会破坏既有契约。
+            code: (error as NodeJS.ErrnoException)?.code ?? 'jet-hub/handler-failed',
+            message,
+          },
         })
       }
     },
@@ -3924,6 +4482,86 @@ function registerJetHubEndpoints(
       }
       return out
     }
+    // ⚠️⚠️ **本 fork 独有**（qiniu，2026-10-29）：与 modelscope 同款 —— 卡片要显示
+    //    **打码**的 API Key 并提供「编辑」入口（`qiniu.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文**（凭据经 RPC 明文下发等于把它摊到客户端
+    //    的 devtools / 日志 / 崩溃上报里）。⚠️ 打码在**宿主**做完（`maskQiniuKey`）
+    //    而不是客户端：两端各写一份必然漂移，且客户端那份一旦漏判形状就会回显原文。
+    if (provider === QINIU.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = JSON.parse(resolved.value) as { access_token?: unknown }
+          const masked = typeof parsed.access_token === 'string'
+            ? maskQiniuKey(parsed.access_token)
+            : ''
+          out.push({ ...account, ...(masked === '' ? {} : { qiniuKeyMask: masked }) })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
+    // ⚠️⚠️ **本 fork 独有**（monkeycode，2026-11-02）：与 qiniu 同款 —— 卡片要显示
+    //    **打码**的 API Key 并提供「编辑」入口（`monkeycode.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文**（凭据经 RPC 明文下发等于把它摊到客户端
+    //    的 devtools / 日志 / 崩溃上报里）。
+    //    ⚠️ 顺带下发 `monkeycodeHasSession`：客户端拿不到凭据，「有没有 web 会话」
+    //    必须由宿主算好 —— 让客户端按 `oma_` 前缀自己猜判据，两端必然漂移。
+    //    ⚠️ 2026-11-02 三审 F🟡-9：本处原还写「下发 `monkeycodeChannel`」。
+    //    那个字段在拆站时**已删**（一个账号只可能属于其中一个 provider），
+    //    这里实际只下发 `monkeycodeKeyMask` 与 `monkeycodeHasSession`。
+    if (provider === MONKEYCODE.id || provider === MONKEYCODE_INTL.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = parseMonkeycodeCredential(resolved.value)
+          if (parsed === undefined) { out.push(account); continue }
+          const masked = maskMonkeycodeKey(parsed.access_token)
+          out.push({
+            ...account,
+            ...(masked === '' ? {} : { monkeycodeKeyMask: masked }),
+            monkeycodeHasSession: typeof parsed.session_cookie === 'string'
+              && parsed.session_cookie.length > 0,
+          })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
+    // ⚠️⚠️ **本 fork 独有**（baizhi，2026-11-02）：与 qiniu / monkeycode 同款 ——
+    //    卡片要显示**打码**的 API Key 并提供「编辑」入口（`baizhi.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文**（凭据经 RPC 明文下发等于把它摊到
+    //    客户端 devtools / 日志 / 崩溃上报里）。
+    if (provider === BAIZHI.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = parseBaizhiCredential(resolved.value)
+          if (parsed === undefined) { out.push(account); continue }
+          const masked = maskBaizhiKey(parsed.access_token)
+          const hasSession = typeof parsed.session_cookie === 'string' && parsed.session_cookie.length > 0
+          out.push({
+            ...account,
+            ...(masked === '' ? {} : { baizhiKeyMask: masked }),
+            baizhiHasSession: hasSession,
+          })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
     return [...accounts]
   }
 
@@ -4016,6 +4654,111 @@ function registerJetHubEndpoints(
       const handled = await handleModelscopeRpc(ctx, pool as never, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：与 modelscope 同款 —— 「不跳浏览器、
+    //    手工粘贴 API Key」的 provider 必须有自己的前缀改道分支，且必须在 `switch`
+    //    之前、对不认识的方法返回 `undefined` 让主 switch 继续匹配。
+    //    ⚠️ 漏本分支的症状是「面板出现但永远加不了账号、零日志」：
+    //    `qiniu.addAccount` 落进 `default` 回 `unknown method`，而客户端
+    //    `account.create` 也没有 qiniu 分支 ⇒ 报 `unknown provider: qiniu`。
+    if (method.startsWith('qiniu.')) {
+      const handled = await handleQiniuRpc(ctx, pool as never, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ **本 fork 独有**（monkeycode，2026-11-02）：同一形态的第二个入口。
+    //    ⚠️ 漏本分支的症状同样是「面板出现但永远加不了账号、零日志」：
+    //    `monkeycode.addAccount` 落进 `default` 回 `unknown method`，而客户端
+    //    `account.create` 也没有 monkeycode 分支 ⇒ 报 `unknown provider: monkeycode`。
+    //    ⚠️ `handleMonkeycodeRpc` 对不认识的方法**必须返回 `undefined`**（不是
+    //    抛错/失败对象），否则主 switch 会被这里短路。
+    if (method.startsWith('monkeycode.')) {
+      const handled = await handleMonkeycodeRpc(ctx, pool as never, method, payload, MONKEYCODE)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ 国际站（2026-11-02）：`monkeycodeintl.` **不会**被上面的
+    //    `startsWith('monkeycode.')` 命中（第 11 个字符是 `i` 不是 `.`），
+    //    所以必须是独立分支 —— 漏了它，国际站面板的「添加 Key / 编辑 / 清空会话」
+    //    全部回 `unknown method`，而卡片会照常显示（静默半可用）。
+    if (method.startsWith('monkeycodeintl.')) {
+      const handled = await handleMonkeycodeRpc(ctx, pool as never, method, payload, MONKEYCODE_INTL)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ **本 fork 独有**（baizhi，2026-11-02）：与 qiniu / monkeycode 同形态的
+    //    第三个入口 —— 前端在最前面改道，直接调 `baizhi.addAccount`。没有本分支
+    //    的话它会落进 `default` 回 `unknown method`，而客户端 `account.create`
+    //    也没有 baizhi 分支 ⇒ 报 `unknown provider: baizhi`。
+    //    ⚠️ `handleBaizhiRpc` 对不认识的方法**必须返回 `undefined`**（不是
+    //    抛错/失败对象），否则主 switch 会被这里短路。
+    /**
+     * ⚠️ **本 fork 独有**（百智云「补登录态」，2026-11-02 二版）。
+     *
+     * 与 `account.create` 的区别：**不建号**，只给一个**已有**账号补
+     * `session_cookie`（积分要靠它）。因为没有新账号要「诞生」，所以不需要
+     * 占位条目 / `login.poll` 那一套 —— 客户端用一个短轮询看
+     * `account.list` 的 `baizhiHasSession` 翻真即可。
+     *
+     * ⚠️ 必须排在 `startsWith('baizhi.')` **之前**：否则会被
+     * `handleBaizhiRpc` 当成未知方法返回 `undefined` 落到主 switch 的
+     * `default`，报「unknown method」。
+     */
+    if (method === 'baizhi.startSession') {
+      const req = (payload ?? {}) as { accountId?: string }
+      const accountId = typeof req.accountId === 'string' ? req.accountId.trim() : ''
+      if (accountId.length === 0) {
+        return { ok: false, error: { code: 'bad-request', message: '缺少 accountId' } }
+      }
+      const entry = pool.listAccountsByProvider(BAIZHI.id).find((a) => a.id === accountId)
+      if (entry === undefined) {
+        return { ok: false, error: { code: 'not-found', message: `未找到百智云账号 ${accountId}` } }
+      }
+      // 同一账号只允许一轮在跑：两次开窗会各写一次凭据，后写的覆盖先写的。
+      if (!baizhiSessionInFlight.has(accountId)) {
+        const task = (async (): Promise<void> => {
+          const session = await auths.baizhi.loginSessionViaBrowser()
+          if (session === undefined) return
+          // ⚠️ **合并**写回，不能覆盖：`access_token`（sk-）是用户手填的推理 Key，
+          //    丢了它账号就再也发不出消息（而且用户没有任何提示）。
+          const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+          let previous: Record<string, unknown> = {}
+          if (resolved !== undefined) {
+            try {
+              const parsed = JSON.parse(resolved.value) as unknown
+              if (parsed !== null && typeof parsed === 'object') {
+                previous = parsed as Record<string, unknown>
+              }
+            } catch {
+              // 旧值不是 JSON ⇒ 只保留新登录态，后面的 `parseBaizhiCredential` 会兜。
+            }
+          }
+          await ctx.credentials.set(credentialRef(entry.credentialRef), JSON.stringify({
+            ...previous,
+            session_cookie: session.session_cookie,
+            ...(session.nickname === undefined ? {} : { nickname: session.nickname }),
+            ...(session.user_id === undefined ? {} : { user_id: session.user_id }),
+          }))
+          await pool.updateAccount(accountId, {
+            ...(session.nickname === undefined ? {} : { nickname: session.nickname }),
+          })
+        })().catch((error: unknown) => {
+          ctx.logger?.warn?.(
+            `百智云：补登录态失败（${error instanceof Error ? error.message : String(error)}）`,
+          )
+        })
+        baizhiSessionInFlight.set(accountId, task)
+        void (async () => {
+          try {
+            await task
+          } catch {
+            // 上面已 catch，这里只兜清理。
+          }
+          baizhiSessionInFlight.delete(accountId)
+        })()
+      }
+      return { ok: true, value: { accountId } }
+    }
+    if (method.startsWith('baizhi.')) {
+      const handled = await handleBaizhiRpc(ctx, pool as never, method, payload)
+      if (handled !== undefined) return handled
+    }
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
@@ -4032,6 +4775,23 @@ function registerJetHubEndpoints(
         //    出现一次全池读（`listAllAccounts`）。
         if (req.provider === OFFICEACE.id) {
           await sweepAbandonedOfficeAceLogins()
+        }
+        /**
+         * ⚠️ **超级麦吉网页版登录的占位条目收口**（与上面 OfficeAce 那条同因，
+         * 判据见 `sweepAbandonedMagicrewBrowserLogins`）。
+         *
+         * ⚠️ 同样放在 `pool.listAccounts` **之前**：用户刷新一次就该看到收口后的列表。
+         * ⚠️ 只在**会走浏览器登录**的 provider 上跑（别的面板不该付代价）。
+         * ⚠️⚠️ 这份集合必须与 sweep 内部判据、与各三段式登记处**同源**
+         *    （2026-11-02 审查发现：内部判据已含 MonkeyCode 两站，但这里只认
+         *    magicrew ⇒ 那段判据永不执行；baizhi 则两边都缺 ⇒ 幽灵卡片永久残留）。
+         */
+        if (
+          req.provider === 'magicrew' || req.provider === 'magicrewintl'
+          || req.provider === MONKEYCODE.id || req.provider === MONKEYCODE_INTL.id
+          || req.provider === BAIZHI.id
+        ) {
+          await sweepAbandonedMagicrewBrowserLogins()
         }
         const accounts = await pool.listAccounts(req.provider)
         // ⚠️ OfficeAce 自愈回填（2026-10-13 修正）：`expiresAt` 回填是后加的
@@ -4103,6 +4863,89 @@ function registerJetHubEndpoints(
             void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
           }
         }
+        /**
+         * ⚠️⚠️ **超级麦吉的 `expiresAt` 自愈回填**（2026-10-29 真机报障：卡片「有效期 未知」）。
+         *
+         * 与上面 OfficeAce / Codely 两条**同因同形**：回填是后加的，修复前（以及
+         * `api_key_expires_at` 缺失时）落下的池条目没有这个字段 ⇒ 卡片**恒**显示
+         * 「未知」，而且不会自己补上。列表时发现缺失就从**凭据**算出真实时刻并写回池
+         * （一次性自愈，之后走正常的登录 / 续期回填）。
+         *
+         * 判据是 {@link magicrewExpiresAtMs}（**唯一一份**）：`apiKeyExpiresAt` 优先、
+         * 否则解 JWT 的 `exp`（30 天的**登录会话**寿命）、都拿不到就**跳过**
+         * —— 绝不写 0/NaN（那会让卡片显示成「已过期」）。
+         *
+         * ⚠️ **逐账号按它自己的 ref resolve**（多账号广播 = 拿 A 的有效期写给 B，
+         * 本仓库已复发 7 次的那类错位）。
+         */
+        /**
+         * ⚠️ **超级麦吉自愈回填**（2026-10-30）：`expiresAt` + `nickname`。
+         *
+         * 「修复前登录的账号」凭据里既没有 `nickname`（卡片恒显示「超级麦吉」
+         * —— 那是 `magicrewDisplayNickname` 在无 phone 时回落到 `product.displayName`
+         * 的结果），也可能没有 `apiKeyExpiresAt`（卡片恒显示「有效期未知」）。
+         *
+         * ⚠️⚠️ **两者都只在「登录那一刻」才取** ⇒ 不在这里补算的话，用户必须
+         * **重新登录一次**才能看到自己的名字（真机报障 2026-10-30：昵称修复已上线，
+         * 但那张**已存在**的卡仍是「超级麦吉」）。
+         *
+         * ⚠️ 昵称要**发一次上游请求**（资料端点）⇒ 用 `magicrewProfileTried` 做
+         * **每账号每进程只试一次**的闸门：失败不重试（否则每次 `account.list` 都
+         * 打一次上游），下次进程启动再来。
+         * ⚠️ 逐账号按**自己的 ref** resolve（多账号广播 = A 的名字显示成 B 的，
+         * 本仓库已复发过 7 次的那类错位）。
+         * ⚠️ 回填**只写 `nickname`**，不写 `phone`：上游给的 phone 是 **10 位本地号**，
+         * 与 `magicrewDisplayNickname` 的 11 位脱敏判据**不同形**，写进去会得到错位掩码。
+         */
+        if (req.provider === 'magicrew' || req.provider === 'magicrewintl') {
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              .catch(() => undefined)
+            if (resolved === undefined) continue
+            let credential: MagicrewCredential | undefined
+            try {
+              credential = parseMagicrewCredential(JSON.parse(resolved.value))
+            } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
+            if (credential === undefined) continue
+            // ① 有效期：纯本地解码，无网络，可以每轮都补
+            if (account.expiresAt === undefined) {
+              const expiresAt = magicrewExpiresAtMs(credential)
+              if (expiresAt !== undefined) {
+                account.expiresAt = expiresAt
+                void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+              }
+            }
+            // ② 昵称：要发请求 ⇒ 每账号每进程只试一次
+            if (credential.nickname === undefined && !magicrewProfileTried.has(account.id)) {
+              magicrewProfileTried.add(account.id)
+              // ⚠️ 走 **auth 的注入点**（`readProfileNickname`）而不是直接调
+              //    `fetchMagicrewProfile`：单测要能注入假取数器，且超时/告警纪律
+              //    与登录那条腿只有**一份**（本仓库「一语义一套判据」的红线）。
+              // ⚠️ 它自己不抛（读不到 ⇒ `undefined`），并已留痕 ⇒ 这里不需要 catch。
+              //
+              // ⚠️⚠️ **必须按灶取实例**（2026-11-01 接入国际站时补）：此前写死
+              //    `auths.magicrew`，而本分支现在同时服务 `magicrewintl` ——
+              //    用国内站的实例去取国际账号的昵称，打的是
+              //    `i-magic-service.letsmagic.cn`（两个数据面账号体系隔离）⇒
+              //    恒 401、昵称永远回填不上，而且**没有任何报错**（该函数读不到
+              //    只返回 `undefined`）⇒ 症状是「国际站卡片一直是默认名」。
+              const profileAuth = req.provider === 'magicrewintl'
+                ? auths.magicrewintl
+                : auths.magicrew
+              const got = await profileAuth.readProfileNickname({
+                jwt: credential.jwt,
+                organizationCode: credential.organizationCode,
+              })
+              if (got !== undefined) {
+                const enriched = { ...credential, nickname: got }
+                await ctx.credentials.set(credentialRef(account.credentialRef), JSON.stringify(enriched))
+                const nickname = magicrewDisplayNickname(enriched, req.provider === MAGICREW_INTL.id ? MAGICREW_INTL : MAGICREW)
+                account.nickname = nickname
+                void pool.updateAccount(account.id, { nickname }).catch(() => undefined)
+              }
+            }
+          }
+        }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
@@ -4112,6 +4955,566 @@ function registerJetHubEndpoints(
         const id = `${provider}-${shortId()}`
         const suffix = shortId().toUpperCase()
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
+        /**
+         * ## Magicrew 两站（2026-11-01）
+         *
+         * 国内站（`magicrew` / `MAGICREW`）与国际站（`magicrewintl` / `MAGICREW_INTL`）
+         * 的登录 / 导入 / 轮询**协议完全相同**（同一个 Go 服务的两个数据面），
+         * 只有 host、webOrigin、凭据 ref 前缀不同 ⇒ 下面各分支全部按这几个派生
+         * 变量分流，**不复制两份代码**（复制会让「改一处漏一处」变成必然，
+         * 本仓库已记录过多次同型事故）。
+         *
+         * ⚠️ `magicrewSite` 为 `undefined` 表示「不是 Magicrew 系」，下方各分支一律跳过。
+         * ⚠️ 两个 id 与展示名**都从 product 常量派生**（`MAGICREW_INTL.id` /
+         *    `.displayName`），不写字面量：本文件的纪律是「两站只差一个 product 常量」，
+         *    把 id 写死成 `'magicrewintl'` 会让「改常量时漏改这里」变成静默缺陷。
+         */
+        const magicrewIntlId = MAGICREW_INTL.id
+        const magicrewSite: 'magicrew' | 'magicrewintl' | undefined
+          = provider === 'magicrew' || provider === magicrewIntlId
+            ? provider as 'magicrew' | 'magicrewintl'
+            : undefined
+        const magicrewIntl = magicrewSite === magicrewIntlId
+        const magicrewAuthOf: MagicrewAuth | undefined = magicrewSite === undefined
+          ? undefined
+          : magicrewIntl ? auths.magicrewintl : auths.magicrew
+        /**
+         * 展示名（错误文案用）—— 两站必须可区分，否则用户不知道是哪个站没登。
+         *
+         * ⚠️ **两站都从 product 常量取**（2026-11-01 二审）：原先国内那一支写死
+         * `'超级麦吉'`，与上面「两个 id 与展示名都从 product 常量派生」的自述不符。
+         * 今天两处恰好相等所以看不出问题，但 `displayName` 一改就会**静默分叉**
+         *（错误文案还叫旧名，用户按旧名去找不到站点）。
+         */
+        const magicrewSiteName = magicrewIntl ? MAGICREW_INTL.displayName : MAGICREW.displayName
+        /** 展示名回落用（无 nickname / 无 11 位手机号时）—— 两站必须各自取值。 */
+        const magicrewDisplayProduct = magicrewIntl ? MAGICREW_INTL : MAGICREW
+
+        /**
+         * ⚠️⚠️ **超级麦吉：从本机浏览器导入已登录态**（`mode: 'local-browser'`）。
+         *
+         * 这是本家三条登录路径里**零门槛**的一条：用户只要在自己的 Edge / Chrome 里
+         * 登录过 `www.letsmagic.cn`，凭据就已经明文躺在浏览器的 localStorage
+         * （leveldb）里 ⇒ 不开窗口、不收手机号密码。依据与读法见
+         * `magicrew-local-browser.ts`（只读，不碰 cookie、不改浏览器数据）。
+         *
+         * 与下面那条「手机号 + 密码」分支的关系：**两条独立的入口**，本分支刻意写在
+         * 它**之前**且只按 `req.mode` 分流 —— 既有分支一行未动。
+         *
+         * ⚠️ 读不到 ⇒ **不建账号**、返回可读错误（绝不留占位条目：本家没有「等用户去
+         * 浏览器完成」那一步，占位条目只会变成幽灵账号）。
+         * ⚠️ **幂等**：同一份凭据反复导入不得造出多个账号 ⇒ 按 **jwt 指纹**判重
+         * （`magicrewCredentialFingerprint`，不能用 `apiKey`：它 2 小时一换，
+         * 会把同一个账号认成新账号）。命中既有账号时把新凭据写回**它自己的 ref**
+         * 并回填昵称 / 有效期，返回**原来的** `accountId`。
+         */
+        if (magicrewSite !== undefined && magicrewAuthOf !== undefined && req.mode === 'local-browser') {
+          let credential: MagicrewCredential | undefined
+          try {
+            credential = await magicrewAuthOf.importFromLocalBrowser()
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error)
+            // ⚠️ 读盘 / 签发失败与「本机没有登录态」是两件事，文案必须分开
+            //    （否则用户被引导去重新登录一个其实已经登录过的站点）。
+            throw new Error(`${magicrewSiteName}：读取本机浏览器登录态失败：${reason}`)
+          }
+          if (credential === undefined) {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: `未在本机浏览器里找到${magicrewSiteName}的登录态`
+                  + `（请先在 Edge/Chrome 里登录 ${magicrewIntl ? 'www.magicrew.ai' : 'www.letsmagic.cn'} 后重试）`,
+              },
+            }
+          }
+          /**
+           * ⚠️⚠️ **新建之前先判重**（用户 2026-10-29 明确要求）：判据是**凭据指纹**
+           * （同一个超级麦吉账号），命中就**只刷新那一条**（同一个 id、同一个 ref），
+           * 不再新建 —— 而不是先造一张卡、再靠读取侧或 UI 去滤重。
+           *
+           * ⚠️ 判重实现只此一份（`findMagicrewAccountByFingerprint`），网页版登录腿
+           * 走同一个函数：两份拷贝必然漂移（本仓库已记过「一文件两套同义判据」的事故）。
+           */
+          const existing = await findMagicrewAccountByFingerprint({
+            ctx,
+            pool,
+            provider: magicrewSite,
+            fingerprint: magicrewCredentialFingerprint(credential.jwt),
+          })
+          if (existing !== undefined) {
+            // 同一个账号 ⇒ 只刷新它的凭据与展示字段，**不新增条目**。
+            await ctx.credentials.set(
+              credentialRef(existing.credentialRef),
+              JSON.stringify(credential),
+            )
+            await pool.updateAccount(existing.id, {
+              nickname: magicrewDisplayNickname(credential, magicrewDisplayProduct),
+              ...magicrewExpiresAtPatch(credential),
+            })
+            return { ok: true, value: { accountId: existing.id, loginUrl: '' } }
+          }
+          // 新账号：凭据写到它**自己的** ref（与下面那条手机号密码分支同形），
+          // 池条目也照它的写法（`refreshable: true`：本家有真实续期端点）。
+          await ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))
+          await pool.addAccount({
+            id,
+            provider: magicrewSite,
+            nickname: magicrewDisplayNickname(credential, magicrewDisplayProduct),
+            enabled: true,
+            credentialRef: refName,
+            refreshable: true,
+            createdAt: Date.now(),
+            ...magicrewExpiresAtPatch(credential),
+          })
+          return { ok: true, value: { accountId: id, loginUrl: '' } }
+        }
+
+        /**
+         * ⚠️⚠️ **超级麦吉：网页版登录**（`mode: 'browser'`）—— 三步式的**第一步**。
+         *
+         * ## 这个分支只做三件事，**不 await 用户**
+         *
+         * 1. 先登记一条**占位条目**（无凭据）—— `login.poll` 靠它知道「这个 id 存在」；
+         * 2. 起一个**后台任务**去开窗 + 等用户 + 签发 + 落库（`loginViaBrowser` 那一条
+         *    完整的腿，含它在 `finally` 里的收窗）；
+         * 3. **立刻**返回 `{ accountId, loginUrl: '' }`。
+         *
+         * ⚠️⚠️ 为什么不能同步等（2–5 分钟的阻塞 RPC）：完整理由见
+         * `magicrewBrowserLoginInFlight` 上方那张表 —— 一句话是「客户端的按钮闸门
+         * 会提前释放 ⇒ 用户再点一次就开第二个窗口」。
+         *
+         * ## 与 `mode: 'local-browser'` 的区别（两者都是「读登录态」）
+         *
+         * | | `local-browser` | `browser` |
+         * |---|---|---|
+         * | 开窗 | 否 | **是**（独立 profile，可见） |
+         * | 时长 | 毫秒级 | **分钟级**（等用户） |
+         * | 失败形态 | 立刻回错误、不建账号 | 先建占位条目，`login.poll` 报终态并**删掉**它 |
+         *
+         * ⚠️ 失败收尾**必须走 `failLogin`**（不自己 `removeAccount`）：它先判
+         * 「凭据是否其实已落库」（登录成功后的记账失败不得删号），再记终态供
+         * `login.poll` 报出原因。十余家 provider 走同一条，别在这里手写第二份。
+         *
+         * ⚠️ **单飞**：同一 `accountId` 只会有一轮（`account.create` 每次新生成 id，
+         * 故这里防的是「同一 id 被重复创建」这种异常路径 —— 幂等保护，不是正常流）。
+         */
+        if (magicrewSite !== undefined && magicrewAuthOf !== undefined && req.mode === 'browser') {
+          // ① 占位条目：**先登记再开窗**。顺序不可颠倒 —— `login.poll` 在这之后
+          //    任何一刻到达都必须能查到它（客户端 1 秒一拍，而开浏览器要几百毫秒）。
+          await pool.addAccount({
+            id,
+            provider: magicrewSite,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: true,
+            createdAt: Date.now(),
+          })
+          magicrewBrowserLoginPendingAt.set(id, Date.now())
+          /**
+           * ② 后台任务。**不 await**（见上）。
+           *
+           * ⚠️ 三段式（与 `exchangeOfficeAceLogin` 同一条纪律）：`loginViaBrowser`
+           * 内部已经把「等用户 → 签发 → 落库」串完，但它**不写账号池**
+           *（凭据只落 `defaultCredentialRef`，账号 id/ref 是 RPC 层的事）⇒ 回填这一步
+           * 在本函数里做，且**必须在落库之后**。
+           */
+          const task = (async (): Promise<{ done: boolean, success?: boolean, error?: string }> => {
+            let credential: MagicrewCredential | undefined
+            try {
+              credential = await magicrewAuthOf.loginViaBrowser()
+            } catch (error) {
+              /**
+               * ⚠️ 抛错 = **真失败**（浏览器起不来 / 签发网络异常）。文案要可读：
+               * `browserNotFoundMessage` 那段多行提示就是这个 try 带出来的。
+               */
+              const message = await failLogin(id, error)
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            if (credential === undefined) {
+              /**
+               * ⚠️ `undefined` = **用户没登完**（超时 / 自己关了窗口）。这不是
+               * 异常路径，但仍是一条**终态**：占位条目留着就是幽灵卡片，
+               * 而「静默转圈到客户端 5 分钟超时」正是 IKLI7J 要根治的那个形态。
+               * ⇒ 同样走 `failLogin`（记终态 + 删占位条目）。
+               */
+              const message = await failLogin(
+                id,
+                new Error('网页登录未完成（超时或窗口已关闭）'),
+              )
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            // 这一步之后凭据已在库里 ⇒ 任何失败都**不得**再删号（`failLogin` 自己会判）。
+            /**
+             * ⚠️⚠️ **判重与 `mode: 'local-browser'` 走同一个函数**（唯一一份实现）：
+             * 「同一个超级麦吉账号已经有一张卡」⇒ 把新凭据写到**它**的 ref，并删掉
+             * 自己那张占位条目（否则用户看到两张卡指向同一个号）。
+             *
+             * ⚠️ `skipAccountId: id` 不可省：本条腿的占位条目已经在池里，不排除自己
+             * 就会把「我刚建的占位」判成「已存在的同账号」（若它恰好已带上凭据）。
+             */
+            const existing = await findMagicrewAccountByFingerprint({
+              ctx,
+              pool,
+              provider: magicrewSite,
+              fingerprint: magicrewCredentialFingerprint(credential.jwt),
+              skipAccountId: id,
+            })
+            if (existing !== undefined) {
+              /**
+               * ⚠️ 顺序：先写凭据、再删条目。反过来的话删条目（连带 `unset`）
+               * 会把唯一那份刚写好的凭据一起清掉。
+               *
+               * ⚠️ 占用位条目自己的 ref 上的凭据也要清掉（`loginViaBrowser` 只写
+               * `defaultCredentialRef`，但占位 ref 上本来就没有值 —— 这里显式
+               * `unset` 是为了万一将来那条腿改了写入位置时不留孤儿凭据）。
+               */
+              await ctx.credentials.set(credentialRef(existing.credentialRef), JSON.stringify(credential))
+              await pool.updateAccount(existing.id, {
+                nickname: magicrewDisplayNickname(credential, magicrewDisplayProduct),
+                ...magicrewExpiresAtPatch(credential),
+              })
+              await ctx.credentials.unset(credentialRef(refName)).catch(() => undefined)
+              await pool.removeAccount(id).catch(() => undefined)
+              return { done: true, success: true }
+            }
+            // 新账号：凭据写到它**自己的** ref（与 `local-browser` 分支同形）。
+            await ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))
+            await pool.updateAccount(id, {
+              nickname: magicrewDisplayNickname(credential, magicrewDisplayProduct),
+              ...magicrewExpiresAtPatch(credential),
+            })
+            return { done: true, success: true }
+          })()
+          magicrewBrowserLoginInFlight.set(id, task)
+          /**
+           * ⚠️ 任务结束后**必须**清两张表（`finally` 而不是 `.then`）：否则一次失败
+           * 就把这个 id 永久钉在表里（`login.poll` 会对它一直 `await` 一个已结束的
+           * promise —— 那本身无害，但表会无界增长、且同一 id 再也开不了新一轮）。
+           */
+          void (async () => {
+            try {
+              await task
+            } catch {
+              // 不该发生：上面两个分支都把异常收成了返回值。仍要兜住 ——
+              // 一次未捕获拒绝会跳过下面的清理。
+            }
+            magicrewBrowserLoginInFlight.delete(id)
+            magicrewBrowserLoginPendingAt.delete(id)
+          })()
+          return { ok: true, value: { accountId: id, loginUrl: '' } }
+        }
+
+        /**
+         * ⚠️⚠️ **MonkeyCode：网页版登录**（`mode: 'browser'`）—— 两步式的**第一步**。
+         *
+         * 用户明确要求（2026-11-02）：「新建账号是浏览器登录」。手工粘三格
+         * （API Key / Signing Secret / Session Cookie）被判为不符合插件范式 ——
+         * 尤其 `monkeycode_ai_session` 是 **HttpOnly**，用户在浏览器里根本拿不到。
+         *
+         * 三段式与 magicrew 同型（理由逐条相同，见上一分支的注释）：
+         * ① 先登记占位条目（`login.poll` 靠它知道 id 存在）；
+         * ② 起后台任务：开窗 → 等用户登 → 读 cookie → 换网关凭据 → 落库；
+         * ③ **立刻**返回 `{ accountId, loginUrl: '' }`，客户端走 `login.poll` 轮询。
+         *
+         * ⚠️ **绝不 await 用户**：等登录是分钟级的，同步等会让客户端按钮闸门提前释放，
+         *    用户再点一次就开第二个窗口。
+         * ⚠️ 失败**一律走 `failLogin`**：它先判「凭据是否其实已落库」（登录成功后的
+         *    记账失败不得删号），再记终态供 `login.poll` 报出原因。
+         */
+        const monkeycodeProduct = provider === MONKEYCODE.id
+          ? MONKEYCODE
+          : provider === MONKEYCODE_INTL.id ? MONKEYCODE_INTL : undefined
+        const monkeycodeAuthOf = monkeycodeProduct === undefined
+          ? undefined
+          : monkeycodeProduct.id === MONKEYCODE.id ? auths.monkeycode : auths.monkeycodeintl
+        if (monkeycodeProduct !== undefined && monkeycodeAuthOf !== undefined && req.mode === 'browser') {
+          await pool.addAccount({
+            id,
+            provider: monkeycodeProduct.id,
+            nickname: monkeycodeProduct.displayName,
+            enabled: true,
+            credentialRef: refName,
+            /**
+             * ⚠️ 恒 `false`：MonkeyCode 的凭据是**静态材料**（网关 key 由平台签发、
+             * 没有 refresh 端点）。写 `true` 会让续期调度把它当成可续期的账号。
+             */
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          /**
+           * ⚠️ 这两张表按 `accountId` 键、**与 provider 无关**（名字里的 magicrew 是
+           * 历史原因，表本身是通用的）。登记它们有两个用处：
+           * ① 首页列表能标出「登录中」；② `sweepAbandonedMagicrewBrowserLogins`
+           * 的判据 1 会放过「有在途任务」的条目（否则会删掉正在登录的账号）。
+           */
+          magicrewBrowserLoginPendingAt.set(id, Date.now())
+          const task = (async (): Promise<{ done: boolean, success?: boolean, error?: string }> => {
+            let credential: MonkeycodeCredential | undefined
+            try {
+              credential = await monkeycodeAuthOf.loginViaBrowser()
+            } catch (error) {
+              /**
+               * ⚠️ 抛错 = **真失败**（浏览器起不来 / 换凭据被拒）。文案要可读：
+               * `loginViaBrowser` 已经把上游原因拼进 message，这里原样交给 `failLogin`。
+               */
+              const message = await failLogin(id, error)
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            if (credential === undefined) {
+              /**
+               * ⚠️ `undefined` = **用户没登完**（超时 / 自己关了窗口）。这不是异常路径，
+               * 但仍是一条**终态**：占位条目留着就是幽灵卡片，而「静默转圈到客户端
+               * 5 分钟超时」正是 IKLI7J 要根治的形态 ⇒ 同样走 `failLogin`。
+               */
+              const message = await failLogin(id, new Error('网页登录未完成（超时或窗口已关闭）'))
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            // 这一步之后凭据已在库里 ⇒ 任何失败都**不得**再删号（`failLogin` 自己会判）。
+            /**
+             * ⚠️⚠️ 判重（2026-11-02 审查 B🟡-5，同日二版更正）：**必须按 `user_id` 判**。
+             *
+             * ## 为什么不能用 `access_token` 派生（第一版就是这么写的，恒不命中）
+             *
+             * `monkeycodeSlotNamesOf` 按 `access_token` **尾 8 位**派生 id 与 ref（见
+             * `src/monkeycode-rpc.ts`），而浏览器登录**每次都重新兑换**并签发
+             * **新的一对**（`src/monkeycode-credits.ts` 的 `exchangeBaizhiSessionForKey`
+             * 注释：「兑换每次都签发新的一对，上游没有幂等键」）⇒ 同一账号第二次登录
+             * 拿到的新 key 必然算出**不同**的 ref ⇒ `duplicate` 恒 `undefined`，
+             * 这一整块是死代码，「同一账号多张卡」根本没修好。
+             *
+             * 这正是 `src/account-pool.ts` 里 AutoClaw 的同型事故（「拿每次轮换的
+             * `access_token` 当身份判据 ⇒ 同一账号每登一次多一张卡」）。
+             *
+             * ## 稳定身份从哪来
+             *
+             * 兑换接口的返回值带 `id`（`value.id`），`MonkeycodeAuth.loginViaBrowser`
+             * 已把它写进凭据的 `user_id`（见 `src/monkeycode-auth.ts`）⇒ 用它与
+             * 已有账号逐条比对（要 `credentials.resolve`，因为 `user_id` 在凭据 JSON 里）。
+             *
+             * ⚠️ `user_id` 缺失（旧凭据 / 上游没给）时**不做判重**，宁可多一张卡也不能
+             * 把两个不同账号误并成一个（那会把别人的 Key 覆盖掉）。
+             */
+            const duplicateUser = credential.user_id
+            let duplicate: { id: string; credentialRef: string } | undefined
+            if (typeof duplicateUser === 'string' && duplicateUser !== '') {
+              for (const entry of pool.listAccountsByProvider(monkeycodeProduct.id)) {
+                if (entry.id === id) continue
+                const raw = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+                if (raw === undefined) continue
+                // ⚠️ `resolve()` 返回的是 `{ value }` 包装，不是裸字符串。
+                let parsed: unknown
+                try {
+                  parsed = JSON.parse(raw.value)
+                } catch {
+                  continue
+                }
+                if (typeof parsed !== 'object' || parsed === null) continue
+                const otherUserId = (parsed as { user_id?: unknown }).user_id
+                if (otherUserId === duplicateUser) {
+                  duplicate = { id: entry.id, credentialRef: entry.credentialRef }
+                  break
+                }
+              }
+            }
+            if (duplicate !== undefined) {
+              // 让可能早于本任务结束的 `login.poll` 直接拿到成功终态（见 `loginMergedRedirect` 注释）。
+              rememberLoginMergedRedirect(id, duplicate.id)
+              /**
+               * ⚠️ **顺序不能反：先删自己的占位，再写旧卡的凭据**（2026-11-02 二审自纠）。
+               *
+               * `account-pool.removeAccount` 内部会 `credentials.unset(自己条目的 ref)`。
+               * 正常情况两张卡的 ref 由不同的 Key 派生、不会相同；但**万一相同**
+               * （上游哪天改成复用同一把 Key），先写后删就会把刚写进旧卡的那份凭据一起
+               * 清掉 —— 表现为旧卡突然「凭据未配置」，且没有任何错误日志。
+               * 反过来先删，最坏只是旧卡没写成、占位已消失，用户重登一次即可。
+               */
+              await pool.removeAccount(id)
+              await ctx.credentials.set(
+                credentialRef(duplicate.credentialRef),
+                JSON.stringify(credential),
+              )
+              // ⚠️ 昵称优先沿用**旧卡自己的**（`credential.nickname` 是平台给的账号名，
+              //    已包含在凭据里）：命中判重时把昵称重置成 `displayName` 会冲掉用户
+              //    自定义的名字（baizhi 那条用的是 `?? displayName`，这里对齐）。
+              await pool.updateAccount(duplicate.id, {
+                ...(typeof credential.nickname === 'string' && credential.nickname !== ''
+                  ? { nickname: credential.nickname }
+                  : {}),
+              })
+              return { done: true, success: true }
+            }
+            await ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))
+            await pool.updateAccount(id, { nickname: monkeycodeProduct.displayName })
+            return { done: true, success: true }
+          })()
+          magicrewBrowserLoginInFlight.set(id, task)
+          /**
+           * ⚠️ 任务结束后**必须**清两张表（`finally` 而不是 `.then`）：否则一次失败
+           * 就把这个 id 永久钉在表里（表会无界增长、且同一 id 再也开不了新一轮）。
+           */
+          void (async () => {
+            try {
+              await task
+            } catch {
+              // 不该发生：上面两个分支都把异常收成了返回值。仍要兜住 ——
+              // 一次未捕获拒绝会跳过下面的清理。
+            }
+            magicrewBrowserLoginInFlight.delete(id)
+            magicrewBrowserLoginPendingAt.delete(id)
+          })()
+          return { ok: true, value: { accountId: id, loginUrl: '' } }
+        }
+
+        /**
+         * 百智云（2026-11-02 二版）**浏览器登录**：开窗让用户登进控制台，
+         * 读控制台 cookie（`sl-session` + `baizhi_session`），用 cookie 换 `sk-` Key。
+         *
+         * ## 为什么要这一步（用户报障驱动的设计）
+         *
+         * 第一版只做「粘贴 API Key」，结果两侧都不对：
+         * ① 用户要去控制台复制 Key（纯负担）；
+         * ② 卡片上**没有积分** —— 因为积分在控制台 `baizhi.cloud`，只认 cookie，
+         *    `sk-` 走 `x-api-key` 打过去 401。
+         *
+         * 实测 `GET /api/v1/user/api-keys`（cookie 认证）直接返回明文
+         * `{"items":[{"key":"sk-…"}]}` ⇒ 一次登录既拿到 Key 又拿到积分能力。
+         *
+         * ## 三段式（与 magicrew / monkeycode 完全同构）
+         *
+         * ① 先登记占位条目（让 `login.poll` 知道这个 id 存在）；
+         * ② 后台任务**不 await**（等登录是分钟级的，同步等会让客户端按钮闸门
+         *    提前释放 ⇒ 用户再点一次开第二个窗口），失败/未完成一律走 `failLogin`；
+         * ③ 立刻返回 `{ accountId, loginUrl: '' }`。
+         */
+        if (provider === BAIZHI.id && req.mode === 'browser') {
+          await pool.addAccount({
+            id,
+            provider: BAIZHI.id,
+            nickname: BAIZHI.displayName,
+            enabled: true,
+            credentialRef: refName,
+            // 静态 Key + 网页登录态，两者都没有 refresh 端点。
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          magicrewBrowserLoginPendingAt.set(id, Date.now())
+          const task = (async (): Promise<{ done: boolean, success?: boolean, error?: string }> => {
+            let credential: BaizhiCredential | undefined
+            try {
+              credential = await auths.baizhi.loginViaBrowser()
+            } catch (error) {
+              const message = await failLogin(id, error)
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            if (credential === undefined) {
+              // 用户没登完（超时 / 自己关窗）也是终态：占位条目留着就是幽灵卡片。
+              const message = await failLogin(id, new Error('网页登录未完成（超时或窗口已关闭）'))
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            // 这一步之后凭据已在库里 ⇒ 任何失败都不得再删号（`failLogin` 自己会判）。
+            /**
+             * ⚠️ 判重（同 monkeycode 两站，2026-11-02 审查 B🟡-5；二审补强）：
+             * 百智云每次浏览器登录**通常**读回同一把 `sk-`（此时按 ref 判重就够），
+             * 但用户在控制台**重建过 API Key** 之后 key 变了、`user_id` 没变 ⇒
+             * 只按 ref 判会多出一张卡。故**先按 `user_id` 比，再退回按 ref 比**。
+             *
+             * 与 monkeycode 的差异：百智云的 `user_id` 来自控制台 `GET /api/v1/user/profile`
+             * 的 `id`（`BaizhiAuth.loginViaBrowser` 写入），同样是平台下发的稳定身份。
+             */
+            const duplicateUser = credential.user_id
+            const slotNames = baizhiSlotNamesOf(credential.access_token)
+            let duplicate = pool.listAccountsByProvider(BAIZHI.id)
+              .find((entry) => entry.id !== id && entry.credentialRef === slotNames.refName)
+            if (
+              duplicate === undefined
+              && typeof duplicateUser === 'string' && duplicateUser !== ''
+            ) {
+              for (const entry of pool.listAccountsByProvider(BAIZHI.id)) {
+                if (entry.id === id) continue
+                const raw = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+                if (raw === undefined) continue
+                let parsed: unknown
+                try {
+                  parsed = JSON.parse(raw.value)
+                } catch {
+                  continue
+                }
+                if (typeof parsed !== 'object' || parsed === null) continue
+                if ((parsed as { user_id?: unknown }).user_id === duplicateUser) {
+                  duplicate = entry
+                  break
+                }
+              }
+            }
+            if (duplicate !== undefined) {
+              rememberLoginMergedRedirect(id, duplicate.id)
+              // ⚠️ 先删自己占位再写旧卡（同 monkeycode 的理由：`removeAccount` 会 unset 自己 ref）。
+              await pool.removeAccount(id)
+              await ctx.credentials.set(
+                credentialRef(duplicate.credentialRef),
+                JSON.stringify(credential),
+              )
+              // 旧卡已有名字就留着，别用平台账号名把它冲掉。
+              await pool.updateAccount(duplicate.id, {
+                ...(typeof credential.nickname === 'string' && credential.nickname !== ''
+                  ? { nickname: credential.nickname }
+                  : {}),
+              })
+              return { done: true, success: true }
+            }
+            await ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))
+            await pool.updateAccount(id, {
+              nickname: credential.nickname ?? BAIZHI.displayName,
+            })
+            return { done: true, success: true }
+          })()
+          magicrewBrowserLoginInFlight.set(id, task)
+          void (async () => {
+            try {
+              await task
+            } catch {
+              // 不该发生：上面两个分支都把异常收成了返回值；仍兜住以免跳过清理。
+            }
+            magicrewBrowserLoginInFlight.delete(id)
+            magicrewBrowserLoginPendingAt.delete(id)
+          })()
+          return { ok: true, value: { accountId: id, loginUrl: '' } }
+        }
+
+        /**
+         * ⚠️ 超级麦吉（Magicrew）**没有「手机号 + 密码」登录**（2026-10-29 删除）。
+         *
+         * 上游 `phone_password` 端点确实存在（magpie 的 `api.mjs` 实测过 200），但
+         * 参考实现里那个 `login()` **零调用者** —— 它是未被采用的探索代码；
+         * 真实入口是短信验证码，而短信必须先解「旋转验证码」⇒ 要识图模型。
+         * ⇒ 本家只走两条**无门槛**的路（都在上面/下面各一个 `mode` 分支）：
+         *    · `mode: 'local-browser'` —— 读本机 Edge/Chrome 的登录态（免开窗）
+         *    · `mode: 'browser'` —— 开窗让用户在网页里登录，再读回来
+         * 不带 `mode` 落到这里 ⇒ 明确报错，不要静默降级成别的登录方式。
+         */
+        if (magicrewSite !== undefined) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `${magicrewSiteName}请用「从本机浏览器导入」或「网页登录」，不支持手机号密码登录`,
+            },
+          }
+        }
 
         // CodeBuddy 系（buddy / workbuddy）共用两步登录流程：
         // 只获取 loginUrl 和 state 立即返回，后台用同一个 state 异步执行
@@ -4147,6 +5550,127 @@ function registerJetHubEndpoints(
             // 续期定时器归属该产品自己的服务实例
             ;(product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh()
             const credential = parseBuddyCredential(flow.access)
+            /**
+             * ★★ **同账号去重**（2026-11-03 合并 PR #30 时按审计重写）。
+             *
+             * ## 症状
+             *
+             * 同一账号点两次「添加账号」（或授权页复用已有会话直接放行）会得到
+             * **两条独立条目**：各自参与选号、各自消耗额度，UI 上昵称一样无从分辨。
+             *
+             * ## 判据：`user_id`（稳定身份），不是 `access_token`
+             *
+             * `buildCredential` 已把服务端下发的 `account.uid` 存进凭据
+             * （JWT `sub` 兜底，见 `buddy.ts`）；`access_token` **每次登录都换**，
+             * 拿它判重等于「每次登录都是一张新卡」（autoclaw 的原始缺陷形态）。
+             *
+             * ## 处置：**把新凭据并入旧卡、删除占位**（与 monkeycode / baizhi /
+             * autoclaw 同型），不改用 zcode 的「停用 + 改名」
+             *
+             * PR #30 原实现是「停用新卡、保留旧卡」，审计实测三个后果：
+             * 1. **旧卡不吃新 token**：用户按 `refreshAll` 的「refresh_token 已失效，
+             *    请重新登录」重登后，旧卡凭据逐字节不变 ⇒ 这条唯一出路变成空操作；
+             * 2. **旧卡已被用户停用 ⇒ 两条都停用**（`findAccountIdByIdentityField`
+             *    刻意不看 `enabled`）⇒ 登录成功却零可用号；删掉旧卡后，剩下的停用
+             *    重复卡仍会被判重命中 ⇒ **每次重登再停用一次**，死循环；
+             * 3. 停用卡仍会被 `credits.balances` / `claimAll` 覆盖 ⇒ 同一上游账号
+             *    在积分面板出现两行、一键签到打两次。
+             *
+             * ⇒ 采用仓库已用三次的「合并进旧卡」语义：
+             * ① 先把**新凭据写到旧卡的 ref**（顺序不能反：`removeAccount` 会清掉
+             *    占位自己的 ref，先删就丢掉唯一的新 token）；
+             * ② 旧卡更新 `nickname` / `expiresAt` / `refreshable`，若它被用户停用过
+             *    则**反转**（重新启用）——用户刚主动登录这个号，语义就是「想让它可用」；
+             * ③ `rememberLoginMergedRedirect` 让 `login.poll` 对**占位 id** 仍报成功
+             *    （条目已删，poll 靠重定向判成功，不会转圈 5 分钟）；
+             * ④ 最后删占位条目。
+             *
+             * ⚠️ 查重**必须排除本次占位 id**：凭据在查重前已写入（上一行 set），
+             *    不排除就会「自己匹配自己」，而方法只返回第一个匹配 ⇒ 判重退化成
+             *    「旧卡恰好排在新卡前面」（一次拖动排序即静默失效，对抗审计实测）。
+             */
+            const userId = credential?.user_id
+            if (typeof userId === 'string' && userId.length > 0) {
+              let duplicateId = ''
+              try {
+                duplicateId = await pool.findAccountIdByIdentityField(
+                  product.id,
+                  'user_id',
+                  userId,
+                  id,
+                )
+              } catch (error) {
+                // ⚠️ 读不到池 ≠ 没有重复 ⇒ 不做任何破坏性动作，照常回填。
+                ctx.logger.warn(
+                  `[jet-hub] ${product.id} 查重失败（按 user_id 读账号池）`
+                  + `⇒ 本次不去重、照常回填：${String(error)}`,
+                )
+              }
+              if (duplicateId.length > 0) {
+                const existing = pool.listAccountsByProvider(product.id)
+                  .find((entry) => entry.id === duplicateId)
+                if (existing !== undefined) {
+                  /**
+                   * ⚠️⚠️ **合并段必须有失败补偿**（2026-11-03 对抗审计 P1）：
+                   * 这一段里任何一步抛错都会冒到外层 `.catch → failLogin`，而
+                   * `failLogin` 看到占位自己的凭据早已落库（`loginCredentialLanded
+                   * === 'yes'`）会按「登录成功」处理、**不删占位** ⇒ 结果是
+                   * 「旧卡 + 占位都启用、都持新凭据」，判重白做且用户无感。
+                   * ⇒ 自己接住：已把凭据交给旧卡就**无条件删占位**；没交出去则
+                   * 保留占位（它是唯一活凭据）但标注失败原因，绝不静默。
+                   */
+                  let handedOver = false
+                  try {
+                    // ① 新凭据写到旧卡（先写，后删占位）。
+                    await ctx.credentials.set(credentialRef(existing.credentialRef), flow.access)
+                    handedOver = true
+                    // ② 旧卡承接到期/续期/昵称；被停用过则反转启用。
+                    const wasDisabled = existing.enabled === false
+                    const expiresAt = credential ? credentialExpiresAtMs(credential) : undefined
+                    const hasRefreshToken = typeof credential?.refresh_token === 'string'
+                      && credential.refresh_token.length > 0
+                    await pool.updateAccount(existing.id, {
+                      ...(typeof credential?.nickname === 'string' && credential.nickname.length > 0
+                        ? { nickname: credential.nickname }
+                        : {}),
+                      // ⚠️ 只在**算得出来**时才写：`updateAccount` 是浅合并，
+                      //    显式 `undefined` 会冲掉旧卡原本有效的 `expiresAt`
+                      //    （2026-11-03 功能审计 P2）。
+                      ...expiresAt === undefined ? {} : { expiresAt },
+                      // 同理：新凭据没有 refresh_token 时**不要**把它改回 false，
+                      // 否则旧卡可能握着可续期的新凭据却被静默标成不可续期。
+                      ...hasRefreshToken ? { refreshable: true } : {},
+                      ...(wasDisabled ? { enabled: true } : {}),
+                    })
+                    // ③ 占位 id 的 login.poll 走重定向报成功。
+                    rememberLoginMergedRedirect(id, existing.id)
+                    // ④ 删占位（会清掉占位自己的 ref；新凭据已在旧卡上）。
+                    await pool.removeAccount(id)
+                    ctx.logger.info?.(
+                      `[jet-hub] ${product.id} 该账号（user_id=${userId}）已存在于 ${existing.id}，`
+                      + `新凭据已并入该条目并删除占位 ${id}`
+                      + `${wasDisabled ? '（原卡此前被停用，已重新启用）' : ''}`,
+                    )
+                    return
+                  } catch (error) {
+                    ctx.logger.warn(
+                      `[jet-hub] ${product.id} 该账号（user_id=${userId}）合并到 ${existing.id} 失败：${String(error)}`,
+                    )
+                    if (handedOver) {
+                      // 旧卡已拿到新凭据 ⇒ 占位必须删，否则两张同凭据启用卡。
+                      await pool.removeAccount(id).catch(() => undefined)
+                      rememberLoginMergedRedirect(id, existing.id)
+                    } else {
+                      // 凭据没搬走 ⇒ 占位是唯一活凭据，保留；但标注原因，不静默。
+                      await pool.updateAccount(id, {
+                        nickname: `（合并失败，请重试）${credential?.nickname ?? id}`,
+                      }).catch(() => undefined)
+                    }
+                    return
+                  }
+                }
+              }
+            }
             await pool.updateAccount(id, {
               nickname: credential?.nickname ?? id,
               // Buddy 的 expires_at 是字符串形式的毫秒时间戳，
@@ -4946,6 +6470,7 @@ function registerJetHubEndpoints(
                 ZCODE.id,
                 'user_id',
                 userId,
+                id,
               )
               if (existingId.length > 0 && existingId !== id) {
                 ctx.logger.warn(
@@ -5211,6 +6736,88 @@ function registerJetHubEndpoints(
              */
             await autoclawAuthForProvider.verifyCredentialSite(credential)
             const ref = credentialRef(refName)
+            /**
+             * ⚠️⚠️ **同账号去重**（2026-11-02 加，接的是 2026-10-19 那次真机报障的同款防线）。
+             *
+             * 历史事故（`login.poll` 那条腿的注释）：同一个手机号出现 **3 次**、积分被
+             * **重复累加 62416**。根因是 `access_token` 是 JWT、**每次登录都轮换** ⇒
+             * 拿它当身份判据时同一账号每登一次就算新账号；而 `user_id` 是稳定值。
+             *
+             * 短信路径之所以兜住了，是因为它有「用户再提交一次验证码」这**第二次交互**
+             * （去重写在 `login.submitSms` 分支里）；而 **OAuth 在回调里一次做完，
+             * 没有第二次机会** ⇒ 必须在这里补一份，否则用户连点两次「+ 新建账号」
+             * 并用同一个 Z.ai 账号授权，就会得到两张卡片、两份凭据、积分翻倍。
+             *
+             * ⚠️ provider 必须用 `autoclawProduct.id`：短信那条硬编码了 `AUTOCLAW.id`，
+             *    对国际版**恒查不到**（这正是本仓「同一事实抄两份」的老形态）。
+             * ⚠️ 判据缺失（老凭据没 `user_id`）时 `identity` 为空 ⇒ 退化成「不去重」，
+             *    **不猜**（与短信路径同口径）。
+             */
+            const identity = credential.user_id === undefined ? '' : String(credential.user_id).trim()
+            /**
+             * ⚠️⚠️ **读池失败必须与「无重复」分开**（2026-11-02 自查补；与 officeace 那条同款教训）：
+             * 这里在 `started.result.then(...)` 链上，**任何抛错都会走 `.catch` ⇒ `failLogin(id)` ⇒ 删账号**。
+             * 而此刻凭据**已经换到手了** —— 把「查重时依赖不可用」判成「登录失败」，用户会看到
+             * 「登录失败」而实际授权成功，且占位条目连同凭据一起被清掉，只能重来一次。
+             * ⇒ 读池失败记 warn 后**照常落库**（读不到 ≠ 没有，与 `poolEntryOf` 的 `'unknown'` 同取向）。
+             */
+            let duplicateId = ''
+            if (identity !== '') {
+              try {
+                duplicateId = await pool.findAccountIdByIdentityField(autoclawProduct.id, 'user_id', identity, id)
+              } catch (error) {
+                ctx.logger.warn(
+                  `[jet-hub] ${autoclawProduct.id} 查重失败（按 user_id 读账号池）⇒ 本次**不去重**、照常落库：${String(error)}`,
+                )
+              }
+            }
+            if (duplicateId !== '' && duplicateId !== id) {
+              /**
+               * 把**本次的新凭据**写到已存在那条的 ref 上，再删掉本次的占位条目。
+               *
+               * 顺序不能反：先删占位会把 `refName` 那份凭据一并清掉（`removeAccount`
+               * 会清理它自己的凭据），但此时新凭据还没写给老条目 ⇒ 老条目拿着**旧 token**、
+               * 新 token 也没了 ⇒ 账号永久失效且用户看不到原因。
+               *
+               * ⚠️ OAuth 是后台完成的，没有「向用户返回错误」的机会 ⇒ 这里**静默并入**并
+               *    留一条 info 日志（面板上表现为「新卡片消失、老卡片刷新」）。
+               */
+              const existing = pool.listAccountsByProvider(autoclawProduct.id)
+                .find((entry) => entry.id === duplicateId)
+              if (existing !== undefined) {
+                await ctx.credentials.set(credentialRef(existing.credentialRef), JSON.stringify(credential))
+                /**
+                 * ⚠️⚠️ **命中一张「已被用户停用」的原卡时，必须把它重新启用**（2026-11-02 自查补；
+                 * 与 officeace 那条 P2 同型，是同一个坑的第二个入口）。
+                 *
+                 * 症状：用户手动停用某张国际版卡片 → 用**同一个 Z.ai 账号**重新授权 ⇒
+                 * 本段把新卡并入老卡并删掉新卡 ⇒ **老卡仍是停用** ⇒ 面板上「新卡片消失、老卡片
+                 * 依旧灰着」，用户以为没登上；若那是唯一账号，还会因「无已启用账号」整组隐藏。
+                 *
+                 * 处置口径与 officeace 一致：**语义 = 用户刚刚主动用这个号登录过，就是想让它可用**
+                 * ⇒ 并入时一并启用（并留 warn 说明这处被动改写）。
+                 */
+                const wasDisabled = existing.enabled === false
+                await pool.updateAccount(existing.id, {
+                  nickname: autoclawDisplayNickname(credential, existing.id),
+                  expiresAt: credential.expires_at,
+                  refreshable: isAutoclawRefreshable(credential),
+                  ...(wasDisabled ? { enabled: true } : {}),
+                })
+                if (wasDisabled) {
+                  ctx.logger.warn(
+                    `[jet-hub] ${autoclawProduct.id} 的账号 ${identity} 原卡片 ${existing.id} 处于**停用**状态，`
+                    + '本次登录已一并重新启用（否则会出现「登录成功但该渠道零可用卡」）',
+                  )
+                }
+                await pool.removeAccount(id)
+                ctx.logger?.info?.(
+                  `[jet-hub] ${autoclawProduct.id} 的账号 ${identity} 已存在（${duplicateId}），`
+                  + `新凭据已并入该条目并删除占位 ${id}`,
+                )
+                return
+              }
+            }
             await ctx.credentials.set(ref, JSON.stringify(credential))
             const nickname = autoclawDisplayNickname(credential, id)
             await pool.updateAccount(id, {
@@ -5654,9 +7261,35 @@ function registerJetHubEndpoints(
             value: { done: true, success: false, error: failure } satisfies RpcPollLoginResponse,
           }
         }
+        /**
+         * ⚠️ 两件事必须排在 `!entry` 早退**之前**（2026-11-02 二审 C🟡-2）：
+         * ① 判重合并会让占位条目消失（`removeAccount`），但那是**成功**；
+         * ② 后台任务在途时条目理应还在，但万一有人先删了卡，也要继续等而不是报完。
+         * 原先 `!entry` 在最前面 ⇒ 「秒过」场景下前端每拍都回 `done:false`，
+         * 一路转圈到 5 分钟上限，而账号其实已经建好。
+         */
         const accounts = await pool.listAllAccounts()
         const entry = accounts.find((a) => a.id === req.accountId)
-        if (!entry) return { ok: true, value: { done: false } }
+        if (!entry) {
+          /**
+           * ⚠️ 条目**已经不在了**时才看这两条（2026-11-02 二审 C🟡-2 的修法位置很重要）：
+           * 不能把「在途」判据提到 `entry` 之前 —— 条目还在时**凭据是否落库**才是
+           * 更可靠的终态信号（既有用例正是靠它判 `done:true`：`account.create`
+           * 返回后任务往往还没跑完，此时 `inFlight.has(id)` 仍为真）。
+           */
+          const merged = takeFreshLoginMergedRedirect(req.accountId)
+          if (merged !== undefined) {
+            // 判重合并 ⇒ 成功（凭据已写进 `merged.targetId`），但 id 已经不是本次这个。
+            // ⚠️ 不再这里另记一次 `loginMergedRedirect.delete`：`takeFreshLoginMergedRedirect`
+            //    已经把过期项删掉并返回了未过期项（四审自查：原写法是多余的重复删除）。
+            return { ok: true, value: { done: true, success: true } }
+          }
+          // 还在途 ⇒ 继续等（别让前端以为「什么都没发生」而提前收工）。
+          if (magicrewBrowserLoginInFlight.has(req.accountId)) {
+            return { ok: true, value: { done: false } }
+          }
+          return { ok: true, value: { done: false } }
+        }
         // 检查凭据是否已实际写入（占位条目没有凭据）。
         //
         // ⚠ **不能只判「resolve 出了非空字符串」**（审查发现）：占位条目被
@@ -5723,6 +7356,51 @@ function registerJetHubEndpoints(
               })()
               return { ok: true, value: await task }
             }
+          }
+          /**
+           * ⚠️⚠️ **超级麦吉网页版登录：把「等用户」交给后台任务**（`mode: 'browser'`）。
+           *
+           * ## 为什么这一格是「占位条目在、凭据还没有」的**正常形态**
+           *
+           * 其余十几家走到这里意味着「拿不到凭据 ⇒ 还没授权完」，而本家是**真的**
+           * 在等一个可见浏览器窗口里的用户操作（分钟级）。⇒ 不能像别家那样干等，
+           * 必须去 `await` `account.create` 里起的那一轮任务（**单飞**：
+           * 客户端 1 秒一拍、`setInterval` 没有 in-flight 闸门，两拍重叠若各起一轮
+           * 就会抢同一个账号 —— 与 OfficeAce 的 `officeAceExchangeInFlight` 同因）。
+           *
+           * ⚠️ 任务结束后**它自己会从表里删掉**（`account.create` 那段 `finally`）；
+           * 这里 `return await task` 拿到的是已经算好的三态，不会再起第二次。
+           *
+           * ⚠️ 顺序：本格必须在「凭据缺失 ⇒ 直接 `{done:false}`」那行**之前**判，
+           * 否则它永远轮不到（占位条目按定义就没有凭据）。
+           */
+          // ⚠️ 两站共用同一张在途表（键是 `accountId`，两站 id 前缀不同不会撞）。
+          if (
+            entry.provider === 'magicrew'
+            || entry.provider === 'magicrewintl'
+            // ⚠️ MonkeyCode 两站共用同一张在途表（键是 `accountId`，两站 id 前缀
+            //    不同不会撞）。漏了这两站 ⇒ 「登录中点刷新」会落到下面的
+            //    `{done:false}`，而真正在跑的那一轮已经成功 —— 用户看到的是
+            //    「转圈到 5 分钟超时」，卡却已经建好了（IKLI7J 同款形态）。
+            || entry.provider === MONKEYCODE.id
+            || entry.provider === MONKEYCODE_INTL.id
+            // ⚠️ 百智云的 `account.create { mode:'browser' }` 也进这张表
+            //    （`baizhi.startSession` 用的是 `baizhiSessionInFlight`，另一张）。
+            || entry.provider === BAIZHI.id
+          ) {
+            const shared = magicrewBrowserLoginInFlight.get(req.accountId)
+            if (shared !== undefined) return { ok: true, value: await shared }
+            /**
+             * ⚠️ 表里没有这一轮（宿主重启过 / 兜底轮询到了别人的 id）⇒ 回
+             * `{done:false}` 交给客户端自己的 5 分钟表收口，**不要**在这里猜成功或失败：
+             * 猜成功会把一张没有凭据的卡片报成「已添加」，猜失败会删掉一张可能
+             * 正在登录的卡（`magicrewBrowserLoginInFlight` 只在**成功或失败落定后**
+             * 才删自己，故走到这里一定意味着没有在途任务）。
+             *
+             * ⚠️ 但**不能**无限挂着：占位条目由 `account.list` 的
+             * `sweepAbandonedMagicrewBrowserLogins` 按 TTL 收口。
+             */
+            return { ok: true, value: { done: false } }
           }
           return { ok: true, value: { done: false } }
         }
@@ -5825,7 +7503,7 @@ function registerJetHubEndpoints(
             const identity = cred.user_id === undefined ? '' : String(cred.user_id).trim()
             const duplicateId = identity === ''
               ? ''
-              : await pool.findAccountIdByIdentityField(AUTOCLAW.id, 'user_id', identity)
+              : await pool.findAccountIdByIdentityField(AUTOCLAW.id, 'user_id', identity, req.accountId)
             if (duplicateId !== '' && duplicateId !== req.accountId) {
               /**
                * ⚠️⚠️ **必须真删占位条目，并把新凭据交给已存在的那条**
@@ -6190,6 +7868,24 @@ function registerJetHubEndpoints(
         }
 
         const value: RpcTestAccountResponse = await testAccount(pool, accountId, modelId)
+        /**
+         * ⚠️⚠️ **不要**在这里清任何标记 —— 包括账号级封禁标记（2026-11-01 对抗
+         * 审计打穿了第一版「成功即清」的写法）。
+         *
+         * 原因不是「少一个便利」，而是**判据强度不够**：
+         * - `testAccount` 只测**一个**模型（`pickTestModel` = 请求里的 modelId >
+         *   `Object.keys(modelRateLimits)[0]`（**插入序最老的那个键**）> 目录第一个）；
+         * - 客户端「测试」按钮**从不传 modelId**（`rpcCall('account.test', { accountId })`）；
+         * - 而封禁与限流是两笔账：最老的键可能是历史 429 的模型，与被 11140 拦下的
+         *   模型无关。实测（对抗审计 `zzatk3.spec.ts`）：`modelRateLimits = {glm-5.2:
+         *   旧429, deepseek-v4.1-flash: 11140}` 时 `pickTestModel ⇒ glm-5.2`，那个
+         *   模型换模型立刻 200 ⇒ `ok:true` ⇒ **整号封禁被洗白** ⇒ 池立刻选回它 ⇒
+         *   下一发再 403（mark/clear 抖动，每次烧一发真实请求 + 2 次写盘）。
+         *
+         * 清除只留给**证据强度足够**的路径：`account.retest`（要求**所有**带标记的
+         * 模型都实测通过）与 `account.reset`（用户显式「我确认它好了」，不做验证）。
+         * 这与上面「它不写任何存储」的原有纪律一致 —— 第一版把它破例了，现撤销。
+         */
         return { ok: true, value }
       }
 
@@ -7164,13 +8860,85 @@ function registerJetHubEndpoints(
         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
         const catalogSource = modelAdapters?.[req.provider]
         const all = catalogSource?.listAllModels()
+        /**
+         * ⚠️⚠️ **黑名单补回必须以上游目录为界**（真实缺陷，2026-10-27）。
+         *
+         * ## 缺陷形态
+         *
+         * 旧实现无条件把 `disabledMap` 里所有 `true` 的 id 补进设置页目录。
+         * 于是**上游已下架**、但用户曾经关掉过的模型会**永久留在设置页**：
+         * 灰显、能点「打开」，点开却必然 404（实测 `GLM-5` / `glm-5.3-flash`
+         * 回 `InferHub.002002009.404 The model is not registered`）。
+         *
+         * 用户视角：这模型明明还在列表里、开关也能动，为什么一发就失败？
+         * 而它既不是 `dead`（没有阳性请求失败记录）、也不在远端目录里 ——
+         * 两条现有的「可解释」路径都覆盖不到它。
+         *
+         * ## ⚠️⚠️ 判据必须用 `listAllModels()`，**不能用 `models`**
+         *
+         * 这是本修法最容易搞反的一处：`llm.listModels()` 的结果**已被适配器按
+         * 黑名单过滤**（见上方长注释）。若拿它当「在售集合」，那么**每一个被
+         * 用户关掉的在售模型都不在其中** ⇒ 它们会被判成「已下架」⇒ 全部不再
+         * 补回 ⇒ 用户关掉的模型从设置页集体消失、无法重新打开 ——
+         * 那正是本端点**当初要修的那个缺陷**，等于把坑重新挖一遍。
+         *
+         * ⇒ 权威在售集合只能取 **`listAllModels()`**（不套黑名单的全量目录）。
+         * 拿不到它（外部/旧适配器没有该方法）时，**放弃该判据**（照旧补回），
+         * 宁可留着幽灵条目，也不让用户在售模型凭空消失。
+         *
+         * ## ⚠️⚠️ 但「拿得到 `listAllModels()`」**仍然不等于**「拿到了全量目录」
+         * （2026-10-28 修，PR159 首版的缺口）
+         *
+         * 它在**冷缓存 / 远端降级**下返回的是各家**编译期兜底表**，而那是远端
+         * 目录的**子集**（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`；
+         * Issue IKJW33 实测：`cline` 冷缓存只有 **3** 条、远端有 **460** 条）。
+         *
+         * 后果与本修复要治的病**同形但方向相反**：用户关掉的**在售**模型若恰好
+         * 不在兜底表里（例如 codearts 近期新增、只存在于远端的 `glm-5.3` /
+         * `kimi-k3`），会被判成「已下架」⇒ **从设置页彻底消失、再也打不开**。
+         * 命中窗口很实在：远端拉取失败、离线启动、或刚重启还没拉到目录时。
+         *
+         * ⇒ 判据的前置条件必须是**适配器自报「这份目录确认来自远端完整读取」**
+         * （{@link ModelCatalogSource.catalogConfirmedRemote}）。证明不了就放弃判据。
+         * 这条正是本文件注释里那句原则的落地：「判据只能建立在**确认拿到全量目录**
+         * 之上」—— 而「拿得到一份数组」不是「确认拿到全量」。
+         *
+         * | 形态 | 处置 |
+         * |---|---|
+         * | 自报确认远端 + `listAllModels()` 非空 | 补回时只补**仍在其中**的（本次要修的） |
+         * | 自报**未**确认远端（false / 未实现） | **放弃判据**，照旧补回（保守；其余 14 家的默认行为） |
+         * | `listAllModels()` 不可用（`undefined`） | 同样放弃判据 |
+         * | 它返回空数组 | 同样放弃判据（空目录 = 无账号门控，不是「全部下架」） |
+         *
+         * ⚠️ 判据只能建立在「确认拿到全量目录」之上。拿「读不到」反推「已下架」
+         * 正是本仓库 `dead-model-store.ts` 头注释明令禁止的「从残缺目录反推」。
+         *
+         * ⚠️ **不删用户数据**：这里只是**不显示**已下架条目，`disabledMap` 里的
+         * 记录原样保留 —— 万一上游把模型重新上架，开关状态还在（用户不必重设）。
+         */
+        // ⚠️ 探测本身抛错一律按「未确认」处理（保守方向：宁可多留一个幽灵条目）。
+        let confirmedRemote: boolean | undefined
+        try {
+          confirmedRemote = catalogSource?.catalogConfirmedRemote?.()
+        } catch {
+          confirmedRemote = undefined
+        }
+        const onSale = confirmedRemote === true && all !== undefined && all.length > 0
+          // ⚠️ 取**两个来源的并集**（与 `fullCatalogIds` 同口径）：`listModels` 是
+          //    被黑名单过滤过的远端目录，`listAllModels` 是不套黑名单的那份 ——
+          //    任一来源里有它，就不能说它已下架。
+          ? new Set([...models.map((model) => model.id), ...all.map((model) => model.id)])
+          : undefined
+        const stillOnSale = (id: string): boolean => onSale === undefined || onSale.has(id)
         let catalog: Array<{ id: string; name: string; isFree?: boolean }>
         if (all !== undefined) {
           catalog = [...all]
           // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
           const known = new Set(catalog.map((model) => model.id))
           for (const id of Object.keys(disabledMap)) {
-            if (disabledMap[id] === true && !known.has(id)) catalog.push({ id, name: id })
+            if (disabledMap[id] === true && !known.has(id) && stillOnSale(id)) {
+              catalog.push({ id, name: id })
+            }
           }
         } else {
           const listedIds = new Set(models.map((model) => model.id))
@@ -7239,7 +9007,7 @@ function registerJetHubEndpoints(
         // `listModels()` 过滤掉，写完再读就把它误判成「不在目录」。
         // ⚠️ 黑名单**不在这里取** —— `readableCatalogIds` 会在 `await` 之后
         //    自己读（理由见其注释：提前取会与写入时刻错开、导致误报「没有变更」）。
-        const known = await readableCatalogIds(ctx, pool, modelAdapters, req.provider)
+        const { known } = await readableCatalogIds(ctx, pool, modelAdapters, req.provider)
         await pool.setModelDisabled(req.provider, req.modelId, req.disabled === true)
         ctx.logger.info(
           `[jet-hub] ${req.disabled === true ? '关闭' : '打开'}模型 ${req.provider}/${req.modelId}`,
@@ -7345,9 +9113,71 @@ function registerJetHubEndpoints(
         }
         // 同单条端点：目录必须在写入**之前**读（关闭方向会让 `listModels()`
         // 过滤掉这些 id）；黑名单由 `readableCatalogIds` 在 `await` 之后自取。
-        const known = await readableCatalogIds(ctx, pool, modelAdapters, req.provider)
-        if (req.disabled) await pool.setModelsDisabled(req.provider, ids)
-        else await pool.clearModelsDisabled(req.provider, ids)
+        const { known, catalog } = await readableCatalogIds(ctx, pool, modelAdapters, req.provider)
+        if (req.disabled) {
+          /**
+           * ⚠️⚠️ **关闭方向必须补设「供应商关闭」意图**（本仓补丁，2026-11-05）。
+           *
+           * ## 缺陷形态（与 `model.setAllDisabled` 的 IKP8OF 同一个症状的**第三个入口**）
+           *
+           * 宿主的「供应商开关」与 `provider.status` 是**两套持久语义**：
+           *
+           * - 开关写的是「黑名单 + 关闭意图」两份状态；
+           * - `provider.status` 的 `closed` 判据是 `total > 0 && disabled === total`
+           *   （`total` 取自 `listAllModels()`，**含被过滤掉的 id**）。
+           *
+           * 本端点原实现只写黑名单、**从不落意图**。于是：
+           *
+           * 1. 模型列表弹窗把该家**全部**模型按「未勾选」全传进来 ⇒ 黑名单写满全量；
+           * 2. 此刻 `provider.status` 报 `closed: true`（`disabled === total`），
+           *    但 `providerClosed[provider]` 仍是 `false`；
+           * 3. 用户看到「全部已关闭」，点「打开供应商」—— 走
+           *    `clearModelsWithProviderClosed`，它按**意图**决定清哪家 ⇒ 清不到；
+           * 4. 弹窗重新打开，34 个模型仍全显示「已在 Jet Hub 关闭」、勾选数 0；
+           * 5. 再点保存 ⇒ 又全传一次。**死循环，用户没有任何出口。**
+           *
+           * 实测（2026-11-05，本机）：黑名单 29 家 / 1005 条全 `true`，而
+           * `providerClosed` 只有 2 家（那两家恰好是账号全停用、走
+           * `provider.setEnabled(false)` 关闭的）。历史备份从 830 → 920 → 1005
+           * 一路上涨，说明每保存一次就把当时目录里的全部模型加进黑名单。
+           *
+           * ## 判据：黑名单**覆盖该家全量目录** ⇒ 语义上等价于「关闭供应商」
+           *
+           * ⚠️ **必须用 `catalog.ids`（`fullCatalogIds` 的纯净并集）**，
+           *    不能用 `known` —— 后者已经把黑名单里的 id 并回去了（为了清理历史
+           *    死键），拿它判「全量覆盖」**恒真**，等于「关一个模型就关掉整个
+           *    供应商」。两者不可混用，见 `readableCatalogIds` 的 `@returns`。
+           *
+           * ⚠️ **目录不完整（`complete === false`）时不猜** —— 宁可少设一次
+           *    意图，也不能拿残缺目录把供应商误关掉（与 `setAllDisabled` 的同名
+           *    守卫同源）。`catalog.ids.length > 0` 同理防「空目录 ⇒ every 恒真」。
+           *
+           * ⚠️ **未覆盖全量时走原路径，一个字节都不变** —— 用户只是关掉了某几个
+           *    分组，那与「关闭供应商」是两件事（`setAllDisabled` 的
+           *    `closeProvider` 注释也这么写：模型级批量关闭不得顺带关供应商）。
+           *
+           * ⚠️ **黑名单与意图必须同一次落盘** —— `writeModelsWithProviderClosed`
+           *    内部合并好两份状态后只 `queueStoreSave()` 一次；分两次写会留下
+           *    「黑名单满了、意图没写」的半套状态，重启后静默复发。
+           */
+          const disabledBefore = pool.listDisabledModels(req.provider)
+          const after: Record<string, boolean> = { ...disabledBefore }
+          for (const id of ids) after[id] = true
+          const coversAll = catalog.complete
+            && catalog.ids.length > 0
+            && catalog.ids.every((id) => after[id] === true)
+          if (coversAll) {
+            await pool.writeModelsWithProviderClosed(req.provider, ids, true)
+            ctx.logger.info(
+              `[jet-hub] ${req.provider} 的黑名单已覆盖全量目录（${catalog.ids.length} 个），`
+              + '同时落「供应商关闭」意图',
+            )
+          } else {
+            await pool.setModelsDisabled(req.provider, ids)
+          }
+        } else {
+          await pool.clearModelsDisabled(req.provider, ids)
+        }
         ctx.logger.info(
           `[jet-hub] ${req.disabled ? '关闭' : '打开'} ${req.provider} 的 ${ids.length} 个模型（按分组）`,
         )
@@ -7411,7 +9241,7 @@ function registerJetHubEndpoints(
           : undefined
         if (req.disabled && catalog !== undefined) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          // ⚠️⚠️ **判据顺序是语义的一部分**，四条分支按「能否在目录不完整时
+          // ⚠️⚠️ **判据顺序是语义的一部分**，五条分支按「能否在目录不完整时
           // 安全作答」从强到弱排列（下面逐条给理由，别重排）：
           //
           // 1. **远端读失败**（超时/抛错/无 llm 服务）⇒ 拒绝且不落盘。
@@ -7460,6 +9290,43 @@ function registerJetHubEndpoints(
             ctx.logger.info(
               `[jet-hub] ${req.provider} 的全部 ${catalog.ids.length} 个模型本就已关闭，无变更`,
             )
+          } else if (!catalog.complete && req.closeProvider === false
+            && catalog.notReady === undefined) {
+            /**
+             * ⚠️⚠️ **模型列表屏的「全关」在「供应商没有账号」时不能拒绝**（2026-11-04 真机报障）。
+             *
+             * 症状（用户原话「部分供应商全关按钮异常」）：模型列表屏上 Codeoly (Unity)
+             * 明明显示「5 个 · 已关闭 0」、五个开关全蓝，点「全关」却报
+             * 「该供应商没有可关闭的模型，未做任何变更」——**界面与报错自相矛盾**。
+             *
+             * 成因：该供应商**没有登录账号** ⇒ `llm.listModels()` 被目录门控成 `[]`
+             * ⇒ `complete = remoteIds.length > 0 = false` ⇒ 落到「目录不完整 ⇒ 拒绝」。
+             * 而界面上那 5 个模型来自适配器**兜底表**（`adapterIds`），`catalog.ids`
+             * 本来就是这 5 个 —— 用户要关的正是它们。
+             *
+             * 为什么这一格**可以**放行（与 IKJW33 不矛盾）：
+             * - IKJW33 的缺陷形态是「写完整黑名单 + 落**关闭意图**」⇒ `provider.status`
+             *   此后报「已关闭」，而上游其实还有几百个模型可选。本分支落的是
+             *   `closeProvider === false`（模型列表屏**从不**写意图，见下面 else 分支
+             *   的注释）⇒ `provider.status` 仍按同一份兜底表算「5 个 · 已关闭 5」，
+             *   **状态与事实一致**。
+             * - 用户看不到的模型不会被误报成已关闭；将来登录后新增的模型仍是打开的，
+             *   用户可以再点一次「全关」。
+             *
+             * ⚠️ **`notReady` 一格必须排除**：那是「远端读到了、但目录还没推导完」
+             * （聚合冷启动），此时「可见项」本身是残的，写黑名单会把状态搞错。
+             * ⚠️ `remoteError`（分支 1 已拦）不放行：那是真的读失败，重试可能就好，
+             * 不该写下一份可能残缺的黑名单。
+             */
+            // ⚠️ 第三参是 `'keep'` **不是** `false`（2026-11-04 修）：
+            //    `false` 的语义是「删掉该供应商已有的关闭意图」，而本屏从不设置
+            //    意图 ⇒ 传 `false` 会**删除用户在别处设好的关闭状态**
+            //    （用户报障「关闭供应商后随更新变回启用」就是这个）。
+            await pool.writeModelsWithProviderClosed(req.provider, pending, 'keep')
+            ctx.logger.info(
+              `[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`
+              + '（目录不完整：该供应商未登录或远端无可读目录，只关当前可见项、不动供应商关闭意图）',
+            )
           } else if (!catalog.complete) {
             // 4. **有新增项但目录不完整** ⇒ 拒绝且不落盘。
             //    ⚠️ 必须排在幂等短路**之后**：先判它会让第 3 条那个正常形态
@@ -7468,6 +9335,22 @@ function registerJetHubEndpoints(
             //    而它只是**子集**，据此写黑名单正是本 issue 的原始缺陷。
             //    ⚠️ 文案与 `provider.setEnabled` **逐字同构**：`remoteError` 有值
             //    = 「**读不到**」（已在第 1 条拦下）；无值 = 「**没账号**」（去登录）。
+            // ⚠️⚠️ **冷帧必须与「无账号」分开说**（二审 P2-1，行为级探针 S4b 实测）：
+            //    `notReady` 有值 = 聚合目录**还在后台推导**，用户动作是「等一下再点」；
+            //    而「没账号」的动作是「去登录」。两者动作不同 ⇒ 文案不能合并，
+            //    否则冷帧下界面明明列着 5 个模型、报错却说「没有可关闭的模型」。
+            //    `provider.setEnabled` 早就分开说了（见它自己的 `notReady` 分支），
+            //    本端点此前漏了 —— 同一份数据、两个端点、两套文案。
+            if (catalog.notReady !== undefined) {
+              return {
+                ok: false,
+                error: {
+                  code: 'bad-request',
+                  message: `聚合目录尚未读取完成（${catalog.notReady}），`
+                    + '为避免只关闭一部分模型，本次未做任何变更。请稍后重试。',
+                },
+              }
+            }
             return {
               ok: false,
               error: {
@@ -7497,11 +9380,28 @@ function registerJetHubEndpoints(
             //   供应商**也关掉（`provider.status` 报 closed、选择器里一个模型都没有）
             //   ；再打开**任意一个**模型，供应商又被顺带打开（`setModelDisabled` 的
             //   打开方向会清意图）⇒ 两头都与用户意图相反，且**零提示**。
-            const closeProvider = req.closeProvider !== false
-            await pool.writeModelsWithProviderClosed(req.provider, pending, closeProvider)
+            // ⚠️⚠️ 第三参 **`'keep'` 而不是 `false`**（2026-11-04 真机报障修复）。
+            //
+            // 上一行的注释说的是「**不落**意图」，而 `false` 的实现是
+            // **`delete providerClosed[provider]`** —— 两回事：
+            // - 「不落」= 不设置；
+            // - `false` = **主动删除**用户已经设好的意图。
+            //
+            // 用户报障的完整链条（实测现场：`providerClosed` 只剩 `{accio:true}`）：
+            // ```
+            // ① 点「关闭供应商」 ⇒ providerClosed={X:true} + 全量黑名单  ← 本来稳定
+            // ② 之后在模型列表屏对 X 点一次「全关」 ⇒ 本行传 false ⇒ 意图被删
+            // ③ 插件更新 / 目录变长 ⇒ 派生判据 disabled!==total ⇒ 翻回「启用」
+            // ```
+            // ⇒ 用户看到「关闭过的供应商自己变回启用」，且无任何提示。
+            await pool.writeModelsWithProviderClosed(
+              req.provider,
+              pending,
+              req.closeProvider !== false ? true : 'keep',
+            )
             ctx.logger.info(
               `[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`
-              + (closeProvider ? '' : '（不落供应商关闭意图）'),
+              + (req.closeProvider !== false ? '' : '（不动供应商关闭意图）'),
             )
           }
         } else {
@@ -7592,9 +9492,8 @@ function registerJetHubEndpoints(
        * ⚠️ 这样**常见路径零网络**：绝大多数供应商是「未关闭」，子集判据
        * 直接给 false、不触发核实（冷缓存下也不触发）。只有**真的可能已关闭**
        * 的供应商才付一次目录读取；缓存已热时那次读是纯内存的。
-       * ⚠️ 代价：多个「已关闭」供应商会**串行**各读一次（每次上限
-       * {@link CATALOG_READ_TIMEOUT_MS}）—— 首屏最多因此多花「已关闭家数 × 2 秒」
-       * 的最坏值，而实际情况是缓存已热（用户会先看到列表才会去关）。
+       * ⚠️ 代价：**只有真的可能已关闭**的供应商才付一次目录读取；缓存已热时
+       * 那次读是纯内存的。并发后总时长与家数**无关**（见阶段 2 的注释）。
        */
       case 'provider.status': {
         const req = payload as RpcProviderStatusRequest
@@ -7602,10 +9501,24 @@ function registerJetHubEndpoints(
           return { ok: false, error: { code: 'bad-request', message: 'providers 必须是字符串数组' } }
         }
         const statuses: Record<string, ProviderStatus> = {}
-        for (const provider of req.providers) {
-          // 空 id 不进结果：它不可能对应任何 provider，留着只会让前端多一个
-          // 无意义的键（前端按 PROVIDERS 取，多出来的键会被忽略，但脏数据不该产生）。
-          if (provider.length === 0) continue
+        // ⚠️⚠️ **三阶段：先同步算出「谁需要核实」，再并发核实，最后生成状态**
+        //（2026-11-05 三审端到端 P1-1）。原先是一个 `for` 里逐家
+        // `await fullCatalogIds(...)`，而该调用最长 2000ms
+        //（`CATALOG_READ_TIMEOUT_MS`）⇒ 28 家全关时**串行 56194ms**（实测）。
+        // 症状：插件更新/重启后首次打开设置页，供应商开关整片灰显
+        //（`reason: '状态尚未读取'`）最长 50 秒，期间分组不生效、之后突然重排，
+        // **全程零提示**。
+        //
+        // ⚠️ `fullCatalogIds` 是**幂等**的读（只读目录与黑名单，不写本仓库的
+        //    状态、不广播），故并发安全。⚠️ 它**不是**「纯读」——冷缓存下会写
+        //    models.dev 的**磁盘缓存**（`src/models-dev-cache.ts` 的
+        //    `writeFile` + `rename`）并发网络请求；那份缓存的并发由模块级在途槽
+        //    + `RemoteCatalogGate` 去重保证（2026-11-05 四审并发 P1-2 更正：
+        //    原注释自称「纯读」，与实现不符）。
+        //    每家的 2s 预算不变，总时长从 `N × 2s` 降到 `≤ 2s`。
+        // ⚠️ 判据只写一份（`computePlan`）：循环与预取共用它，避免两处漂移
+        //    （本仓库「一文件两套同义判据」是红线）。
+        const computePlan = (provider: string) => {
           const catalog = modelAdapters?.[provider]?.listAllModels()
           let total = catalog?.length ?? 0
           // ⚠️ `listAllModels()` **不带 disabled 字段**，故必须另取黑名单再按 id 计数。
@@ -7653,12 +9566,47 @@ function registerJetHubEndpoints(
             closed = true
             disabled = total
           }
+          return { total, disabled, closed, closedByIntent }
+        }
+
+        // 阶段 2：**并发**核实（只对「派生判据为已关闭且无意图」的家发请求）。
+        // ⚠️ 「空 id 不进结果」：它不可能对应任何 provider，留着只会让前端多一个
+        //    无意义的键（前端按 PROVIDERS 取，多出来的键会被忽略，但脏数据不该产生）。
+        const planMap = new Map<string, ReturnType<typeof computePlan>>()
+        for (const provider of req.providers) {
+          if (provider.length === 0) continue
+          planMap.set(provider, computePlan(provider))
+        }
+        const verifyMap = new Map<string, Awaited<ReturnType<typeof fullCatalogIds>>>()
+        await Promise.all(
+          [...planMap]
+            .filter(([, plan]) => plan.closed && !plan.closedByIntent)
+            .map(async ([provider]) => {
+              // ⚠️ 走 single-flight：同一 provider 的在飞核实只发一次请求
+              //（2026-11-05 四审端到端 P2-1，见 `verifyCatalogOnce`）。
+              verifyMap.set(provider, await verifyCatalogOnce(provider))
+            }),
+        )
+
+        // 阶段 3：应用核实结果并生成状态。
+        for (const provider of req.providers) {
+          const plan = planMap.get(provider)
+          if (plan === undefined) continue
+          let { total, disabled, closed } = plan
+          /** 核实腿没能证明「已关闭」时的原因（见 `ProviderStatus.verifyFailed`）。 */
+          let verifyFailed: string | undefined
           // ⚠️⚠️ 只有「即将报已关闭」才核实（危险方向，见方法头）。
           // ⚠️ 意图为真时**跳过核实**：核实是为了「证明目录里每一条都关着」，
           //    而意图已经把整家关掉了 ⇒ 核实既无必要，还会因一次远端抖动
           //    把 `closed` 翻回 false（正是本 issue 的形态）。
-          if (closed && !closedByIntent) {
-            const full = await fullCatalogIds(ctx, modelAdapters, provider)
+          if (closed && !plan.closedByIntent) {
+            // ⚠️ 阶段 2 已按同一判据预取，但**判据写了两份**（那边的 `filter`
+            //    与这里的 `if`）⇒ 将来任何人在阶段 1 加一个 `continue` 就会
+            //    「该核实却没预取」⇒ 这里必须显式处理 `undefined`
+            //（2026-11-05 四审并发 P2-3；改用 `!` 会在下面 `full.notReady`
+            //  处抛 `TypeError`，把一次读状态变成 500）。
+            const full = verifyMap.get(provider)
+            if (full === undefined) continue
             // ⚠️⚠️ **判据是「远端读成功」，不是 `complete`**：`complete` 额外要求
             // 远端**非空**，而这里恰好有一个**正常**的空形态 ——
             // 「全部模型都已关闭」时 `listModels()` 被黑名单过滤成 `[]`
@@ -7681,21 +9629,80 @@ function registerJetHubEndpoints(
               // provider.status = {"total":1,"disabled":1,"closed":true,"verified":"ok（远端 0 条）"}
               // 改前形态        = {"total":1,"disabled":1,"closed":false,"verified":"remoteError：超时"}
               // ```
-              // 改前该路径必然 2000ms 超时 ⇒ `remoteError` ⇒ `closed=false`（**安全方向**）；
               // 改后核实「成功」但只见到 `auto` ⇒ `closed=true`（**危险方向**），
               // 而另外两个虚拟模型仍可选 —— 界面与事实相反。
               //
-              // ⇒ 这里把 `notReady` 与「核实不了（远端读失败）」**并列**处理：
-              // 两者都说明「我这份合并目录不足以证明已关闭」，都报 `closed:false`。
-              // 报 false 是安全的（用户可再点一次开关，点了会得到上面那条明确拒绝）。
+              // ⚠️⚠️ 这一格与下面的 `remoteError` **必须分开**（2026-11-05 四审
+              // 端到端 P1-1 与三审 P1-2 的裁决）：
+              // - `notReady` 是**适配器确定性地**说「我这份目录不全」⇒ 此时
+              //   「派生判据说全关」**不构成证据**（它只见到一个子集）⇒ 必须报
+              //   `closed:false`。这个判断**不随上游抖动翻转**（它是适配器自己
+              //   的就绪状态），故没有「28 家一起翻」的问题。
+              // - `remoteError` 是**瞬态网络故障**（429 / 502 / 超时）⇒ 本地
+              //   证据（目录快照 + 黑名单）**一个字都没变**，变的只是「远端
+              //   读不到」⇒ 保留派生判据（见下面 else 分支的长注释）。
+              verifyFailed = full.notReady
               closed = false
             } else if (full.remoteError === undefined) {
               total = full.ids.length
+              // ⚠️⚠️ 黑名单必须在**这一刻**重读（2026-11-05 四审并发 P1-1）。
+              //
+              // 原实现用阶段 1 的快照（`plan.disabledMap`），理由是「黑名单与
+              // 目录必须来自同一时刻」。方向对，但**取错了那一时刻**：
+              // 阶段 1 在**所有**核实之前跑完，而 `total` 来自**全部**核实
+              // 之后 ⇒ 窗口从「该家一次读取（≤2s）」**放大**成「阶段 1 剩余
+              // + 全部核实」。可复现（两供应商，p1 核实期间把 m3 移出黑名单）：
+              // ```
+              // 改前 p2 = {"total":3,"disabled":2,"closed":false}  ✅ 安全
+              // 改后 p2 = {"total":3,"disabled":3,"closed":true}   ❌ 报已关闭而
+              //                                                      m3 已可选
+              // ```
+              // 现在两者紧挨着取 ⇒ 窗口 = 两次同步调用之间的**零 await**。
+              const disabledMap = pool.listDisabledModels(provider)
               disabled = full.ids.filter((id) => disabledMap[id] === true).length
               closed = total > 0 && disabled === total
             } else {
-              // 核实不了（远端读失败）⇒ 保守报未关闭（安全方向）。
-              closed = false
+              // ⚠️⚠️⚠️ **瞬态远端故障时绝不改写 `closed`**（2026-11-05 四审端到端 P1-1）。
+              //
+              // 三审（`9b2f93a`）这里原本是 `closed = false`，理由是「保守报
+              // 未关闭是安全方向」。**该结论已被真实链路实测推翻**：
+              //
+              // 真实 UI 载荷是 `model.setAllDisabled({closeProvider:false})`
+              //（`plugin-src/client/jet-hub.js:7757-7761`）⇒ **永不写关闭意图**
+              // ⇒ 每次读状态都走核实腿。于是**任何一次上游瞬态故障**
+              //（429 / 502 / 超时 > 2s）都会把「派生判据说已关闭」的**全部**
+              // 供应商一起翻成 `closed:false`。实测 28 家同时关闭：
+              // ```
+              // 健康目录：        closed===true  = 28/28
+              // 目录 429（2ms）： closed===false = 28/28   ← 界面「全部开启」
+              // 502 / 超时 2100ms：同上
+              // ```
+              // 而 `groupProviders`（`plugin-src/client/provider-toggle.js:42-55`）
+              // 只读 `closed === true` ⇒ 28 家整片从「已关闭」组跳到「已打开」组
+              // = 用户报障的「有时候全部开启 / 全部关闭」。
+              //
+              // ⇒ 正确语义：**「核实不了」只意味着「我无法证明它已关闭」，
+              //    不意味着「它没关闭」**。此时保留派生判据的结论（`closed` 与
+              //    `disabled`/`total` 都来自**同一个**本地快照，三者自洽），
+              //    只用 `verifyFailed` 附注「本次未能核实」。
+              //
+              // ⚠️ 保留 `closed:true` 会不会「危险」（界面说已关闭而模型可选）？
+              //    本格的触发条件是**远端读失败**，而目录快照与黑名单一个字都没变
+              //    ⇒ 若目录真的变长了，那一次**成功**的核实会给出 `closed:false`
+              //（见上面 `total = full.ids.length` 那一支）。即：只有「读到了
+              //    新目录」才允许改判 —— 与 `notReady` 那一格刻意不同。
+              //
+              // ⚠️⚠️ **前端在这一格**拿不到**原因**（2026-11-05 对抗审计 P2-3）：
+              //    `providerSwitchState` 的第一条 `if (status.closed === true)`
+              //    **先短路** ⇒ 本格 `closed:true` + `verifyFailed` ⇒ 前端渲染成
+              //    「已关闭、可点开」，**`reason` 为 null** ⇒ 悬停看不到「本次没核实成」。
+              //    （`notReady` 那一格不同：它报 `closed:false` ⇒ 走下面那条
+              //    「核实失败 ⇒ 禁用 + 原因」分支 ⇒ 原因可见。）
+              //    ⇒ 这里**刻意**保留 `closed:true`（界面与分组自洽，见上方注释），
+              //      `verifyFailed` 只作**排障线索**（服务端日志 / 客户端 console），
+              //      **不得**在注释里承诺「前端会渲染成禁用 + 原因」——
+              //      那会是一个不存在的渲染。
+              verifyFailed = full.remoteError
             }
           }
           const entries = pool.listAccountsByProvider(provider)
@@ -7721,6 +9728,9 @@ function registerJetHubEndpoints(
             },
             closed,
             ...catalogHealth === undefined ? {} : { catalog: catalogHealth },
+            // ⚠️ 字段**缺席**表示「核实成功或未需要核实」；只有「派生判据说已关闭、
+            //    但核实腿没能证明」时才出现（见 `ProviderStatus.verifyFailed`）。
+            ...verifyFailed === undefined ? {} : { verifyFailed },
           }
         }
         const value: RpcProviderStatusResponse = { statuses }
@@ -7906,7 +9916,7 @@ function registerJetHubEndpoints(
         broadcastCatalogChanged(ctx)
         ctx.logger.info(
           `[jet-hub] ${req.enabled ? '打开' : '关闭'}供应商 ${req.provider}：`
-          + `${req.enabled ? '清空' : '写入'} ${modelCount} 个模型、`
+          + `${req.enabled ? '清空' : '变更'} ${modelCount} 个模型、`
           + `${req.enabled ? '启用' : '停用'} ${accountCount} 个账号`,
         )
         const value: RpcProviderSetEnabledResponse = {
@@ -8434,6 +10444,36 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
+      // ── 「ZCode 会话负载均衡」总开关（Jet Hub 页头的开关）──
+      //
+      // 语义：**开** = ZCode 多账号按 DSH sessionId 做会话亲和（同一会话**优先**
+      // 落同一账号；账号今日负载达阈值后会被沉底、正在跑的会话会迁移一次），
+      // 没有 sessionId 的请求随机分摊；**关** = 回到「手动顺序首个可用账号」的
+      // 既有语义。消费方是 `credential-resolver.ts` 与
+      // `zcode-adapter.ts` 的选号路径（每次现读 `pool.sessionBalanceEnabled()`）。
+      case 'sessionBalance.getEnabled': {
+        const value: RpcSessionBalanceGetEnabledResponse = { enabled: pool.sessionBalanceEnabled() }
+        return { ok: true, value }
+      }
+
+      case 'sessionBalance.setEnabled': {
+        const req = payload as RpcSessionBalanceSetEnabledRequest
+        // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
+        // 默认成 true 会静默打开用户特意关闭的开关。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        await pool.setSessionBalanceEnabled(req.enabled)
+        // 不刷新任何缓存：选号路径**每次现读** `pool.sessionBalanceEnabled()`，
+        // 写完即生效（没有需要失效的派生状态）。
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}ZCode 会话负载均衡`
+          + `${req.enabled ? '' : '（ZCode 回到手动顺序优先选号）'}`,
+        )
+        const value: RpcSessionBalanceSetEnabledResponse = { enabled: pool.sessionBalanceEnabled() }
+        return { ok: true, value }
+      }
+
       // ── 「面板入口」（插件详情页设置卡片里的下拉）──
       //
       // 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
@@ -8881,6 +10921,47 @@ function registerJetHubEndpoints(
           if (req.dismiss) {
             const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.dismiss() }
             return { ok: true, value }
+          }
+        }
+        /**
+         * 写两个执行时刻（`HH:MM`，UTC+8）。
+         *
+         * ⚠️ 与 `enabled` / `dismiss` 一样**一次请求只做一件事**：三类字段同时给出
+         * 时无法分辨「用户到底改了什么」，故**直接拒绝**（`bad-request`）而不是
+         * 静默丢弃后面的字段 —— 静默丢弃会让客户端以为两项都保存成功
+         * （2026-11-01 审计 P3：旧实现只处理 `times` 就 return，`enabled` 与
+         * `dismiss` 被无声吞掉，调用方无从发现）。
+         */
+        if (req.times !== undefined || req.jitterMinutes !== undefined) {
+          if (req.enabled !== undefined || req.dismiss !== undefined) {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: '一次请求只能改一件事：times / jitterMinutes 不能与 enabled / dismiss 同时下发',
+              },
+            }
+          }
+          try {
+            // `times` 与 `jitterMinutes` 是同一次「保存设置」的两个字段：
+            // 客户端关闭面板时一次把它们写全。`times` 省略 = 保留现有时刻。
+            const value: RpcUsageAutoCheckinResponse = {
+              autoCheckin: await autoCheckin.setTimes(
+                req.times !== undefined ? req.times : autoCheckin.state().times,
+                req.jitterMinutes,
+              ),
+            }
+            return { ok: true, value }
+          } catch (error) {
+            // 校验失败（数量不对 / 格式非法 / 重复）按 bad-request 回给客户端，
+            // **不静默回落** —— 回落会让用户以为保存成功却永远等不到那轮签到。
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: error instanceof Error ? error.message : String(error),
+              },
+            }
           }
         }
         if (req.enabled === undefined) {

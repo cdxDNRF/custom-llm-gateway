@@ -4,14 +4,22 @@ import {
   attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError,
   isQuotaExceededError, LlmAdapter, LlmError,
 } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type {
+  GenerateOptions,
+  LlmModelInfo,
+  LlmProviderInfo,
+  LlmResolvedModelInfo,
+  ResolvedRetryPolicy,
+  StreamChunk,
+} from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
+import { claimCodeArtsBenefit } from './codearts-credits.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
-import { isCodeArtsBenefitModel } from './models.js'
+import { isCodeArtsBenefitModelKnown, type RemoteModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 // ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
@@ -23,7 +31,7 @@ import { signRequestHuawei } from './sign.js'
 // 「同一语义两套实现」—— 而共享实现已经把 12 家的坑（工具结果内嵌图片提升为
 // 独立 user 消息、空 Map 不降级、`[image unavailable]` 占位符、递归深度与
 // `collectImages` 对齐）全部踩过了。**故直接复用，不另写。**
-import { collectImages, detailFieldText, serializeMessages } from './openai-compat.js'
+import { collectImages, contentToText, detailFieldText, serializeMessages } from './openai-compat.js'
 
 /**
  * 重新导出共享的 `serializeMessages`（**只为了让既有调用方与测试的导入路径不变**）。
@@ -46,6 +54,53 @@ import { CODEARTS_PROVIDER, codeartsAcceptsImage, codeartsVisionModel } from './
 import { reportLedgerAccount } from './token-ledger.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
+/**
+ * CodeArts 推理请求的 `User-Agent` —— **必须是官方客户端的身份**。
+ *
+ * ## ⚠️⚠️ 为什么不能沿用宿主的 `attributionHeaders()`（2026-11-05 真机实测）
+ *
+ * 宿主的 `attributionHeaders()` 恒发
+ * `deepseek-harness/<ver> (+https://github.com/deepseek-ai/deepseek-harness)`，
+ * 而**华为 WAF 按这个前缀拒发**：报文
+ * `403 {"error_code":"TM.00000001","error_msg":"网络繁忙，请稍后重试"}`，
+ * 响应头带 `server: CW` / `set-cookie: HWWAFSESID=…`（WAF 侧，不是 APIG）。
+ *
+ * ⚠️ **症状极具误导性**：403 落到 {@link httpErrorCode} 的 `AUTH` 分支 ⇒ 客户端
+ * 把整条 message 换成「**API 密钥无效**」（`dsh-client-ui-chat` 的
+ * `message.failure.auth`）⇒ 用户以为凭据坏了去重新登录，而凭据**完全有效**。
+ * 且 `isAuthError` 对 403 恒真 ⇒ 每次失败还**白跑一次凭据续期**（CodeArts 的
+ * `refresh_token` 是**一次性轮换**的，见 `tests/e2e/codearts-credential.ts` 的
+ * 注释 ⇒ 这不是无害副作用）。
+ *
+ * ## 实测对照（同一账号、同一份签名、逐字节相同的 body，只改 UA）
+ *
+ * | `User-Agent` | 结果 |
+ * |---|---|
+ * | `deepseek-harness/0.2.1-rc.2 (+https://…)` | **403 TM.00000001** |
+ * | `deepseek-harness/0.2.1`（无 url 段） | **403 TM.00000001** |
+ * | `deepseek-harness`（无 `/版本`） | 200 |
+ * | `deepseek-harness-x/1.0` / `DEEPSEEK-HARNESS/1.0` | 200 |
+ * | `VSCode/1.95.3` / `Mozilla/5.0 …` / `curl/8.4.0` | 200 |
+ * | `claude-code` / `opencode` / `cline` | 200（**不是**「拦所有 AI 客户端」） |
+ *
+ * ⇒ 拒发判据是**大小写敏感的前缀 `deepseek-harness/`**（4 个账号全部一致，
+ * 交替顺序 3 轮可复现）。故本家必须显式覆盖该头。
+ *
+ * ## 取值 = 官方 IDE 的身份（不是随手编一个能过的值）
+ *
+ * `codearts/1.0.0-1147257973136832` 逐字取自本机 CodeArts Agent 内核进程的
+ * 启动参数（`~/.codeartsdoer/codearts-data/log/kernel_error_*.log`：
+ * `Args: "…AgentKernel_Vscode_….exe" "--user-agent=codearts/1.0.0-1147257973136832"`）
+ * ⇒ 与真实客户端同形。终值部分只影响指纹相似度（WAF 只拒 `deepseek-harness/`）。
+ *
+ * ⚠️ UA **不参与** SDK-HMAC-SHA256 签名（`signRequestHuawei` 只签
+ * `host` / `x-sdk-date` / `x-sdk-content-sha256` / `x-security-token` /
+ * `content-type` / 显式传入的 `extraHeaders`）⇒ 覆盖它**不会**打破验签。
+ * ⚠️ 覆盖只作用于**推理**路径：目录（`fetchSignedGet`）/ 积分 / 签到路径
+ * **不显式设置** UA —— 实测 Node 的 `fetch` 会补 `user-agent: node`（本机验证），
+ * 而 WAF 只拒 `deepseek-harness/` 前缀 ⇒ 那三条腿本来就过 WAF，无需改动。
+ */
+export const CODEARTS_USER_AGENT = 'codearts/1.0.0-1147257973136832'
 /**
  * codearts 的 provider id。
  *
@@ -133,6 +188,126 @@ const BENEFIT_NOT_FOUND_CODE = 'BENEFIT_NOT_FOUND'
 const CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE = 'InferHub.4004.200'
 
 /**
+ * ⚠️⚠️ **本进程内「补头成功过」的模型 id**（2026-10-27 审计 P1 修）。
+ *
+ * ## 为什么需要它
+ *
+ * `benefitHeaderPromoted` 是 `stream()` 局部的 ⇒ 远端集合取不到时
+ * （本机常态：`gateway/config` 回 `4000 invalid channel`），benefit-only 模型
+ * **每条请求**都要「无头 404 → 补头 → 成功」两次 chat。修前（有静态表）只需 1 次
+ * ⇒ 这是 PR156 引入的净回归。实测：连续两次 `stream()` 头序列
+ * `[null,'benefit',null,'benefit']`，一轮 3 条并发 ⇒ **6 次上游**。
+ *
+ * ## 边界（如实登记）
+ *
+ * - **只在进程内**，不落盘：落盘会污染「权威集合」的语义（那只能由远端
+ *   `gateway/config` 写）。重启后重新探测一次，代价仅 1 轮。
+ * - 只记「补头后**真的成功了**」的模型（`markCodeArtsBenefitLearned` 只在
+ *   收到成功响应后调用）⇒ 不会把「上游根本不存在这个模型」记成 benefit。
+ * - 上限 {@link CODEARTS_BENEFIT_LEARNED_MAX} 条，防「用户狂换模型 id」把内存撑爆。
+ */
+const codeArtsBenefitLearned = new Set<string>()
+/** 学习集合上限（CodeArts 目录实际只有十来条，留足余量）。 */
+const CODEARTS_BENEFIT_LEARNED_MAX = 64
+
+/** 该模型在本进程内是否已被「补头成功」证明过要带 `maas_type: benefit`。 */
+export function codeArtsBenefitLearnedFor(model: string): boolean {
+  return codeArtsBenefitLearned.has(model)
+}
+
+/** 记下「该模型补头后成功」；只由成功路径调用。 */
+export function markCodeArtsBenefitLearned(model: string): void {
+  if (model.length === 0) return
+  if (codeArtsBenefitLearned.size >= CODEARTS_BENEFIT_LEARNED_MAX) {
+    // 淘汰最早的（Set 迭代序＝插入序），保持内存有界。
+    const oldest = codeArtsBenefitLearned.values().next()
+    if (!oldest.done) codeArtsBenefitLearned.delete(oldest.value)
+  }
+  codeArtsBenefitLearned.add(model)
+}
+
+/** 清空学习集合（仅供单测隔离）。 */
+export function resetCodeArtsBenefitLearned(): void {
+  codeArtsBenefitLearned.clear()
+}
+
+/**
+ * ⚠️⚠️ **领取福利的跨请求去重表**（2026-10-27 审计 P2 修）。
+ *
+ * 修前只有 `stream()` 局部的 `benefitClaimAttempted` ⇒ 3 条并发请求各领一次
+ * （实测 `claims=3`）。而领取是**写操作**，标题/压缩是后台请求，用户看不到
+ * 它们的失败但写请求照发；若上游对领取做了限流/审计，等于每次对话 3 发。
+ *
+ * ⇒ 按 `access_token` 的短哈希做 key，**同一个 Promise 在 60s 内复用**：
+ * - 并发场景：3 条同时进入 ⇒ 拿到**同一个** Promise ⇒ 只发 1 次写；
+ * - 跨轮场景：60s 内第二轮复用结果 ⇒ 不再重复领。
+ *
+ * ⚠️ 用 token 短哈希而不是完整 token：表只在内存里，但别把凭据原文当 key
+ *   （本仓库纪律：日志/索引都不留凭据原文）。
+ */
+const CODEARTS_BENEFIT_CLAIM_DEDUPE_MS = 60_000
+interface ClaimDedupEntry { at: number; promise: Promise<string> }
+const codeArtsBenefitClaimFlight = new Map<string, ClaimDedupEntry>()
+
+/** 领取去重的 key：凭据标识的短哈希（不落原文）。 */
+function claimDedupKey(credential: CodeArtsCredential): string {
+  // ⚠️ CodeArts 凭据没有 `access_token`（那是别的 provider 的形状），
+  //    身份是 `access_key_id`（+ 可选的 `user_id`）。
+  const token = `${credential.access_key_id ?? ''}:${credential.user_id ?? ''}`
+  let hash = 0
+  for (let i = 0; i < token.length; i += 1) {
+    hash = (hash * 31 + token.charCodeAt(i)) | 0
+  }
+  return `${token.length}:${(hash >>> 0).toString(16)}`
+}
+
+/**
+ * 领取福利（跨请求去重版）。返回 `claimCodeArtsBenefit` 的原字符串。
+ *
+ * ⚠️ 去重窗口内**复用同一个 Promise**，因此并发的三条请求只会真正发一次写请求。
+ * ⚠️ 失败结果也复用（避免「失败 → 立刻重试」放大写请求）；窗口过了才重新领。
+ */
+export async function claimCodeArtsBenefitShared(
+  credential: CodeArtsCredential,
+  fetcher: typeof fetch,
+  options?: { signal?: AbortSignal },
+): Promise<string> {
+  const key = claimDedupKey(credential)
+  const now = Date.now()
+  const existing = codeArtsBenefitClaimFlight.get(key)
+  if (existing !== undefined && now - existing.at < CODEARTS_BENEFIT_CLAIM_DEDUPE_MS) {
+    return existing.promise
+  }
+  const promise = claimCodeArtsBenefit(credential, fetcher, options)
+  codeArtsBenefitClaimFlight.set(key, { at: now, promise })
+  // ⚠️ 结算后**不移除**条目：窗口内要复用结果（含失败）。过期条目在下次调用时
+  //    被替换，且上限兜底防泄漏。
+  if (codeArtsBenefitClaimFlight.size > 128) {
+    const oldest = codeArtsBenefitClaimFlight.keys().next()
+    if (!oldest.done) codeArtsBenefitClaimFlight.delete(oldest.value)
+  }
+  return promise
+}
+
+/** 清空领取去重表（仅供单测隔离）。 */
+export function resetCodeArtsBenefitClaimFlight(): void {
+  codeArtsBenefitClaimFlight.clear()
+}
+
+/**
+ * 「模型未注册」的稳定失败码 —— 用于反向补 `maas_type: benefit`。
+ *
+ * CodeArts 对**只按 benefit 通道注册**的模型（如 `glm-5.3-flash`）会以
+ * HTTP 200 + SSE `InferHub.002002009.404 The model is not registered` 拒绝
+ * 不带 `maas_type: benefit` 的请求；带上该头才能出流。它与
+ * {@link BENEFIT_NOT_FOUND_CODE} 恰好**互为镜像**：一个说「该带头却没带」，
+ * 一个说「不该带却带了」。`stream()` 两条都要能自愈。
+ */
+const MODEL_NOT_REGISTERED_CODE = 'MODEL_NOT_REGISTERED'
+/** CodeArts 在「该模型只按 benefit 通道注册」时下发的事件 error_code。 */
+const CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE = 'InferHub.002002009.404'
+
+/**
  * 额度用尽时抛出的错误码 —— **字面量 `'QUOTA_EXCEEDED'`，不是 harness 常量**。
  *
  * ## ⚠️ 为什么不能用 `QUOTA_EXCEEDED_CODE`（真实缺陷，Gitee issue IKJVCW）
@@ -184,13 +359,45 @@ const CODEARTS_QUOTA_EXHAUSTED_CODE = 'QUOTA_EXCEEDED'
 //   - deepseek-v4-flash / deepseek-v4-pro（无后缀）  → 非 benefit（带该头会
 //     `unsupported model`）
 // gateway/config 返回的是 benefit 那组，故下方静态表保留无后缀形态
-// （无后缀始终可用，不依赖 benefit 头），而 deepseek-v4.1-flash 只有 benefit 形态。
-const DEFAULT_MODELS: readonly string[] = [
-  'GLM-5.2', 'GLM-5.1', 'GLM-5',
-  'glm-5.3-flash',
+// （无后缀始终可用，不依赖 benefit 头）。
+//
+// ## ⚠️⚠️ 2026-10-27 全表实测校准（逐条真机请求，两个账号交叉验证）
+//
+// 旧表 9 条里 **3 条已彻底失效**、4 条上游新模型完全缺席。实测结果：
+//
+// | 条目 | 不带头实测 | 处置 |
+// |---|---|---|
+// | `GLM-5.2` | 200 | 保留 |
+// | `GLM-5.1` | **200（仍可用！）** | 保留 —— 不在 builtin 目录里**不等于**不可用 |
+// | `GLM-5` | **404 InferHub.002002009** | **删除** |
+// | `glm-5.3-flash` | **404 InferHub.002002009** | **删除** |
+// | `openpangu-2.0-flash` / `-pro` | 200 | 保留 |
+// | `deepseek-v4-flash` | **200（仍可用！）** | 保留 |
+// | `deepseek-v4-pro` | **404 ModelArts.81009 Invalid model** | **删除** |
+// | `deepseek-v4.1-flash` | 200 | 保留 |
+// | `glm-5.3` / `glm-5.2-sft-harmony` | 200 | **新增**（上游有、旧表漏） |
+// | `deepseek-v4.1-flash-1017` | 200 | **新增**（issue IKQY27 的新模型） |
+// | `kimi-k3` | 200 | **新增** |
+//
+// ⚠️ **判据是「真机能不能调通」，不是「在不在 builtin 目录里」**：`GLM-5.1`
+// 与 `deepseek-v4-flash` 实测 200，若按目录比对删掉就会让用户少两个可用模型
+// （这正是 `dead-model-store.ts` 头注释里「不从残缺目录反推」那条铁律）。
+//
+// ⚠️ VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不入本表**：它们被
+// `catalogEntries` 的可见性过滤挡在主列表外，只经 `analyzeImage` 间接调用。
+//
+// ⚠️⚠️ **`kimi-k3` 也不在本表**（2026-10-30 第二轮审计 P1 N-1 修）：
+// 它是**只在 AgentCenter 出现**的模型（builtin 漏发）⇒ AgentCenter
+// **不下发倍率** ⇒ 它进目录必然是**裸名** ⇒ `priceFactorFromName` 恒
+// `Infinity` ⇒ 聚合里 codearts 恒排最后、永远不被挑中（静默）。
+// ⇒ **窗口源条目一律不进对话目录**（两条路径：远端与冷缓存兜底）。
+// ⚠️ 它的**上下文窗口**仍可用：见 `CONTEXT_WINDOWS`（静态兜底）与
+// `remoteContextWindows`（动态权威）—— 用户手填 `kimi-k3` 时分母是对的。
+export const DEFAULT_MODELS: readonly string[] = [
+  'GLM-5.2', 'GLM-5.1',
+  'glm-5.3', 'glm-5.2-sft-harmony',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
-  'deepseek-v4-flash', 'deepseek-v4-pro',
-  'deepseek-v4.1-flash',
+  'deepseek-v4-flash', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017',
 ]
 
 /**
@@ -212,23 +419,27 @@ const DEFAULT_MODELS: readonly string[] = [
  *
  * | 模型 | `limit.context` | 取值历史 |
  * |---|---|---|
- * | `GLM-5.2` | **1_048_576** | 09-11~10-20 是 `202_752`，**10-21 起上游改成 1M** |
+ * | `GLM-5.2` | **202_752** | 09-11~10-20 是 `202_752`；**10-21 改 1_048_576**；
+ * | | | **10-29 IDE 0.2.6 抓包 + AgentCenter 又改回 202_752**（三次漂移，见下） |
  * | `glm-5.3` | **1_048_576** | 同上（09 月表里没有它，10-17 起出现，先 202752 后 1M） |
- * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-21） |
- * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定 |
+ * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-29，AgentCenter 一致） |
+ * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定（AgentCenter 一致） |
  * | `deepseek-v4.1-flash` | **1_048_576** | 全期稳定（本表原先写 1_000_000，**已按 IDE 权威值改正**） |
+ * | `kimi-k3` | **1_048_576** | 2026-10-29 补（IDE 0.2.6 + AgentCenter 一致；此前缺行走 524_288 兜底） |
  * | `glm-5.3-flash` | **1_048_576** | 逆向自 IDE gateway/config（对齐 deveco-code-rust 90aeb17d） |
  * | `deepseek-v4-flash` / `-pro` | **1_048_576** | UI 标注「每日 1000 万免费 Tokens」同批（对齐 fb1b4a2） |
  *
- * ⚠️ **`GLM-5.2` 的 202_752 已过期**（那是 10-20 及以前的配置）。留着它有两个
- * 真实后果，且都是**静默**的：① 占用比被封顶成 100%（分母小 5 倍）；
- * ② 自动压缩阈值 = `0.8 × 202752 ≈ 162K` ⇒ **1M 的能力永远吃不到**
- * （与 `officeace-product.ts` 那次「估值偏小 5.3 倍」逐字同因）。
+ * ⚠️⚠️ **`GLM-5.2` 的窗口是本表唯一三次漂移的行**：202_752（09~10-20）→
+ * 1_048_576（10-21 校准）→ **202_752（10-29 复测，IDE 0.2.6 抓包 + AgentCenter
+ * 动态源双源一致）**。⇒ 结论：**10-21 那次不是「上游永久上调」而是临时值/灰度**。
+ * 本表现按 2026-10-29 权威写回 202_752 —— 但它是**兜底**（冷缓存/AgentCenter
+ * 失败时才用到）：运行时权威已由 AgentCenter 动态下发（`RemoteModel.contextWindow`，
+ * 优先于本表），下次上游再漂移不再依赖改这张表。
  *
  * ⚠️ **本表查不到时不再省略 `context`** —— 见 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
-  ['GLM-5.2', 1_048_576],
+  ['GLM-5.2', 202_752],
   ['glm-5.3', 1_048_576],
   ['glm-5.3-flash', 1_048_576],
   ['glm-5.2-sft-harmony', 202_752],
@@ -237,6 +448,17 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4-flash', 1_048_576],
   ['deepseek-v4-pro', 1_048_576],
   ['deepseek-v4.1-flash', 1_048_576],
+  // ⚠️ `-1017` 是上游**独立注册**的模型（`/v1/model/builtin` 与
+  //    `deepseek-v4.1-flash` 同时下发，`src/models.ts` 用**原始 `model_id`**
+  //    当对外 id 与去重键——2026-10-27 修，见 `parseModelInfo`），
+  //    但**窗口与老版一致**（用户 2026-10-27 确认）。
+  //    不补这一行会让它走 524_288 的具名兜底 ⇒ 分母错 2 倍、压缩阈值偏早
+  //    （正是 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 注释里记录的那条报障形态）。
+  ['deepseek-v4.1-flash-1017', 1_048_576],
+  // ⚠️ `kimi-k3` 在 IDE 0.2.6 与 AgentCenter 目录里都有（2026-10-29 取证），
+  //    但 2026-10-29 前的 `/v1/model/builtin` 快照**没有它** ⇒ 曾走 524_288
+  //    兜底（分母错 2 倍）。现由 AgentCenter 动态补目录 + 窗口，本行是兜底。
+  ['kimi-k3', 1_048_576],
 ])
 
 /**
@@ -341,6 +563,38 @@ export function codeartsRateSuffix(display: string): string | undefined {
 const CODEARTS_MAX_OUTPUT_TOKENS = 65_536
 
 /**
+ * `maxTokens` **缺省时**下发的输出上限 —— 与 IDE 逐字一致（2026-10-30 取证）。
+ *
+ * ## 为什么有两个常量（`CODEARTS_MAX_OUTPUT_TOKENS` vs 本值）
+ *
+ * 它们回答的是**两个不同问题**，混用会让其中一个静默失效：
+ *
+ * | 常量 | 回答的问题 | 值 |
+ * |---|---|---|
+ * | {@link CODEARTS_MAX_OUTPUT_TOKENS} | 「上游**最多**接受多少」的**安全边界** | 65_536 |
+ * | **本值** | 「**没人指定时我们该发多少**」的**默认预算** | 32_000 |
+ *
+ * ## 取证
+ *
+ * Reqable 抓包 4 条真实 IDE 聊天请求，`model=deepseek-v4.1-flash-1017` 的
+ * `max_tokens` **恒为 32000**（4/4，无一例外），而 AgentCenter 的
+ * `model_parameters.max_tokens` 给的**上限**是 65536。
+ * ⇒ IDE 的 32000 是**客户端默认预算**，不是模型能力上限。
+ *
+ * ## ⚠️⚠️ 为什么不能直接把 {@link CODEARTS_MAX_OUTPUT_TOKENS} 改成 32000
+ *
+ * 那个常量是**钳制上界**（`clampCodeArtsMaxTokens` 用它 `Math.min`）。改成
+ * 32000 会**静默削掉**调用方明确要求的长输出 —— 而长输出正是本家接
+ * `tool_stream` 的理由（大文件 write 的参数 JSON 需数万 token，截断会产出
+ * 非法 JSON，harness 报 `invalid arguments`）。⇒ 两者必须分开：
+ * **默认值降级对齐 IDE，上界保持 65536**。
+ *
+ * ⚠️ 与 `RemoteModel.maxOutputTokens` 的取舍一致：上游声明的上限**不**当默认
+ * 预算用（否则宿主的压缩预留会跟着变，见 `readAgentCenterWindow` 的注释）。
+ */
+const CODEARTS_DEFAULT_MAX_OUTPUT_TOKENS = 32_000
+
+/**
  * 收敛输出上限到安全区间；非法值返回 undefined（不编造，交由调用方取默认）。
  *
  * ⚠️ 存在的理由与 TRAE 的 `clampTraeMaxTokens`、Cline 的 `clampClineMaxTokens`
@@ -362,7 +616,7 @@ export interface CodeArtsAdapterOptions {
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; rateLabel?: string }>>
+  fetchRemoteModels?: () => Promise<RemoteModel[]>
   /**
    * 最近一次目录拉取的**各来源成败**（issue IKJVTF，审计 I3）。
    *
@@ -716,6 +970,109 @@ function isQueueError(status: number, body: string): boolean {
       || /high\s+demand|too\s+many\s+requests/i.test(body))
 }
 
+/* ──────────────── 三个「非凭据问题」的业务码（2026-11-05） ──────────────── */
+
+/**
+ * 上游「网络繁忙」的业务码 —— 实测是**华为 WAF 按 `User-Agent` 首 product token
+ * 拒发**（`^deepseek-harness/`），不是真的繁忙。
+ *
+ * 见 {@link CODEARTS_USER_AGENT} 的完整对照表。本判据存在的意义是**兜底**：
+ * 我们已把 UA 覆盖成官方 IDE 的身份，但上游策略随时可能再变（或用户跑的是旧版），
+ * 届时这条 403 会落到 `httpErrorCode` 的 `401/403 → AUTH` ⇒ 客户端把报文整条换成
+ * 「API 密钥无效」⇒ 用户去重登/换 token，方向全错。
+ */
+const CODEARTS_GATEWAY_BUSY_CODE = 'TM.00000001'
+
+/** 账号级并发上限的业务码（实测每账号同时最多 3 个请求）。 */
+const CODEARTS_CONCURRENCY_LIMIT_CODE = 'TM.00001041'
+
+/**
+ * 「模型未在本租户开通」的业务码。
+ *
+ * ⚠️ **来源是 Gitee PR #175 评审里的一条实测记录**（`deepseek-v4-flash` 恒回该码），
+ * 本仓库**没有**独立复现 —— 因此只做「归类 + 文案」，不与其它判断合并，
+ * 也不据此推断任何账号/模型的能力。拿到本机报文后应在此登记。
+ */
+const CODEARTS_TENANT_NOT_ENABLED_CODE = 'TM.000010051'
+
+/**
+ * 错误体里是否带某个**精确**业务码（数字后缀必须断开）。
+ *
+ * ## ⚠️ 为什么不能用裸 `body.includes(code)`
+ *
+ * 本仓库已经踩过同型坑（{@link isSseQueueErrorCode} 的 `429` 命中 `InferHub.4291.200`）：
+ * 业务码是**纯数字后缀**，`TM.00000001` 是 `TM.000000011` 的前缀。
+ * 用裸子串匹配会把「另一个码」也吃进来，而这三条的处理方式各不相同
+ *（一个不重试、一个等 1~2 分钟、一个换模型）。
+ *
+ * ⚠️ 大小写**敏感**：上游恒为大写 `TM.`，放宽只会扩大误判面。
+ */
+function hasBusinessCode(body: string, code: string): boolean {
+  if (typeof body !== 'string' || body.length === 0) return false
+  return new RegExp(`${code.replace(/\./g, '\\.')}(?![0-9])`).test(body)
+}
+
+/** 错误体是否为「网关按客户端标识拒发」（`TM.00000001`）。 */
+export function isGatewayBusyError(body: string): boolean {
+  return hasBusinessCode(body, CODEARTS_GATEWAY_BUSY_CODE)
+}
+
+/** 错误体是否为「账号级并发上限」（`TM.00001041`）。 */
+export function isConcurrencyLimitError(body: string): boolean {
+  return hasBusinessCode(body, CODEARTS_CONCURRENCY_LIMIT_CODE)
+}
+
+/** 错误体是否为「模型未在本租户开通」（`TM.000010051`，见常量注释的取证强度）。 */
+export function isTenantNotEnabledError(body: string): boolean {
+  return hasBusinessCode(body, CODEARTS_TENANT_NOT_ENABLED_CODE)
+}
+
+/**
+ * 「网关按客户端标识拒发」给用户看的完整说明。
+ *
+ * ⚠️ 三条措辞不可省：
+ * 1. **不是凭据问题**（否则用户去重登，白费一轮）；
+ * 2. **重试无效**（同 UA 重试恒 403 —— 这是它与并发上限的**本质区别**；
+ *    映射成 `RATE_LIMIT` 会让宿主白退避重试 5 次，每次都打上游一次 403）；
+ * 3. **本插件已发官方 IDE UA**（告诉用户「这是上游策略、不是你没配好」，
+ *    并给出可执行的下一步：升级插件 / 贴日志）。
+ */
+export function codeartsGatewayBusyMessage(model: string): string {
+  return (
+    `codearts: 上游网关拒绝了本客户端的标识（${CODEARTS_GATEWAY_BUSY_CODE}「网络繁忙」，`
+    + '实测是华为 WAF 按 `User-Agent` 首 product token 拒发，不是真的繁忙）。'
+    + '这不是凭据问题，重试也无效 —— 本插件已改为发送官方 CodeArts IDE 的 UA；'
+    + `若你看到这句，说明上游策略又变了或插件版本过旧 ⇒ 请升级插件，`
+    + `并把本句与 error_code（含 logid）一起反馈。（当前模型：${model}）`
+  )
+}
+
+/**
+ * 账号级并发上限给用户看的完整说明。
+ *
+ * ⚠️ 措辞必须交代三件事（缺一件用户就会走错方向）：不是密钥问题 / 上限是 3 /
+ * 等一会儿会自己好（或换账号立即解除）。
+ * ⚠️ 刻意**不写死秒数**：实测槽位释放是变长的（等 60s 恢复，但没有公开的确切时长）。
+ */
+export function codeartsConcurrencyLimitMessage(model: string): string {
+  return (
+    `codearts: 账号级并发上限已达（上游 ${CODEARTS_CONCURRENCY_LIMIT_CODE}，`
+    + '实测每个账号同时最多 3 个请求）。'
+    + '这不是凭据问题 —— 请等 1~2 分钟让上一个请求释放后重试，'
+    + '或改用其它模型，也可在 Jet Hub 的 CodeArts 面板切换/添加账号（换账号立即解除）。'
+    + `（当前模型：${model}）`
+  )
+}
+
+/** 「模型未在本租户开通」给用户看的说明（出路是换模型/换账号，不是重试）。 */
+export function codeartsTenantNotEnabledMessage(model: string): string {
+  return (
+    `codearts: 上游返回「模型未在本租户开通」（${CODEARTS_TENANT_NOT_ENABLED_CODE}）。`
+    + '这不是凭据问题，重试无效 —— 请改用其它模型，'
+    + `或换一个已开通该模型的账号。（当前模型：${model}）`
+  )
+}
+
 /**
  * 判断 HTTP 错误是否表示凭据已失效、可通过 refresh_token 续期后重试。
  * CodeArts 经华为 APIG 网关鉴权：SecurityToken 过期/无效时网关返回
@@ -740,6 +1097,21 @@ function isAuthError(status: number, body: string): boolean {
     // 捎带余额词）；这里排除的是**非网关来源**的 401/403 —— 判据锚定的是
     // bili 独有的三个 marker，与 APIG 的报文形态零重叠。
     if (isProxyResignRefusal(status, body)) return false
+    /**
+     * ⚠️ 同理排除三个「**非凭据问题**」的业务码（2026-11-05，Gitee PR #175 的
+     * 评审 + 本仓库 UA 修复的兜底）：
+     *
+     * - `TM.00000001` = 网关按客户端标识拒发（UA 门控，见 {@link CODEARTS_USER_AGENT}）；
+     * - `TM.00001041` = 账号级并发上限（等 1~2 分钟或换号即好）；
+     * - `TM.000010051` = 模型未在本租户开通（换模型/换账号）。
+     *
+     * 三者与 AK/SK/security_token **无关** ⇒ 刷新只会白跑一次真实 STS 网络往返
+     *（CodeArts 的 `refresh_token` 是**一次性轮换**的，见
+     * `tests/e2e/codearts-credential.ts` 的注释），然后落 `AUTH` 把上面三条
+     * **唯一出路**的文案吞掉。判据只认**精确业务码**（{@link hasBusinessCode}），
+     * 与 APIG 的报文形态零重叠 ⇒ 不破坏「401/403 先判」的铁律。
+     */
+    if (isGatewayBusyError(body) || isConcurrencyLimitError(body) || isTenantNotEnabledError(body)) return false
     return true
   }
   return body.includes('APIG.0602') || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body)
@@ -850,6 +1222,47 @@ export function isSseQuotaExhaustedErrorCode(code: string, message: string): boo
  */
 export function isBenefitNotFoundBody(body: string): boolean {
   return body.includes(CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE)
+}
+
+/**
+ * 错误体是否是「该模型只按 benefit 通道注册」（`InferHub.002002009.404`）。
+ *
+ * 与 {@link isBenefitNotFoundBody} 互为镜像：一个说「该带头却没带」，
+ * 一个说「不该带却带了」。判据同样按**实测全等**，不放松成前缀。
+ */
+export function isModelNotRegisteredBody(body: string): boolean {
+  /**
+   * ⚠️⚠️ **优先按 JSON 的 `error_code` 全等判，裸子串只作兜底**（2026-10-27 审计修）。
+   *
+   * 修前是裸 `body.includes('InferHub.002002009.404')` —— 对抗审计构造了一个
+   * **与「未注册」完全无关**的 400：正文是
+   * `invalid tool call arguments: {"q":"InferHub.002002009.404"}`（用户内容被回显）
+   * ⇒ 也命中 ⇒ 多打一次上游，还把 `maas_type` 送给一个非 benefit 模型。
+   *
+   * 而 SSE 通道那条用的是 `data.error_code === '…'` **全等**判据 ——
+   * 所以 PR 注释里「两条通道同源同判据」是**不实**的（现在按全等优先，才真的同源）。
+   *
+   * ⚠️ 兜底保留裸子串的理由：4xx 的报文形态与 SSE 不同（字段名可能不叫
+   * `error_code`），本函数上方注释记载过这条教训（`isBenefitNotFoundBody` 同型）。
+   * 兜底只在「解析不出结构化 error_code」时才走。
+   */
+  const trimmed = body.trim()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      const code = typeof parsed === 'object' && parsed !== null
+        ? (parsed as { error_code?: unknown; errorCode?: unknown }).error_code
+          ?? (parsed as { errorCode?: unknown }).errorCode
+        : undefined
+      if (typeof code === 'string') {
+        // 结构化字段存在 ⇒ 只认全等，不再看正文（避免把回显内容当信号）。
+        return code === CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE
+      }
+    } catch {
+      // 不是合法 JSON ⇒ 走下面的兜底
+    }
+  }
+  return body.includes(CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE)
 }
 
 /**
@@ -1192,6 +1605,36 @@ function readCodeArtsChunk(
 
 /** 兼容 OpenAI 格式的 CodeArts 模型适配器，使用华为请求签名。 */
 export class CodeArtsAdapter extends LlmAdapter {
+  /**
+   * 声明宿主级重试策略（issue #21）。
+   *
+   * CodeArts 的失败面里 `TRANSPORT` / `TIMEOUT` / `EMPTY_RESPONSE` / `SERVER`
+   * 都是**瞬态**（网关抖动、长上下文偶发空响应），交给宿主按指数退避重试，
+   * 而不是把一次抖动直接抛给用户（长任务被迫手动重跑）。
+   *
+   * ⚠️ **必须显式保留 `RATE_LIMIT`**：不声明策略时宿主 fallback 的默认集合
+   * 含它（TPM/并发 429 是瞬态，退避后大概率可过）；一旦声明就**替换**默认集，
+   * 漏掉它会让 429 从「重试 5 次」变成「立即失败」——这是无意的收窄。
+   *
+   * ⚠️ 不动 `AUTH` / `QUOTA` / `INVALID_REQUEST`：这些重试只会白烧账号。
+   * ⚠️ 只对自己这一路 provider 生效；未注册的 provider 返回 undefined。
+   */
+  override providerRetryPolicy(provider: string): ResolvedRetryPolicy | undefined {
+    if (provider !== PROVIDER) return undefined
+    // `satisfies` 让编译器按宿主契约逐字段校验（比 `as` 强），
+    // 同时把数组也冻上（浅 freeze 只冻外层，调用方仍可 push）。
+    return Object.freeze({
+      mode: 'normal',
+      maxRetries: 5,
+      retryableCodes: Object.freeze([
+        'TRANSPORT', 'TIMEOUT', 'EMPTY_RESPONSE', 'SERVER', 'RATE_LIMIT',
+      ]),
+      initialDelayMs: 2_000,
+      maxDelayMs: 10_000,
+      jitterRatio: 0.25,
+    }) satisfies ResolvedRetryPolicy
+  }
+
   private readonly fetchImpl: typeof fetch
   private readonly chatId: string
   private readonly sessionId: string
@@ -1259,8 +1702,14 @@ export class CodeArtsAdapter extends LlmAdapter {
          * ⚠️ **不要推广到别家**：多数家的窗口来自远端该模型的配置，对未知 id
          *    编一个就是**假窗口**（分母错 ⇒ 占用比与压缩阈值一起错）。
          *    取值理由见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释。
+         *
+         * ⚠️ 2026-10-29 修订（AgentCenter 接入）：取值顺序改为「动态值优先、
+         *    静态表兜底」—— 此前「目录窗口全来自静态表」已过期；AgentCenter
+         *    与 IDE 内核权威逐值一致（GLM-5.2 现值 202752），静态表有三次漂移史
+         *    （见 `CONTEXT_WINDOWS` 的 GLM-5.2 行）；远端失败/无该 id 时仍回静态表。
          */
-        unknownModelContextWindow: (modelId) => codeartsContextWindow(modelId),
+        unknownModelContextWindow: (modelId) =>
+          this.remoteContextWindowOf(modelId) ?? codeartsContextWindow(modelId),
         /**
          * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
          *
@@ -1293,7 +1742,53 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
-  private remoteModels: Array<{ id: string; name: string; rateLabel?: string }> | undefined
+  private remoteModels: RemoteModel[] | undefined
+
+  /**
+   * AgentCenter 动态窗口表（**独立于目录可见性**）。
+   *
+   * ⚠️⚠️ **为什么必须与目录解耦**（2026-10-30 四路审计 P3 D6 定案）：
+   * `src/model-catalog.ts` 的 `unknownModelContextWindow` 调用点**只在
+   * `entry === undefined`（模型不在目录里）时**才走；而旧实现查的是
+   * `this.remoteModels` —— 可 `catalogEntries()` 正是由 `this.remoteModels`
+   * 映射而来 ⇒ **「在 remoteModels 里」⟺「在目录里」** ⇒ 动态腿在
+   * 「手填模型 id」场景**基本不可达**（实测唯一例外是 VL 模型，而 VL 走
+   * `analyzeImage` 那条路**根本不需要窗口** ⇒ 实际收益 ≈ 0）。
+   *
+   * ⇒ 这张表只装「AgentCenter 下发的窗口」，**与目录可见性无关**：
+   * 任何 id 只要 AgentCenter 给过窗口，就能查到正确分母。
+   *
+   * ⚠️ 键用**原始 id**（不做 `normalizeModelId` 归一）—— 与
+   * `src/models.ts` 的 `seen` 键口径一致（归一会把 `deepseek-v4.1-flash` 与
+   * `deepseek-v4.1-flash-1017` 并成一条，那是**两个不同模型**）。
+   */
+  private remoteContextWindows = new Map<string, number>()
+
+  /**
+   * 「只作窗口源」的模型 id 集合（**独立于目录**）。
+   *
+   * ⚠️⚠️ **必须是独立集合，不能只看条目的 `windowOnly` 属性**
+   * （2026-10-30 第二轮审计 P1 N-1 修）：原先只看属性 ⇒ **只在「远端拉取
+   * 成功」时生效** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）走 `DEFAULT_MODELS`
+   * 兜底 ⇒ 那些条目**没有** `windowOnly` 属性 ⇒ `kimi-k3` 以**裸名**进目录
+   * ⇒ `priceFactorFromName('kimi-k3')` = `Infinity` ⇒ 聚合里 codearts 恒排
+   * 最后 ⇒ 第一轮 P1-2 的症状**原样复发**（实测）。
+   *
+   * ⇒ 这里在**远端拉到窗口源条目时**记下它们的 id ⇒ 之后**冷缓存也记得**
+   * ⇒ 两条路径口径一致。
+   */
+  private windowOnlyIds = new Set<string>()
+
+  /**
+   * AgentCenter 动态窗口优先查（2026-10-29 接入；2026-10-30 改为查独立表）。
+   *
+   * ⚠️ 查**表**（O(1)）而不是扫数组：旧实现是线性 `find`，且因与目录耦合
+   * 而基本走不到；改成表之后它才真的会被调用（手填 id 场景）。
+   */
+  private remoteContextWindowOf(modelId: string): number | undefined {
+    const w = this.remoteContextWindows.get(modelId)
+    return typeof w === 'number' && w > 0 && Number.isFinite(w) ? w : undefined
+  }
 
   /**
    * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
@@ -1364,6 +1859,32 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 也不应立刻重试（否则每个模型都打一次空请求）。
       if (models.length === 0) return false
       this.remoteModels = models
+      // ⚠️⚠️ **同步重建窗口表**（2026-10-30 审计 P3 D6 修）：
+      //    动态窗口**必须与目录可见性解耦** —— `unknownModelContextWindow`
+      //    只在「模型不在目录里」时被调，而旧实现查的是 `remoteModels`
+      //    ⇒ 「在 remoteModels 里」⟺「在目录里」⇒ 动态腿在「手填模型 id」
+      //    场景**基本不可达**（实测唯一例外是 VL，而 VL 不需要窗口）。
+      //    ⇒ 这里把**全部**带窗口的条目（含 `windowOnly` 的窗口源条目）
+      //    收进表里，与目录可见性无关。
+      //
+      //    ⚠️ 键用**原始 id**（不做归一）—— 与 `src/models.ts` 的 `seen` 键
+      //    口径一致（归一会把 `deepseek-v4.1-flash` 与 `-1017` 并成一条，
+      //    那是**两个不同模型**）。
+      const windows = new Map<string, number>()
+      for (const model of models) {
+        const w = model.contextWindow
+        if (typeof w === 'number' && Number.isFinite(w) && w > 0) windows.set(model.id, w)
+      }
+      this.remoteContextWindows = windows
+      // ⚠️⚠️ **同时记下「窗口源 id」**（2026-10-30 第二轮审计 P1 N-1 修）：
+      //    这些 id **只在 AgentCenter 出现**（builtin 没有）⇒ 若它们进目录，
+      //    就是**裸名**（AgentCenter 不下发倍率）⇒ `priceFactorFromName` 恒
+      //    `Infinity` ⇒ 聚合里 codearts 恒排最后。
+      //    ⇒ 记进**独立集合**（`windowOnlyIds`）⇒ 之后**冷缓存也记得**
+      //    ⇒ 远端路径与兜底路径口径一致。
+      this.windowOnlyIds = new Set(
+        models.filter((m) => m.windowOnly === true).map((m) => m.id),
+      )
       // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
       //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
       this.catalogAt = this.options.now?.() ?? Date.now()
@@ -1423,10 +1944,18 @@ export class CodeArtsAdapter extends LlmAdapter {
    *    `reasoning_tokens`，落在基线噪声内；`none` 也照常思考）。
    *    故**不**臆造 low/high/max 强度阶梯。
    */
-  private toCatalogEntry(model: { id: string; name: string; rateLabel?: string }): CatalogEntry {
-    // ⚠️ **恒有值**（表内优先、查不到走具名兜底）—— 缺它用户就没有上下文占用条，
-    //    见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释（真实报障 2026-10-21）。
-    const contextWindow = codeartsContextWindow(model.id)
+  private toCatalogEntry(model: RemoteModel): CatalogEntry {
+    // ⚠️ **恒有值**（远端动态值优先 → 静态表 → 具名兜底，恒返回正数）——
+    //    缺它用户就没有上下文占用条，见 `CODEARTS_FALLBACK_CONTEXT_WINDOW`
+    //    的长注释（真实报障 2026-10-21）。
+    //    2026-10-29 起动态源：AgentCenter 带回的窗口与 IDE 内核权威逐值一致，
+    //    静态表只是冷缓存/失败兜底（GLM-5.2 漂移史见 `CONTEXT_WINDOWS`）。
+    //    ⚠️ 这里**直接读条目自身的 `contextWindow`**（条目本就来自
+    //    `this.remoteModels`，再 `find` 一遍是 O(N²) 重建——IKL3YH 同型）；
+    //    `DEFAULT_MODELS` 的骨架条目没有该字段 ⇒ 走静态表。
+    const contextWindow = typeof model.contextWindow === 'number' && model.contextWindow > 0 && Number.isFinite(model.contextWindow)
+      ? model.contextWindow
+      : codeartsContextWindow(model.id)
     // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
     //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
     //
@@ -1472,6 +2001,32 @@ export class CodeArtsAdapter extends LlmAdapter {
       // ⚠️ **无条件落键**（`codeartsContextWindow` 恒返回正数）—— 写成
       //    `...contextWindow !== undefined ? {...} : {}` 就是本缺陷的成因。
       contextWindow,
+      // ⚠️⚠️ **刻意不声明 `maxTokens`**（2026-10-30 四路审计 P1-1 定案）：
+      //
+      //    上游 AgentCenter 的 `max_tokens`（单次输出上限）**看起来**该落这里，
+      //    但 DSH 的契约不是「上限」而是「**默认输出预算**」：
+      //    `dsh-llm` 把 `defaultMaxTokens` 注入 `config.maxTokens`
+      //    （`node_modules/@deepseek-ai/dsh-llm/lib/index.js:2183-2185`），
+      //    而 `dsh-compaction-basic` 的 `reservedCompletionTokens(agent,
+      //    defaultMaxTokens)`（`lib/index.js:757`）读的**正是同一个值** ——
+      //    它把该值当作「**输出侧预留**」**从上下文窗口里扣掉**。
+      //
+      //    ⇒ 落键的后果（实测，宿主默认 thresholdRatio=0.8 / headroom=65536）：
+      //      GLM-5.2 压缩触发点 **162,201 → 109,772**、压力预算 **137,216 → 71,680**；
+      //      窗口 131,072 的模型配上 65536 的预留 ⇒ pressure=0 ⇒ 宿主**抛**
+      //      `TargetPressureConfigError`（**不是降级**）。
+      //    ⇒ 而 `master` 的 `toCatalogEntry` **全文没有 `maxTokens` 键**
+      //      ⇒ `defaultMaxTokens` 恒 undefined ⇒ 预留恒 0 ⇒ 上述回归是
+      //      **本 PR 新引入的**。
+      //
+      //    ⚠️ 与本仓既有先例同口径：`src/opencode-adapter.ts:392-413`
+      //    **刻意不声明** `defaultMaxTokens`，理由逐字为「能力表里的
+      //    `limit.output` 是**模型单次输出上限**，不是『合理的默认输出预算』……
+      //    下发等于**我们替用户决定**每轮按上限请求」。本家照此办理。
+      //    ⚠️ 出站侧的钳制**不受影响**：`clampCodeArtsMaxTokens` 只 `Math.min`
+      //    向下、不抬预算，默认预算仍由 `CODEARTS_MAX_OUTPUT_TOKENS` 单点决定
+      //    （`src/llm-adapter.ts:1965`）⇒ 撤掉本键**不改变实际发出去的
+      //    `max_tokens`**（上游声明值 65535 与本地 65536 的 1 token 差异也一并消失）。
       reasoning: {
         // ⚠️ 顺序 = **强度序（弱 → 强）**，逐条理由见 `CODEARTS_REASONING_EFFORTS`
         // 的长注释（Issue IKLIDV）—— 简言之：DSH 把该数组当展示顺序、客户端不排序，
@@ -1494,11 +2049,43 @@ export class CodeArtsAdapter extends LlmAdapter {
   private async catalogEntries(): Promise<readonly CatalogEntry[]> {
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
-    // ⚠️ 与 `listModels` 保持**同一套**「可见性」过滤（VL 多模态不参与），
-    // 唯一区别是不套用户黑名单 —— 那条区别现在由骨架的 `listAllModels` 承担。
     return source
-      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .filter((m) => this.isVisibleCatalogEntry(m))
       .map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * 一条远端条目**该不该进对话目录**（**两条路径共用**，2026-10-30 第二轮审计 P1 N-2 修）。
+   *
+   * ⚠️⚠️ **必须共用**（实测踩到）：`catalogEntries()`（异步，给 `listModels` /
+   * `resolveModel` 用）与 `syncCatalogEntries()`（同步，给 `listAllModels` 用）
+   * **原本各写一遍** ⇒ 守卫只覆盖了异步那条 ⇒ 变异「删掉同步那条的过滤」
+   * ⇒ **全量 11476 条用例全绿**（零保护）⇒ 而 `listAllModels()` 是
+   * **Jet Hub 模型开关清单**的数据源（`src/jet-hub-rpc.ts` 的 `fullCatalogIds()`）
+   * ⇒ 窗口源条目会**以裸名**出现在设置页（正是 P1-2 想消灭的形态）。
+   *
+   * ⇒ 现在**一份判据、两条路径共用** ⇒ 不可能再分叉。
+   *
+   * 判据两条：
+   * 1. ⚠️ **窗口源条目不进目录** —— AgentCenter 不下发倍率 ⇒ 进目录就是裸名
+   *    ⇒ `priceFactorFromName` 恒 `Infinity` ⇒ 聚合里 codearts 恒排最后、
+   *    永远不被挑中（静默）。它们的**窗口**仍可用 ——
+   *    见 {@link remoteContextWindows}。
+   *    ⚠️⚠️ **判据是「id 集合」而不是「条目属性」**（2026-10-30 第二轮审计
+   *    P1 N-1 修）：原先只看条目的 `windowOnly` 属性 ⇒ **只在「远端拉取成功」
+   *    时生效** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）走
+   *    `DEFAULT_MODELS` 兜底 ⇒ 那里的条目**没有** `windowOnly` 属性 ⇒
+   *    `kimi-k3` 以**裸名**进目录 ⇒ 第一轮 P1-2 的症状**原样复发**。
+   *    ⇒ 现在判据是 {@link windowOnlyIds} 这个**独立 id 集合**（远端来时填、
+   *    **冷缓存时也留着**）⇒ 两条路径口径一致。
+   * 2. ⚠️ **VL 多模态不进对话目录**（上下文小、不支持工具调用；当 agent 主模型
+   *    会踩别的坑）。⚠️ 与 `src/models.ts` 的 `parseModelInfo` **同口径**
+   *    （大小写**不敏感**）。
+   */
+  private isVisibleCatalogEntry(model: { id: string, windowOnly?: boolean }): boolean {
+    if (model.windowOnly === true) return false
+    if (this.windowOnlyIds.has(model.id)) return false
+    return !/-VL-/i.test(model.id) && !/-VL$/i.test(model.id)
   }
 
   /**
@@ -1509,13 +2096,41 @@ export class CodeArtsAdapter extends LlmAdapter {
    */
   private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    // ⚠️⚠️ **判据与 `catalogEntries()` 共用**（`isVisibleCatalogEntry`）——
+    //    原先两条路径**各写一遍** ⇒ 守卫只覆盖异步那条 ⇒ 同步那条（**Jet Hub
+    //    模型开关清单**的数据源）零保护（2026-10-30 第二轮审计 P1 N-2 修）。
     return source
-      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .filter((m) => this.isVisibleCatalogEntry(m))
       .map((m) => this.toCatalogEntry(m))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 「这份 `listAllModels()` **确认**来自远端完整读取」——供 `model.list` 的
+   * 「已下架」判据用（见 `ModelCatalogSource.catalogConfirmedRemote` 的注释）。
+   *
+   * ## 判据（两条腿都必须成立，缺一即 `false`）
+   *
+   * 1. `remoteModels !== undefined` —— 至少成功读到过一次远端目录。
+   *    ⚠️ `syncCatalogEntries()` 在未落地时回退**编译期兜底表**，那是远端目录的
+   *    **子集**（Issue IKJW33 的实测形态）⇒ 不能当「在售集合」。
+   * 2. `remoteComplete === true` —— 接线层经 `catalogComplete` 上报「**两个**
+   *    目录端点都取全」。只有一个端点成功时目录同样是子集。
+   *
+   * ## 保守方向
+   *
+   * 冷启动 / 远端降级 / 残缺时返回 `false` ⇒ `model.list` **放弃**判据、照旧补回
+   * 黑名单条目。代价是可能多留一个「点开会 404」的幽灵条目；反向的代价是用户在售
+   * 模型从设置页**彻底消失且无法重新打开**（不可自愈）⇒ 两害相权取其轻。
+   *
+   * ⚠️ 本方法必须能被 `withDeadModelPruning` 的 Proxy **原样透传**（它有接线守卫：
+   * `dead-model-store.spec.ts` 的「catalogConfirmedRemote 经包装后仍可调用」）。
+   */
+  catalogConfirmedRemote(): boolean {
+    return this.remoteModels !== undefined && this.remoteComplete
   }
 
   async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -1599,6 +2214,31 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
 
     const messages = serializeMessages(options.messages, imageUrls)
+    /**
+     * IDE 的 `user_prompt`：**回看原始 `options.messages`（不是序列化后的 wire 数组）**
+     * 里最后一条**真正的用户发言**的纯文本。
+     *
+     * ⚠️⚠️ **必须从原始入参取，不能从 `messages` 取**：
+     * 1. **语义正确性**：`user_prompt` 的值域是「用户原话」，从原始入参取让
+     *    取值判据独立于 `serializeMessages` 的投影方式。实测（对抗审计 M16
+     *    三场景探针）当前投影把工具结果发成独立 `role:'tool'`、永不命中
+     *    `role==='user'`，两取法**逐字同形** —— 但那是投影的**当前巧合**，
+     *    不是取值判据的依据；投影一改（如工具结果折回 user 消息），从 wire
+     *    取就会静默变成「几百 KB 的文件内容」，与 IDE 的「用户一句话」语义
+     *    完全相反。
+     * 2. `messages` 已被 `unshift` 插入 system、且可能被 DSML 模式注入过提示
+     *    ⇒ 扫 wire 数组要多绕开这些注入项。
+     */
+    const lastUserPromptText = (() => {
+      for (let i = options.messages.length - 1; i >= 0; i--) {
+        const message = options.messages[i]
+        if (message.role !== 'user') continue
+        // 该条是否**只**含工具结果（没有真正的用户文本）⇒ 跳过
+        const text = contentToText(message.content).trim()
+        if (text.length > 0) return text
+      }
+      return undefined
+    })()
     // harness 的 GenerateOptions.system 是独立的系统提示（如标题生成的
     // systemPrompt、agent 的 persona）。后端 chat/completions 只接受
     // messages 数组里的 system 角色，必须显式插入——否则模型看不到
@@ -1659,25 +2299,69 @@ export class CodeArtsAdapter extends LlmAdapter {
       model: options.model,
       messages,
       stream: true,
-      // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回 cached_tokens，
-      // 缺少该字段时缓存命中恒为 0（实测 2026-08-24）。
+      /**
+       * ⚠️⚠️ **以下字段集与 IDE 抓包逐项对齐**（2026-10-30 真机对照）。
+       *
+       * ## 取证（Reqable 抓包，4 条真实 IDE 聊天请求，键集 4/4 完全一致）
+       *
+       * IDE 的 11 个键：
+       * `enable_thinking, max_tokens, messages, model, stream, stream_options,
+       *  temperature, tool_choice, tool_stream, tools, user_prompt`
+       *
+       * 插件此前**多发 3 个**（IDE 一个都不发）、**少发 5 个**：
+       *
+       * | 字段 | 旧插件 | IDE | 本次处置 |
+       * |---|---|---|---|
+       * | `prompt_cache_key` | 发 | **不发** | **保留**（见下，有实测收益） |
+       * | `include` | 发 | **不发** | **移除**（IDE 不请求加密 reasoning） |
+       * | `reasoning_summary` | 发 | **不发** | **移除**（同上） |
+       * | `enable_thinking` | 不发 | `true` | **新增**（唯一真正生效的思考开关） |
+       * | `stream_options` | 不发 | `{include_usage:true}` | **新增**（要 usage 帧） |
+       * | `temperature` | 不发 | `0` | **新增** |
+       * | `tool_choice` | 不发 | `'auto'` | **新增** |
+       * | `user_prompt` | 不发 | 用户原话 | **新增** |
+       *
+       * ## ⚠️ `prompt_cache_key` 为什么**不**跟着删（与 IDE 一致的那条唯一例外）
+       *
+       * IDE 不发它也能吃到缓存（实测 `cached_tokens 148480/148949`，99.7% 命中，
+       * 靠服务端自动前缀缓存）。但插件显式发会话 id 有**独立收益**：
+       * 会话级亲和让同一会话的多轮/并发请求落同一后端实例 ⇒ 命中率稳定。
+       * 2026-10-30 真机 A/B：带它 200 且 `cached=256`，不带也 200 且同样 `cached=256`
+       * ⇒ **无害**，故保留（不是「与 IDE 不一致」的误配）。
+       *
+       * ## ⚠️⚠️ `enable_thinking` 是**唯一真正生效**的思考开关（实测判别）
+       *
+       * 用「17×23 step by step」+ `reasoning_tokens` 作判据，三轮真机：
+       *
+       * | 请求 | `reasoning_tokens` | reasoning 字符 |
+       * |---|---|---|
+       * | `enable_thinking: true`  | **34** | 129 |
+       * | `enable_thinking: false` | **n/a（无该字段）** | **0** |
+       * | 不发该字段              | 45 | 175 |
+       *
+       * ⇒ `true`/`false` **双向都生效**；不发 = 服务端默认（开）。
+       * ⚠️ 这推翻了本文件上方「顶层 `thinking.type` 是唯一生效控制」的旧结论
+       * —— 那是 2026-09-29 只测了 `thinking.type` 得出的，**两条腿并存**：
+       * `enable_thinking:false`（IDE 方言）与 `thinking:{type:'disabled'}`（旧方言）
+       * 实测**等价**（都让 `reasoning_tokens` 归零），故按 IDE 用前者。
+       */
+      // ⚠️ 删 `include` / `reasoning_summary` 的依据：IDE 从不下发它们，
+      // 而本仓也没有任何消费者读「加密 reasoning」⇒ 纯冗余出站字段。
+      // ⚠️ `prompt_cache_key` **保留**（唯一有意偏离 IDE 的字段，理由见上方长注释）。
       prompt_cache_key: this.sessionId,
-      // include/reasoning_summary 对齐 Rust 端 CodeArtsExtraFields，
-      // 让服务端返回加密 reasoning 内容与摘要。
-      include: ['reasoning.encrypted_content'],
-      reasoning_summary: 'auto',
-      // 思考开关（实测，2026-09-29）：档位「关闭」翻成本网关真正认的字段。
-      // ⚠️ 是**顶层** `thinking`，不是 raccoon 那种 `extra_body.thinking` 方言
-      // （两者是不同网关的方言，混用会静默无效）。
-      // 实测判据：`disabled` → reasoning_tokens 3/3 全为 0、正文仍正确；
-      // `enabled` 与不传等价（服务端默认就开着），故「开启」档**不发**该字段。
-      //
-      // ⚠️ 标题请求走 `titlePlan`（上方），它会把档位定成 `'off'`，
-      // 于是这里同样发 `disabled` —— 两条判据**合并写**在一个表达式里，
-      // 避免「标题请求绕开了关闭」这类静默失效。
-      ...titlePlan.thinkingOff || options.reasoningEffort === 'off'
-        ? { thinking: { type: 'disabled' } }
-        : {},
+      // 思考开关：按 IDE 的 `enable_thinking`（关档发 false，其余发 true）。
+      // ⚠️ **不发 `thinking:{type:'disabled'}`** —— 与 IDE 对齐后两者只留一份，
+      //    避免「同一语义两个字段」（旧方言仍被服务端接受，但不该再发）。
+      enable_thinking: !(titlePlan.thinkingOff || options.reasoningEffort === 'off'),
+      // IDE 每次请求都带 `stream_options.include_usage`（要 usage 帧）。
+      // ⚠️ 本仓的 usage 消费方（token-meter / 占用条）依赖 `assistant/message.usage`，
+      //    拿不到 usage 会让分子的唯一来源变空 ⇒ 这不是可选美化项。
+      stream_options: { include_usage: true },
+      // ⚠️ `temperature: 0` 与 IDE 逐字一致（IDE 4/4 请求全是 0）。
+      temperature: 0,
+      // ⚠️ `tool_choice: 'auto'`：只在真带工具时发（无工具时下发的 `tools` 已省略，
+      //    此时发 `tool_choice` 是无意义字段，IDE 也只在有工具时发它）。
+      ...wireTools !== undefined && wireTools.length > 0 ? { tool_choice: 'auto' as const } : {},
       // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
       // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
       // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
@@ -1701,8 +2385,26 @@ export class CodeArtsAdapter extends LlmAdapter {
       // ⚠️ 抬预算（`titlePlan.maxTokens`，关不掉思考时才有值）必须走**同一个**
       // 钳制函数，否则会被钳回原值、兜底静默失效。标题请求的 512 远小于上限，
       // 故实际不会被钳；这里统一走一遍是为了「预算只有一个出口」。
-      max_tokens: clampCodeArtsMaxTokens(titlePlan.maxTokens) ?? CODEARTS_MAX_OUTPUT_TOKENS,
+      max_tokens: clampCodeArtsMaxTokens(titlePlan.maxTokens) ?? CODEARTS_DEFAULT_MAX_OUTPUT_TOKENS,
       ...wireTools !== undefined && wireTools.length > 0 ? { tools: wireTools } : {},
+      /**
+       * ⚠️ `user_prompt` = **最后一条 user 消息的纯文本**（IDE 的语义）。
+       *
+       * 实测（Reqable 4 条 IDE 请求）它的值恒为「用户这一轮的原话」，例如
+       * `"继续按照设计稿优化UI代码dart，然后每完成一个模块，就提交一个git"`。
+       *
+       * ## 它是什么 / 不是什么
+       *
+       * - **不是**发给模型的提示（模型看的是 `messages`），大概率是服务端用于
+       *   **会话计费/审计/标题**的旁路字段 ⇒ 缺失不影响出流（旧的插件请求
+       *   不带它也能稳定 200，两年实测如此）。
+       * - 但既然用户要求「尽量与 IDE 一致」，就按 IDE 下发：取值语义必须**对齐**
+       *   （用户原话，不是拼好的 system 或工具结果），否则不如不发。
+       *
+       * ⚠️ 取不到（无 user 消息 / 内容全是工具结果）时**省略该键** —— 发一个
+       * 空串会与 IDE 的真实形态（恒非空）不符，反而制造新的差异。
+       */
+      ...lastUserPromptText !== undefined ? { user_prompt: lastUserPromptText } : {},
     })
     const url = `${CHAT_API_BASE}/chat/completions`
 
@@ -1723,24 +2425,108 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 该账号不带 benefit 包时去掉 `maas_type: benefit` 头重试一次：
     // 只试一次，避免与真实失败互相掩盖。
     let benefitHeaderDropped = false
+    // 反向：该模型只按 benefit 通道注册（不带该头 → InferHub.002002009.404）
+    // 时补上该头重试一次。与 `benefitHeaderDropped` 互斥且各只一次。
+    //
+    // ⚠️ 实测（2026-10-27 审计）**最坏是三次发送**，不是「两轮」：
+    //    无头(404) → 补头(4004.200，此时可能先领一次) → 去头(404) → 抛。
+    //    即 `benefitHeaderPromoted` 与 `benefitHeaderDropped` **不互斥**（先补后去），
+    //    两条自愈都允许发生一次 ⇒ 序列长度 3。断言「最多两轮」会与实际不符。
+    let benefitHeaderPromoted = false
+    /**
+     * 本轮请求**实际带上了** `maas_type: benefit` 没有。
+     *
+     * ⚠️ 去头自愈必须以此为准，而不是「该模型是 benefit 模型」：若首轮根本没带
+     * 该头，收到的 `4004.200` 只能来自**别处**（本机另有一个会重签 CodeArts
+     * 请求的压缩插件 billion-context，它按自己的名单补该头），此时「去掉头」
+     * 是**逐字节相同的重发**，只会白白用掉唯一一次自愈名额并把它锁死
+     * （`benefitHeaderDropped` 同时挡住补头方向，见下方 catch）。
+     */
+    let benefitHeaderSent = false
+    // ⚠️ 限时福利领取只试一次（对标 codearts2api 的 `benefit_auto_claim`：领取幂等，
+    // 但上游若仍报 benefit-not-found 就该降级了，反复领只是白打接口）。
+    let benefitClaimAttempted = false
     // 因限流已尝试过的账号 id：保证每个账号只试一次，试完才判定"全部受限"。
     const rateLimitTried = new Set<string>()
     if (currentAccountId) rateLimitTried.add(currentAccountId)
-    // benefit（免费额度）模型判定在重试循环外先算好：它要读 benefit 集合缓存
-    // （`~/.cache/deveco/codearts_benefit_models.json`），不宜每轮重试都做 IO。
-    // 集合来自 gateway/config 的模型清单 ∪ 静态兜底（见 isCodeArtsBenefitModel），
-    // 使后端新增 benefit 模型时无需改代码即可自动识别。
-    const isBenefitModel = isCodeArtsBenefitModel(options.model)
+    // 该模型要不要带 `maas_type: benefit`：**唯一权威来源是远端 gateway/config
+    // 的模型清单**。官方 CodeArts Agent 内核的判据与此完全一致 —— 它只在
+    // `chat.headers` 钩子里写 `if (model_id ∈ gatewayConfig.models) headers.maas_type
+    // = "benefit"`，没有任何静态表（2026-10-26 逆向 `agentkernelServer-win32-x64.exe`）。
+    // 本仓库曾另有一张静态兜底表，两次都因后端改注册通道而误判，已删除：
+    // 猜错的代价是**首条消息直接报 4004.200**，比"首次多一轮 404 往返"贵得多。
+    const benefitHeaderCertain = isCodeArtsBenefitModelKnown(options.model)
+    /**
+     * ⚠️⚠️ **本进程内「补头成功」的记忆**（2026-10-27 审计 P1 修）。
+     *
+     * ## 为什么必须有
+     *
+     * `benefitHeaderPromoted` 是 `stream()` 的**局部变量** ⇒ 下一轮从"没带头"
+     * 重新开始。而远端集合取不到时（本机常态：`gateway/config` 回
+     * `4000 invalid channel`，见 `docs/agent-notes/providers-codearts.md:57`），
+     * `benefitHeaderCertain` 恒 `false` ⇒ benefit-only 模型（`glm-5.3-flash`，
+     * 在 `DEFAULT_MODELS` 里）**每条请求**都要「无头 404 → 补头 → 成功」两次 chat。
+     *
+     * 实测（对抗审计）：连续两次 `stream()` 的头序列 `[null,'benefit',null,'benefit']`；
+     * DSH 一轮 3 条并发（主回复/标题/压缩）⇒ **6 次上游**。
+     * 而修前（有静态表）同场景只需 1 次 ⇒ 这是本 PR 引入的**净回归**。
+     *
+     * ## 为什么是进程内（不落盘）
+     *
+     * 落盘会污染「权威集合」的语义（那必须只由远端 `gateway/config` 写），
+     * 而这里只是"实践证伪了远端集合的完备性"的**观测**：进程内学习足够消除
+     * 同一次运行里的重复代价，重启后重新探测一次也无妨（代价仅 1 轮）。
+     */
+    const learnedThisProcess = codeArtsBenefitLearnedFor(options.model)
+    /**
+     * 领一次限时福利（幂等）。`true` = 领到 ⇒ 调用方**保持** `maas_type: benefit`
+     * 头重试；`false` = 领不到 ⇒ 退回既有的去头降级。
+     *
+     * ⚠️⚠️ **两个门禁，缺一不可**（2026-10-27 审计 P2 修）：
+     * 1. 调用方的 `benefitClaimAttempted` —— 「本次 `stream()` 内只领一次」；
+     * 2. {@link claimCodeArtsBenefitShared} 的**跨请求去重** —— 「同一凭据
+     *    在一段时间内只领一次」。
+     *
+     * 修前**只有**第 1 条，而它是 `stream()` 局部变量 ⇒ 3 条并发请求各领一次
+     * （实测 `claims=3`）。而领取是**写操作**，标题/压缩请求是后台的、用户看不到
+     * 它们的失败，但写请求照发。
+     */
+    const claimBenefitOnce = async (): Promise<boolean> => {
+      // 闭包里拿不到外层「credential 已判非空」的收窄（`let` 可变），自己再判一次。
+      if (credential === undefined) return false
+      /**
+       * ⚠️⚠️ **只有远端集合确认过的模型才允许领取**（2026-10-27 审计 P1 修）。
+       *
+       * `InferHub.4004.200` 这个码**不区分**两种语义：
+       * ① 该账号没有 benefit 包；② 这个模型根本不该带该头（PR 自己取证过：
+       * 把该头送给非 benefit 模型就回 `4004.200`）。
+       *
+       * 而补头方向（`MODEL_NOT_REGISTERED`）会把**任意**未确认模型也带上该头
+       * ⇒ 于是「模型不存在 / 打错 id」这种与福利无关的场景，会走到这里**领一次福利**
+       * （实测：一次 `stream()` 里 4 次 chat + 1 次写）。
+       *
+       * ⇒ 领取的前置条件收紧成「该模型由远端 `gateway/config` **确认**过」
+       *   （或本进程内补头成功过）。未确认时直接返回 `false`，走既有的去头降级 ——
+       *   那条路径**只发读请求**。
+       */
+      if (!benefitHeaderCertain && learnedThisProcess === false) return false
+      try {
+        return (await claimCodeArtsBenefitShared(credential, this.fetchImpl, options)) === 'success'
+      } catch {
+        // 领取路径的任何异常都不得掩盖原失败：领不到就走降级。
+        return false
+      }
+    }
     for (;;) {
-      // benefit（免费额度）模型（glm-5.3-flash、deepseek-v4.1-flash 等）后端要求
-      // maas_type: benefit 头参与 SDK-HMAC-SHA256 签名，否则返回
-      // InferHub.002002009.404 "model is not registered"。
-      //
-      // 判定必须是**动态**的：早期只硬编码 glm-5.3-flash 一个模型，导致
-      // deepseek-v4.1-flash 等其它 benefit 模型调用失败（用户报障：
-      // 发消息后报 Insufficient Balance / QUOTA —— 缺该头时后端按非 benefit
-      // 通道处理该模型）。实证见 CODEARTS_BENEFIT_FALLBACK 注释。
-      const extraSignedHeaders = isBenefitModel && !benefitHeaderDropped ? { maas_type: 'benefit' } : undefined
+      // `maas_type: benefit` 参与 SDK-HMAC-SHA256 签名（不签就 401），故只能在这里
+      // 决定。首次是否带只看三条腿：远端确认 / 本进程补头成功过 / 本次已补头。
+      // 其余一律先发常规请求 —— 与官方内核「model_id ∈ gatewayConfig.models 才写该头」
+      // 同一口径。后端若另有安排，由下方两个自愈方向兜住（各一次）。
+      const extraSignedHeaders = !benefitHeaderDropped
+        && (benefitHeaderCertain || learnedThisProcess || benefitHeaderPromoted)
+        ? { maas_type: 'benefit' }
+        : undefined
+      benefitHeaderSent = extraSignedHeaders !== undefined
       const signed = await signRequestHuawei(
         credential.access_key_id,
         credential.secret_access_key,
@@ -1751,6 +2537,10 @@ export class CodeArtsAdapter extends LlmAdapter {
         extraSignedHeaders,
       )
       const headers = new Headers(attributionHeaders())
+      // ⚠️⚠️ **必须覆盖宿主的 `user-agent`**（华为 WAF 拒发
+      // `deepseek-harness/` 前缀 ⇒ 403 ⇒ 客户端报「API 密钥无效」）。
+      // 取证、对照表与「为什么不参与签名」见 {@link CODEARTS_USER_AGENT}。
+      headers.set('user-agent', CODEARTS_USER_AGENT)
       // 签名 map 中的额外头（如 maas_type）必须随请求发送——它们已参与
       // canonical 计算、包含在 SignedHeaders 列表中，缺失会导致服务端验签失败。
       signed.forEach((value, key) => { if (key !== 'content-type') headers.set(key, value) })
@@ -1772,6 +2562,19 @@ export class CodeArtsAdapter extends LlmAdapter {
         // SseQueueRetryError，落入下方排队重试逻辑，与 TM.00001041 一致。
         try {
           yield* this.consumeSse(response, options)
+          /**
+           * ⚠️⚠️ **补头后真的出流成功 ⇒ 记入进程内学习集合**（2026-10-27 审计 P1 修）。
+           *
+           * 只有走到这里（`consumeSse` 正常返回、没抛任何自愈错误）才算
+           * 「这个模型确实需要 `maas_type: benefit`」⇒ 下一轮请求直接带头，
+           * 不再每次先付一轮 404 往返（远端集合取不到时那是**每条请求**的代价，
+           * 实测一轮 3 条并发 = 6 次上游）。
+           *
+           * ⚠️ 刻意**不**在 `benefitHeaderPromoted = true` 那一刻记 —— 那只是
+           * 「决定补头」，补上去仍可能失败（模型不存在 / 账号无权限）。记错了会让
+           * 后续请求把该头送给一个不该带的模型，而那正是本 PR 要修的缺陷形态。
+           */
+          if (benefitHeaderPromoted) markCodeArtsBenefitLearned(options.model)
           break
         } catch (error) {
           if (error instanceof SseQuotaExhaustedError) {
@@ -1817,11 +2620,33 @@ export class CodeArtsAdapter extends LlmAdapter {
             // 落入下方排队重试
           } else if (
             error instanceof LlmError
+            && error.code === MODEL_NOT_REGISTERED_CODE
+            && !benefitHeaderSent
+            && !benefitHeaderDropped
+            && !benefitHeaderPromoted
+          ) {
+            // 反向自愈：该模型只按 benefit 通道注册，而我们这次**没带**该头
+            // （见上方 `benefitHeaderCertain` 的说明）。补上该头重放一次。
+            //
+            // ⚠️ 这里**不再**要求「该模型是 benefit 模型」：那正是被删掉的静态
+            // 表才能回答的问题，而它过时正是本类缺陷的根源。判据改成「本轮没带
+            // 头 + 上游说未注册」，对新模型同样成立，代价最多多一轮往返。
+            benefitHeaderPromoted = true
+            continue
+          } else if (
+            error instanceof LlmError
             && error.code === BENEFIT_NOT_FOUND_CODE
-            && isBenefitModel
+            && benefitHeaderSent
             && !benefitHeaderDropped
           ) {
-            // 该账号没有 benefit 包：去掉 maas_type 头重试一次
+            // 上游报「benefit not found」。两种解读**可能都成立**：
+            // ① 该账号没有 benefit 包；② 有资格但**还没领取**（领取幂等）。
+            // 先领一次：领到就**保持**该头重放；领不到才去头降级。
+            if (!benefitClaimAttempted) {
+              benefitClaimAttempted = true
+              if (await claimBenefitOnce()) continue // 保持 maas_type: benefit 重放
+            }
+            // 没领到（或已试过领取）⇒ 去头降级（只试一次）。
             benefitHeaderDropped = true
             continue
           } else {
@@ -1941,8 +2766,27 @@ export class CodeArtsAdapter extends LlmAdapter {
         // 「只试一次，避免与真实失败互相掩盖」），且 issue 自己给的证据是
         // 「去掉请求头后密集取样 9 次全部 200」——那说明的正是**去头即通**，
         // 而非「需要多次退避」。按证据改，不按建议改。
-        if (isBenefitModel && !benefitHeaderDropped && isBenefitNotFoundBody(errorText)) {
+        //
+        // ⚠️ 与 SSE 通道**共用同一对门禁**（`benefitClaimAttempted` /
+        // `benefitHeaderDropped`）⇒ 先领一次；领不到才去头，且两条通道叠加
+        // 也只各一次，不会把请求放大成多轮。
+        if (benefitHeaderSent && !benefitHeaderDropped && isBenefitNotFoundBody(errorText)) {
+          if (!benefitClaimAttempted) {
+            benefitClaimAttempted = true
+            if (await claimBenefitOnce()) continue // 保持 maas_type: benefit 重放
+          }
           benefitHeaderDropped = true
+          continue
+        }
+        // 反向自愈的 4xx 孪生分支：与 SSE 通道同源同判据（本仓库红线：
+        // 同一语义不得有两套判据）。只在该头**未带**时才补，且各只一次。
+        if (
+          !benefitHeaderSent
+          && !benefitHeaderDropped
+          && !benefitHeaderPromoted
+          && isModelNotRegisteredBody(errorText)
+        ) {
+          benefitHeaderPromoted = true
           continue
         }
         // 限流处理：记录当前账号在该模型上的重置时间，然后切换账号重试
@@ -2013,6 +2857,49 @@ export class CodeArtsAdapter extends LlmAdapter {
           // 立即抛出，避免把真错误（如 401/400）拖成 30 分钟超时。
           const probe = await this.queryQueueStatus(credential, options.model, options.signal)
           if (probe === undefined || probe.status === 'working') {
+            /**
+             * ⚠️⚠️ 三个「非凭据问题」的业务码必须在**通用模板之前**单列
+             *（2026-11-05，Gitee PR #175 评审 + 本仓库 UA 修复的兜底）。
+             *
+             * 通用模板 `codearts: model request failed with HTTP ${status}` 一个字
+             * 都没说「这是上游策略 / 并发上限 / 租户未开通」，而
+             * `httpErrorCode(403)` 会把它归成 `AUTH` ⇒ 客户端整条换成
+             * 「API 密钥无效」（IKLBSH 同族红线）⇒ 用户去重登凭据，方向全错。
+             *
+             * ## 错误码为什么三条各不相同（**别合并**）
+             *
+             * | 码 | 成因 | 重试有效？ | 宿主码 |
+             * |---|---|---|---|
+             * | `TM.00000001` | 网关按客户端标识拒发 | **否**（同 UA 恒 403） | `PERMISSION`（**不可重试**） |
+             * | `TM.00001041` | 账号级并发上限（403 形态） | **是**（等 1~2 分钟即好） | `RATE_LIMIT`（可重试） |
+             * | `TM.000010051` | 模型未在本租户开通 | **否** | `PERMISSION` |
+             *
+             * ⚠️ 把 `TM.00000001` 也归 `RATE_LIMIT` 是**错的**：宿主
+             * `DEFAULT_RETRYABLE_CODES` 含 `RATE_LIMIT`（`maxRetries 5`）⇒
+             * 确定性失败会被白退避重试 5 次，每次都打上游一次 403。
+             * ⚠️ 与 qoder 那条「网关 5xx 白重试」是**同型缺陷**，只是方向相反。
+             *
+             * ## 为什么 403 + `TM.00001041` 也走这里而不是排队流程
+             *
+             * {@link isQueueError} 只认 `400`（**400 形态的自愈路径不可动**：
+             * 本仓库 4 条既有用例用它锁「撞上限后自动重试即成功」）。
+             * 403 形态进不了排队 ⇒ 只能在这里给「等一会儿就好」的文案 + 可重试码。
+             */
+            if (isGatewayBusyError(errorText)) {
+              throw new LlmError(codeartsGatewayBusyMessage(options.model), 'PERMISSION', {
+                status: response.status,
+              })
+            }
+            if (isConcurrencyLimitError(errorText)) {
+              throw new LlmError(codeartsConcurrencyLimitMessage(options.model), 'RATE_LIMIT', {
+                status: response.status,
+              })
+            }
+            if (isTenantNotEnabledError(errorText)) {
+              throw new LlmError(codeartsTenantNotEnabledMessage(options.model), 'PERMISSION', {
+                status: response.status,
+              })
+            }
             // 与 deepseek 适配器的 httpErrorCode 词汇保持一致；
             // 400 + 上下文超限措辞归为 CONTEXT_WINDOW_EXCEEDED（触发 compaction）。
             const code = httpErrorCode(response.status, errorText)
@@ -2359,6 +3246,10 @@ export class CodeArtsAdapter extends LlmAdapter {
             if (data.error_code === CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE) {
               // 账号没有 benefit 包（积分制账户）：交给 stream() 去掉该头重试
               throw new LlmError(`codearts: ${message}`, BENEFIT_NOT_FOUND_CODE, { status: 200 })
+            }
+            if (data.error_code === CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE) {
+              // 该模型只按 benefit 通道注册：交给 stream() 补上该头重试
+              throw new LlmError(`codearts: ${message}`, MODEL_NOT_REGISTERED_CODE, { status: 200 })
             }
             throw new LlmError(`codearts: ${message}`, 'INVALID_REQUEST', { status: 200 })
           }

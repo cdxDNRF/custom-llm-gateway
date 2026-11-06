@@ -155,6 +155,20 @@ interface ContentFingerprint {
   readonly replace: string
   /** 来源与证据，写死在代码里，免得后人「顺手」把它改成正则或删掉。 */
   readonly note: string
+  /**
+   * ⚠️ **可选的「漂移容忍」正则源码**（2026-10-30 新增，只有第 4 条用它）。
+   *
+   * 语义：**只**放宽「形态」这一维（大小写、空白量、可选逗号、可选
+   * `coding` / 定冠词），**不放宽**成关键词 —— 锚点仍必须是**整句**。
+   *
+   * ⚠️ 存在的理由：`find` 是**逐字符**字面量，DSH 只要改动其中**一个**字符，
+   * 这条规则就**静默失效**（症状 = 每轮 400/11128，与「没登记过」同形）。
+   * 本文件顶部已把这条风险登记为「漂移风险未解」。
+   *
+   * ⚠️ 填了 `findRegex` 也必须**同时**填 `find`：`find` 是文档可读的原文，
+   * 也是单测「原文 vs 改写后」对照的取样源。
+   */
+  readonly findRegex?: string
 }
 
 /**
@@ -327,11 +341,20 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     //
     // `find` 刻意不带尾句点：一条同时覆盖带句点与不带句点两种形态。
     find: 'You are an AI agent powered by DeepSeek Harness',
+    // ⚠️⚠️ **漂移容忍**（2026-10-30 实测定案，见下方「2026-10-30」一节）：
+    // 上游的匹配器**大小写不敏感**、且**归一空白**，但**不跨标点** ——
+    // 于是「形态」这一维可以放宽，而语义仍锁在整句上。
+    findRegex: 'You\\s+are\\s+an?\\s+AI\\s+(?:coding\\s+)?agent\\s*,?\\s*powered\\s+by\\s+'
+      + '(?:the\\s+)?DeepSeek\\s+Harness',
     // 见上方「2026-10-21」一节：官方同形 + 官方原生兜底措辞。
     replace: 'You are an AI coding assistant, powered by a large language model',
     note: '本机 2026-10-20 对 copilot.tencent.com 实测：system 绝对行首 400/11128，'
       + '前接任意字符放行；2026-10-21 换成官方同形措辞后**实测放行**（buddy 站 / '
-      + 'deepseek-v4.1-flash），另实测该句在 www.workbuddy.ai 两模型**均不拦**（站点相关）',
+      + 'deepseek-v4.1-flash），另实测该句在 www.workbuddy.ai 两模型**均不拦**（站点相关）'
+      + '；2026-10-30 复测（buddy / deepseek-v4.1-flash / 账号 A6146635）：原文 400'
+      + '，全小写与全大写**同样 400**（⇒ 大小写不敏感），双空格**仍 400**（⇒ 空白归一）'
+      + '，`agent` 后加逗号**200**、`agent,` 无空格**200**（⇒ 匹配不跨标点）'
+      + '，裸两个词 DeepSeek Harness **200**（⇒ 认整句不认 token）',
   },
   {
     // **DSH Web 运行面的开头两句** —— 来自 DSH 的 `@deepseek-ai/dsh-harness-dev-context`
@@ -391,53 +414,100 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
       + 'www.workbuddy.ai 不拦、旧版 `at <url>` 形态不拦；去掉品牌串后真实整段 200',
   },
   {
-    // Claude Code 的 **system 首块**：一个伪装成 HTTP 头的计费标记。
+    // **DSH 的 `@` 文件引用说明句**（`FILE_REFERENCE_PROMPT`；2026-10-28 真实报障）。
     //
+    // ## 现象
+    //
+    // 真实会话每轮 `400/11128 Illegal API invocation from an unapproved channel`，
+    // 用户侧显示 `INVALID_REQUEST` + 「请求被拦截，请重新发送」。关键观察：
+    // **前五条全部命中并被改写**（身份句、Web 面两句都在出站文本里确认消失），
+    // **仍然被拦** ⇒ 触发物不在已登记的清单里。
+    //
+    // ## 出处（写在这里是因为它极易被漏第二次）
+    //
+    // `packages/context/file-reference/src/index.ts` 的 `FILE_REFERENCE_PROMPT`，
+    // 由 `@deepseek-ai/dsh-file-reference-local` 注入为 `context:file-reference` 段：
+    //
+    // ```ts
+    // text: () => agent.ctx.tools.get('read', agent) === undefined ? '' : FILE_REFERENCE_PROMPT
     // ```
-    // x-anthropic-billing-header: cc_version=2.1.293.9b8; cc_entrypoint=sdk-cli;
-    // ```
     //
-    // ## ⚠️ 这是**本仓库独有**的登记（上游至今没有这一条）
+    // 该段在 agent 有 `read` 工具时**恒非空** ⇒ **每轮必带**，与加载了哪些插件、
+    // 哪些 skill **完全无关**（曾误判为「superpowers 把 system 撑大导致」，
+    // 实测删掉 superpowers 整段后**仍被拦**，该假设已被证伪）。
     //
-    // 同源备份：上游的指纹表里没有它，故 `scripts/sync-vendor.sh` 的 rsync
-    // **会把本条冲掉** —— 每次同步 vendor 后必须回来核对这一条还在不在
-    // （v0.1 的全量同步实测冲掉过一次）。
+    // ## ⚠️⚠️ 本条**不含任何品牌词** —— 这就是它被前五条漏掉的原因
     //
-    // ## 事故链（2026-10-21 用真 CLI 复现）
+    // 没有 `DeepSeek Harness`、没有 `dsh`、没有 `DeepSeek`。前五条的普查方式是
+    // 「找出带品牌名的句子」，而这条是**纯功能描述**，按品牌名筛选**必然漏掉**。
+    // ⇒ **判据不是品牌名，是「`@` 路径引用语法说明」这个 DSH 独有写法。**
+    // 以后新增登记时请回来读这一行：**别只按品牌名普查**。
     //
-    // Claude Code v2.1.292+ 把它放在 `system[0]` 第一行（74 字符）。这是它给
-    // Anthropic 官方统计「第三方入口」用的标记，腾讯把它当成「未获批准渠道」
-    // 的证据 ⇒ **每条请求**都 400/11128 ⇒ Claude Code 里**任何 buddy 模型都用不了**，
-    // 而其它客户端正常（它们不发这一行）。
+    // ## 本机逐格实测（2026-10-28；`copilot.tencent.com`；`deepseek-v4.1-flash`）
     //
-    // ## 匹配语义（逐格实发探针，经网关 → buddy）
+    // 固定一个基线放行的账号（先用中性 system 筛掉限流/渠道门控的账号），
+    // 每格发 2–3 次确认确定性（该格结果稳定，非随机）。
     //
-    // | 形态 | 结果 |
-    // |---|---|
-    // | 整行（system 开头）                        | ❌ 400/11128 |
-    // | 只留头名 `x-anthropic-billing-header`（无冒号/值）| ❌ 400/11128 |
-    // | 头名少一个字母（`…-heade`）                | ✅ 200 ⇒ 需要**完整头名** |
-    // | 头名后接字母（`…-headerX`）                | ❌ 400/11128 ⇒ 是**词边界**匹配，不是子串 |
-    // | 全大写 `X-ANTHROPIC-BILLING-HEADER`        | ❌ 400/11128 ⇒ 大小写不敏感 |
-    // | 值改版本号 / 改 entrypoint                 | ❌ 400/11128 ⇒ **值与内容无关，只认头名** |
-    // | 头名后加空格再冒号（`…-header :`）         | ❌ 400/11128 |
-    // | 头名前加任意字符（换行 / `hello `）        | ✅ 200 ⇒ 行首锚定 |
-    // | 改头名任一字母（`x-billing-header:` / `anthropic-…`）| ✅ 200 |
-    // | 放进 **assistant** 正文开头                | ❌ 400/11128（故 assistant 也要改） |
-    // | 放进 assistant 正文中间 / user / tool 结果 | ✅ 200（不扫这几处） |
+    // | 探针 | 结果 | 结论 |
+    // |---|---|---|
+    // | 中性句 `You are a helpful assistant.` | ✅ 200 ×6 | 基线 |
+    // | **真实整段 system（18,383 字符）** | ❌ 400/11128 ×6 | 复现 |
+    // | **同一 system，仅把本句改成 `replace`** | ✅ **200 ×3** | **修法有效** |
+    // | 完全不发 system | ✅ 200 ×3 | 对照（证明变量在 system 内） |
+    // | 真实 system 逐行二分 | 第 160 行为临界 | 定位 |
+    // | 该行**前 110 字符** | ✅ 200 | — |
+    // | 该行**前 111 字符** | ❌ 400 | ⇒ 字面量 = 111 字符 |
+    // | 只发**前半句**（`Tokens prefixed with @…`，48 字符） | ✅ 200 | ⇒ 半句空跑 |
+    // | 只发**后半句**（`Relative paths…`，44 字符） | ✅ 200 | ⇒ 半句空跑 |
+    // | 裸串作整个 system（绝对行首） | ❌ 400 | — |
+    // | 前接 1 空格 / 前接换行 / 前接中文 | ❌ 400 | ⇒ **位置无关** |
+    // | 嵌在句中（`Note: … here.`） | ❌ 400 | ⇒ **位置无关** |
+    // | 整行跳到第 50 字符之后 | ✅ 200 | ⇒ 锚点从行首起算 |
+    // | 全小写 / 全大写 | ❌ 400 | ⇒ **大小写不敏感** |
     //
-    // ⇒ 判据是「**行首 + 完整头名**」，值随便。故 `find` 只写头名 —— 比整行短、
-    //    覆盖将来版本号变化（已验 2.1.293 / 2.1.306 两版均命中）。
-    // ⚠️ 更稳的客户端侧规避是 `CLAUDE_CODE_ATTRIBUTION_HEADER=0`（实测能整块关掉
-    //    这个头），但那是 Anthropic 的开关、随时可能收回；网关侧改写才是可控层。
-    find: 'x-anthropic-billing-header',
-    // ⚠️ 替换**必须保留原意**：这是上游统计入口用的标记，不是面向模型的话。
-    //    只把「头名」改成标签形态，语义（计费/入口标记）不变而字面量不同。
-    replace: 'anthropic-billing-header-tag',
-    note: '本仓库独有登记（上游无）。Claude Code v2.1.293 / 2.1.306 真 CLI 实测：'
-      + '行首锚定、只认完整头名（值/版本号无关）、assistant 正文开头同样拦；'
-      + '改写后 200。⚠️ 同步 vendor 时必须核对本条还在',
+    // ## `find` 为什么是 111 字符、不能更短
+    //
+    // 前缀二分给出 **110 放行 / 111 拦**；而按句切开后**两半各自都放行**
+    // ⇒ 触发串**跨了句边界**，是前两句的**并集**。切开任一半都会**空跑**
+    // （症状：登记了却仍每轮 400）。与第 5 条同型，同一条纪律：
+    // **非单调现象只能逐格实测，不能凭直觉切。**
+    //
+    // ## ⚠️ 位置语义与第 4 条**相反**
+    //
+    // 第 4 条（身份首句）是**行首锚定**（前接任意字符即放行）；
+    // 本条是**位置无关**（句中、前接任意前言照样拦）。
+    // ⇒ 改写范围**不做**行首锚定正则 —— 宁可略宽：漏改 = 整轮 400，
+    // 多改 = 语义等价的措辞变化。**别拿一条的锚点结论推给另一条。**
+    //
+    // ## 本条的**脆弱性**（如实登记）
+    //
+    // 上游认**逐字符**长字面量 ⇒ DSH 哪天改动这两句里的任一字符，本规则会
+    // **静默停止匹配**（症状 = 该渠道整轮 400 复发，与「完全没登记」同形）。
+    // 守卫见 `tests/unit/openai-gateway-tencent-fingerprint.spec.ts` 的同名组
+    // （含「真实整段 407 字符只改一处、后半段约束逐字不动」那条语义守卫）。
+    find: 'Tokens prefixed with @ are paths the user explicitly referenced. '
+      + 'Relative paths resolve from the workspace root',
+    // 只调整语序：`相对路径从工作区根解析` → `路径相对工作区根解析`。语义不变，
+    // 且**整句其余 402 字符逐字不动** —— 后半段（目录 list / 用 read /
+    // 不得声称已读过 / 引号语法）是防模型编造文件内容的核心约束，一个字都不许删。
+    replace: 'Tokens prefixed with @ are paths the user explicitly referenced. '
+      + 'Paths resolve relative to the workspace root',
+    note: '真实报障 2026-10-28；本机逐格实测：真实整段 18,383 字符 400×6，'
+      + '仅改本句语序后 200×3；111 字符字面量（110 放行）、位置无关、大小写不敏感、'
+      + '切句两半各自放行；⚠️ 本条不含品牌词，按「找含 DeepSeek Harness 的句子」普查必漏',
   },
+  {
+    // 客户端 SDK 把计费头写进 system 正文开头：
+    //   `x-anthropic-billing-header: cc_version=2.1.316.060; cc_entrypoint=sdk-ts;...`
+    // 2026-11-03 实发：该**字样**（连裸词）会被 buddy 的内容级 11128 拦截；
+    // 同一整段里只把这一处换成 `x-client-billing-header` 后 200。
+    // 位置无关、大小写不敏感；同段其余 232 字符逐字不动。
+    find: 'x-anthropic-billing-header',
+    replace: 'x-client-billing-header',
+    note: '2026-11-03 实测（copilot.tencent.com / deepseek-v4.1-flash）：原文 400/11128，'
+      + '换名后 200；裸词也 400，x-anthropic-foo / anthropic-billing-header 均 200',
+  },
+
 ]
 
 /** 正则元字符转义：把字面量安全地变成**精确**匹配，而不是模式。 */
@@ -447,16 +517,38 @@ function escapeRegExp(literal: string): string {
 
 interface CompiledFingerprint {
   readonly replace: string
-  /** 小写形态，用于 `includes` 预检（不命中就不必跑正则，字符串**原样**返回）。 */
+  /**
+   * 用于 `includes` 预检的**锚**（不命中就不必跑正则，字符串**原样**返回）。
+   *
+   * ⚠️ 有 `findRegex` 时它是「正则里那段**必然出现**的稳定子串」的小写形态
+   * （第 4 条用 `'ai agent'`）—— 不能再用整句小写，否则漂移容忍就白做了。
+   */
   readonly findLower: string
   readonly pattern: RegExp
 }
 
+/**
+ * 从 `findRegex` 源码里取「预检锚」。
+ *
+ * ⚠️ 取法是**人工指定的常量**（每条规则自带 `precheckAnchor`），不从正则反推 ——
+ * 从正则反推「哪段必然出现」是**不可判定**的，猜错会让预检把真命中挡掉
+ * （症状：规则静默不生效，与「没登记」同形）。
+ */
+const PRECHECK_ANCHORS: Readonly<Record<string, string>> = {
+  // 第 4 条：锚取 `deepseek harness` 而**不是** `ai agent` ——
+  // 后者不含漂移形态 `ai **coding** agent`（实测：锚写成 `ai agent` 时
+  // 「coding agent」那一格**静默不匹配**，正是本轮要治的那类失效）。
+  // ⚠️ 锚只需「必然出现且够独特」：`deepseek harness` 在本句里恒在，
+  //    且不会命中无关文本（比 `powered by` 这种通用短语好得多）。
+  'You are an AI agent powered by DeepSeek Harness': 'deepseek harness',
+}
+
 const COMPILED: readonly CompiledFingerprint[] = CONTENT_FINGERPRINTS.map((rule) => ({
   replace: rule.replace,
-  findLower: rule.find.toLowerCase(),
+  findLower: PRECHECK_ANCHORS[rule.find] ?? rule.find.toLowerCase(),
   // `g` = 全部出现都改写；`i` = 大小写不敏感（实测全小写 / 全大写同样被拦）。
-  pattern: new RegExp(escapeRegExp(rule.find), 'gi'),
+  // ⚠️ 有 `findRegex` 时用它（只放宽形态，仍锚整句）。
+  pattern: new RegExp(rule.findRegex ?? escapeRegExp(rule.find), 'gi'),
 }))
 
 /** 该 provider 是否走腾讯系后端（有这套内容级风控）。 */

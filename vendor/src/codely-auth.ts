@@ -638,6 +638,29 @@ export async function fetchCodelyCliApiKey(
       // ⚠️ **分档在这里**（2026-10-22 A1 修）：只有 401/403 才算「该号的凭据
       //    确实不可用」；5xx / 429 / 其它状态码都是「上游此刻不好」，
       //    **不得**让调用方把它记成账号级冷却（那会一次抖动锁死整池）。
+      //
+      // ## ✅ 上游真实形态（2026-10-24 实测，别再靠猜）
+      //
+      // 用**无效 token** 对本端点逐种畸形输入实测（无头 / `Bearer` 空 / 无 Bearer
+      // 前缀 / 路径穿越串 / 5000 字符超长串），结论：**一律 401，没有 400**：
+      //
+      // ```
+      // HTTP 401  content-type: application/problem+json
+      // {"type":"https://codely.dev/problems/unauthorized","title":"Unauthorized",
+      //  "status":401,"detail":"access token is invalid"｜"access token is required",
+      //  "instance":"/api/api-token/cli-api-key","request_id":"…"}
+      // ```
+      //
+      // ⇒ 上游遵循 **RFC 7807**，鉴权问题**只用 401**表达（两种 detail：
+      //   「缺失」与「无效」），**不存在**「用 400 表示单号无权」这种形态。
+      //   ⚠️ 曾有人据此建议「把 400 也归 credential 档」—— 那是**误报**，
+      //      照做会把真实的客户端/网关错误（405 等）误判成账号问题去换号。
+      //
+      // 另两种观察到的形态（同样与单号好坏无关，维持 transient 是对的）：
+      //   · 405 → `…/problems/method-not-allowed`（problem+json）
+      //   · **不存在的路径也返回 401**，但格式是 `{"detail":"Authentication required…"}`
+      //     （非 problem+json，是认证中间件拦的）⇒ 若哪天端点 URL 拼错，现象会是
+      //     「整池每个号都 401、都被当成凭据失效换掉」，排查时看 `instance` 字段。
       if (res.status === 401 || res.status === 403) return { kind: 'credential', status: res.status }
       return { kind: 'transient', status: res.status, reason: `HTTP ${res.status}` }
     }

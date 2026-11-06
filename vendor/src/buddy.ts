@@ -84,9 +84,14 @@ export const HTTP_HEADER_PRODUCT_CODE = 'X-Product-Code'
 
 /**
  * User-Agent 标识（对齐 IDE 的 getUserAgent() → CodeBuddyIDE/${platformVersion}）。
- * platformVersion 来自 IDE product.json version 字段（1.106.1），非 genie 版本。
+ * platformVersion 来自 IDE product.json version 字段，非 genie 版本。
+ *
+ * ⚠️ 2026-10-30：**`1.106.1` → `4.12.2`**（用户提供的客户端实际版本）。
+ * ⚠️⚠️ 本常量与 `src/product.ts` 的 `CODEBUDDY.userAgent` 是**同一份取值的两处
+ * 定义**（该处注释已登记「迁移完成前必须同步」）⇒ **必须同改**，只改一处会造出
+ * 「UA 与 `X-IDE-Version` 互相矛盾」的指纹。
  */
-export const BUDDY_USER_AGENT = 'CodeBuddyIDE/1.106.1'
+export const BUDDY_USER_AGENT = 'CodeBuddyIDE/4.12.2'
 /** X-Product-Code 值（对齐 IDE headers 设置）。 */
 export const BUDDY_PRODUCT_CODE = 'codebuddy'
 /** X-Product 默认值（deploymentType，对齐 ProductEndpointHttpInterceptor）。 */

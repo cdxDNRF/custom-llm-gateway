@@ -221,6 +221,18 @@ export interface JetHubState {
    */
   nativeWebSearchEnabled?: boolean
   /**
+   * 「ZCode 会话负载均衡」开关（{@link sanitizeSessionBalanceEnabled}）。
+   *
+   * 语义：**开** = ZCode 多账号按 DSH sessionId 做会话亲和（同一会话**优先**
+   * 落同一账号；账号今日负载达阈值后会被沉底、正在跑的会话会迁移一次），没有
+   * sessionId 的请求随机分摊；**关** = 回到「手动顺序首个可用账号」的既有语义。
+   *
+   * ⚠️ 与 `nativeWebSearchEnabled` 同级、**可以**住在这里：老版本代码整体
+   * 重写 `state.json` 时丢掉本键，后果仅是**回到手动顺序**，用户再开一次即可
+   * —— 没有任何不可逆后果。缺键语义为**启用**（2026-10-30 用户要求的默认）。
+   */
+  sessionBalanceEnabled?: boolean
+  /**
    * 「面板入口」：Jet Hub 的**唯一**入口位置（{@link PanelEntry}）。
    *
    * 两个取值**严格互斥**，任一时刻只有一个入口存在：
@@ -350,7 +362,14 @@ export type JetHubStoreKind = 'settings' | 'file' | 'memory'
 /** Jet Hub 状态存取接口（同步读、异步写）。 */
 export interface JetHubStore {
   readonly kind: JetHubStoreKind
-  /** 同步载入；文档不存在时返回 `undefined`（等价于"空"）。 */
+  /**
+   * 同步载入；文档不存在（全新安装且没有可迁移的凭据）时返回 `undefined`（等价于"空"）。
+   *
+   * ⚠️⚠️ **「读不出来」必须抛错，不得返回 `undefined`**（2026-11-05 三审 P0-1）。
+   * 两种状态同形会让 `AccountPool.ensureLoaded()` 把空缓存当成已载入，接着
+   * 任何一次写入都会用空状态**整体覆盖**磁盘文档（账号 / 模型黑名单 / 关闭
+   * 意图 / 网关开关全部永久丢失，且全程零报错）。调用方负责决定降级方式。
+   */
   load(): JetHubState | undefined
   /** 整体写入（账号与黑名单必须同时携带，见 AccountPool 的说明）。 */
   save(state: JetHubState): Promise<void>
@@ -387,6 +406,9 @@ export const jetHubSchema = Schema.object({
   // 「允许局域网访问」：默认关闭（暴露面变大必须是显式选择）。
   gatewayAllowLan: Schema.boolean().default(false),
   nativeWebSearchEnabled: Schema.boolean().default(true),
+  // 「ZCode 会话负载均衡」：默认开启（2026-10-30 用户要求）。关闭 = ZCode
+  // 回到「手动顺序首个可用账号」的既有语义。判据在 sanitizeSessionBalanceEnabled。
+  sessionBalanceEnabled: Schema.boolean().default(true),
   // 缺键 = 「仅侧栏」（升级前的默认就是显示那一行；改掉是显式动作）。
   // ⚠️ 用 `Schema.string()` 而不是 `Schema.union([...])`：schema 只负责类型，
   // 取值合法性由 `sanitizePanelEntry` 在**读写两侧**统一判（老契约后端不经过
@@ -454,6 +476,20 @@ export function sanitizeGatewayAllowLan(raw: unknown): boolean {
  * 要 API Key。
  */
 export function sanitizeNativeWebSearchEnabled(raw: unknown): boolean {
+  return raw !== false
+}
+
+/**
+ * 归一化「ZCode 会话负载均衡」开关（{@link JetHubState.sessionBalanceEnabled}）。
+ *
+ * 缺键语义为**启用**（2026-10-30 用户要求的默认方向）：老文档没有本键、或被
+ * 老版本代码整体重写时丢键，都回到「会话亲和 + 随机分摊」开启态 —— 与
+ * {@link sanitizeNativeWebSearchEnabled} 的判据同构（`raw !== false`）。
+ *
+ * ⚠️ 字符串 `'false'` **不算** `false`（与 panelEntry 那条同款）：那是脏数据，
+ * 不是用户意图。
+ */
+export function sanitizeSessionBalanceEnabled(raw: unknown): boolean {
   return raw !== false
 }
 
@@ -923,6 +959,20 @@ export function sanitizeAccounts(raw: unknown): ProviderAccountEntry[] {
       // 无有效项时写 `undefined`：`JSON.stringify` 会整个丢弃该键，
       // 故落盘/传输形态与「从未有过标记」完全一致（不留 `{}` 噪音）。
       modelRateLimits: limits,
+      /**
+       * 封号标记（issue IKS2MV）：时刻走与 `modelRateLimits` **同一个**谓词
+       * （有限、正、Date 范围内 —— 它会进 `new Date()`，脏值抛 `RangeError`），
+       * 报文只保留非空字符串并截断到 200 字符。
+       *
+       * ⚠️ 同样**显式写键名并置于 `...candidate` 之后**：备份文件是用户可编辑输入，
+       * 原样透传会让脏的 `policyBlockedAtMs` 直达选号判据 —— 而封号是**账号级**，
+       * 一条脏值就会让整个账号永久不可选（比逐模型的限流脏值更狠）。
+       */
+      policyBlockedAtMs: isValidResetAtMs(candidate.policyBlockedAtMs) ? candidate.policyBlockedAtMs : undefined,
+      policyBlockedMessage: typeof candidate.policyBlockedMessage === 'string'
+        && candidate.policyBlockedMessage.trim().length > 0
+        ? candidate.policyBlockedMessage.slice(0, 200)
+        : undefined,
       // ⚠️ 四个代理字段统一过闸（2026-10-25 审计 B2-1，见 `PROXY_FIELDS` 的注释）。
       // 与 `modelRateLimits` 同款：**显式写键名并置于展开之后**，否则
       // `candidate` 里的脏值会把清理结果整个覆盖回去（本文件第一版正是如此）。
@@ -1093,6 +1143,7 @@ class SettingsStore implements JetHubStore {
         gatewayEnabled?: unknown
         gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
+        sessionBalanceEnabled?: unknown
         // ⚠️ 老键，只为迁移而读（新文档不再写它）：见 sanitizePanelEntry 的第二参。
         sidebarEntryEnabled?: unknown
         panelEntry?: unknown
@@ -1119,6 +1170,8 @@ class SettingsStore implements JetHubStore {
       gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
       // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
       nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
+      // 老文档没这个键 → 启用（2026-10-30 用户要求的默认方向）。
+      sessionBalanceEnabled: sanitizeSessionBalanceEnabled(value.sessionBalanceEnabled),
       // 老文档没新键 → 按老布尔迁移（只有明确 false 才是「仅设置页」）；两者都没有 → 仅侧栏。
       panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
       // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
@@ -1170,6 +1223,10 @@ class SettingsStore implements JetHubStore {
       //    探针实测（老契约后端）：`setNativeWebSearchEnabled(false)` 的
       //    replace 载荷里根本没有本键，新实例读回 `true`。
       nativeWebSearchEnabled: state.nativeWebSearchEnabled !== false,
+      // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同因，是同一个
+      //    `replace` 整体替换陷阱）：漏键会让用户明确关闭的「ZCode 会话负载
+      //    均衡」在任何一次其它写入时被抹掉，重启后**静默回到开启**。
+      sessionBalanceEnabled: state.sessionBalanceEnabled !== false,
       // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同因，是同一个
       //    `replace` 整体替换陷阱的第二个受害者）：漏键会让用户改过的
       //    「面板入口」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
@@ -1276,6 +1333,32 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //    上游整套反代命名空间都不存在，且 `account.create` 生成的账号 ref 恒为
   //    `${provider.toUpperCase()}_ACCOUNT_${suffix}` —— 两者必须对上，否则本表认不出它。
   ['MODELSCOPE', 'modelscope'],
+  // ⚠️ **本 fork 独有**的 provider（qiniu，2026-10-29）—— 同款坑第 **六** 次。
+  // 漏加 = `QINIU_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新粘贴 Key）。
+  //
+  // ⚠️ 前缀取 `QINIU`：`account.create` 生成的账号 ref 恒为
+  //    `${provider.toUpperCase()}_ACCOUNT_${suffix}`（见 `qiniu-rpc.ts` 的
+  //    `qiniuSlotNamesOf`），两者必须对上，否则本表认不出它。
+  ['QINIU', 'qiniu'],
+  // ⚠️ **本 fork 独有**的 provider（monkeycode，2026-11-02）—— 同款坑又一次。
+  // 漏加 = `MONKEYCODE_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新粘贴 Key）。
+  //
+  // ⚠️ 前缀取 `MONKEYCODE`：`monkeycode-rpc.ts` 的 `monkeycodeSlotNamesOf`
+  //    生成的 ref 恒为 `MONKEYCODE_ACCOUNT_${suffix}`，两者必须对上。
+  ['MONKEYCODE', 'monkeycode'],
+  // ⚠️ 国际站（2026-11-02，2026-11-02 接入）—— script 同款坑第 **八** 次。
+  //    与 `MONKEYCODE` 是**超串关系**（`MONKEYCODEINTL` 以 `MONKEYCODE` 开头）——
+  //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组书写顺序无关
+  //    （与 `MINIMAX` / `MINIMAXINTL`、`AUTOCLAW` / `AUTOCLAWINTL` 同型）。
+  //    漏加 = 国际站账号在 `state.json` 缺失时**静默消失**（凭据还在
+  //    `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+  ['MONKEYCODEINTL', 'monkeycodeintl'],
+  // ⚠️ 百智云（`BAIZHI_ACCOUNT_*`，2026-11-02）：与 MONKEYCODE 系列**无前缀关系**，
+  //    但同样必须登记 —— 漏了它，`state.json` 里的账号列表损坏/缺失时，
+  //    从凭据 ref 反推 provider 会失败 ⇒ 账号在重启后**静默消失**。
+  ['BAIZHI', 'baizhi'],
   // ⚠️ 第 14 个 provider（gemini，2026-10-03）—— 同款坑第 **三** 次。
   // 漏加 = `GEMINI_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新授权）。
@@ -1302,6 +1385,17 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //    —— 漏加会让 `jet-hub-store.spec.ts` 的派生用例变红）。账号 ref 形态沿用
   //    统一规则 `CODELY_ACCOUNT_${suffix}`（`account.create` 的前缀规则）。
   ['CODELY', 'codely'],
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）—— 同款坑第 **八** 次。
+  // 漏加 = `MAGICREW_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+  ['MAGICREW', 'magicrew'],
+  // ⚠️ MagiCrew 国际站（`magicrewintl`，2026-11-01）—— 同款坑第 **九** 次。
+  // 漏加 = `MAGICREWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+  // ⚠️ 与 `MAGICREW` 是**超串关系**（`MAGICREWINTL` 以 `MAGICREW` 开头）——
+  //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组书写顺序无关
+  //    （与 `MINIMAX` / `MINIMAXINTL`、`AUTOCLAW` / `AUTOCLAWINTL` 同型）。
+  ['MAGICREWINTL', 'magicrewintl'],
   // ⚠️ 第 19 个 provider（autoclawintl，2026-10-20）—— 同款坑第 **七** 次。
   // 漏加 = `AUTOCLAWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
@@ -1427,7 +1521,21 @@ function accountFromCredentialRef(ref: string): ProviderAccountEntry | undefined
     enabled: true,
     credentialRef: ref,
     createdAt: Date.now(),
-    refreshable: true,
+    /**
+     * ⚠️ 恢复路径**不能一律写 `true`**（2026-11-03 PR #171 合并审计）。
+     *
+     * 这个值是「凭据能不能自动续期」的镜像：静态 Key 渠道（MonkeyCode 两站 /
+     * 百智云）在上游**没有任何 refresh 端点**，正常建号时都写 `false`
+     * （`monkeycode-rpc.ts` / `baizhi-rpc.ts` / `jet-hub-rpc.ts:5179,5339`）。
+     * 从残留凭据恢复时写 `true` ⇒ 卡片会显示「· 自动续期」，与事实相反，
+     * 且会把「凭据已过期」的排查方向带偏。
+     *
+     * 其余 provider 保持 `true`（绝大多数确有 refresh 端点）；将来新增
+     * 「静态材料」渠道时要把 id 一并加进来 —— 这是一张**只增不改**的例外表。
+     */
+    refreshable: provider !== 'monkeycode'
+      && provider !== 'monkeycodeintl'
+      && provider !== 'baizhi',
   }
 }
 
@@ -1447,7 +1555,12 @@ class FileStore implements JetHubStore {
     try {
       if (!existsSync(this.path)) return this.bootstrapFromCredentialRefs()
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown
-      if (typeof parsed !== 'object' || parsed === null) return undefined
+      // ⚠️⚠️ **文档形状坏掉也必须抛，不能返回 `undefined`**（2026-11-05 三审 P0-1）：
+      // `undefined` 与「全新安装」同形，而 `AccountPool.ensureLoaded()` 会把
+      // 空缓存当成已载入 ⇒ 下一次写入整体覆盖磁盘文档。
+      if (typeof parsed !== 'object' || parsed === null) {
+        throw new Error(`${this.path} 不是 JSON 对象（文档已损坏）`)
+      }
       const value = parsed as {
         accounts?: unknown
         disabledModels?: unknown
@@ -1459,6 +1572,7 @@ class FileStore implements JetHubStore {
         gatewayEnabled?: unknown
         gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
+        sessionBalanceEnabled?: unknown
         // ⚠️ 老键，只为迁移而读（新文档不再写它）：见 sanitizePanelEntry 的第二参。
         sidebarEntryEnabled?: unknown
         panelEntry?: unknown
@@ -1483,6 +1597,8 @@ class FileStore implements JetHubStore {
         gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
         // 老文档没这个键 → 启用，与升级前行为一致。
         nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
+        // 老文档没这个键 → 启用，与升级前行为一致。
+        sessionBalanceEnabled: sanitizeSessionBalanceEnabled(value.sessionBalanceEnabled),
         // 老文档没新键 → 按老布尔迁移（与 `SettingsStore` 同一判据）；两者都没有 → 仅侧栏。
         panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
         // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
@@ -1493,8 +1609,35 @@ class FileStore implements JetHubStore {
         providerClosed: sanitizeProviderClosed(value.providerClosed),
       }
     } catch (error) {
-      this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，本次以空列表启动: ${String(error)}`)
-      return undefined
+      // ⚠️⚠️ **不能吞成 `undefined`**（2026-11-05 三审 P0-1）：`undefined` 与
+      // 「全新安装」同形，而 `AccountPool.ensureLoaded()` 会把空缓存当成已载入
+      // ⇒ 下一次写入用空状态**整体覆盖**磁盘文档（账号 / 黑名单 / 关闭意图全丢）。
+      // 抛出去交给调用方：`ensureLoaded` 不置 `loaded`，RPC 层转成用户可见错误，
+      // 下一次访问会重试读盘。
+      this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败：${String(error)}`)
+      // ⚠️⚠️ **必须把路径与出路包进面向用户的消息**（2026-11-05 四审契约 P1-1）。
+      //
+      // 原始 `JSON.parse` 的 `SyntaxError.message` 形如
+      // `Expected property name or '}' in JSON at position 2 (line 1 column 3)`
+      // —— **不含路径**，而它会被 RPC 层原样透给用户
+      //（`{ code: 'jet-hub/handler-failed', message }`）。用户看到的就是一条
+      // **无法操作的英文解析错误**：既不知道坏的是哪个文件，也不知道该怎么办。
+      // 而 `AccountPool.ensureLoaded()` 被**全部**读方法调用 ⇒ 每次 RPC 都重新
+      // 读盘并抛错；19 个 `writeAccounts` 调用点写之前都要先读 ⇒ **写也全失败**
+      // ⇒ 面板能打开、能点「重试」，但重试**必然**失败，且用户无法添加账号、
+      // 改设置、开关供应商、改黑名单。
+      //
+      // ⚠️ 自查出路只有两条，文案里必须点名（两条都实测可用）：
+      // ① `backup.import` 的 **`replace`** 模式（`src/backup.ts` 只在 `merge`
+      //    分支调 `getStateSnapshot` ⇒ `replace` 不读当前状态，故可用）；
+      // ② 手动删除该文件（丢本地索引，但凭据本体在 `.credentials.yaml` 里）。
+      throw new Error(
+        `读取账号状态文件失败（${this.path}）：`
+        + `${error instanceof Error ? error.message : String(error)}。`
+        + '可在「备份恢复」里导入一份备份（选择「替换」模式），'
+        + '或删除该文件后重新添加账号。',
+        { cause: error },
+      )
     }
   }
 
@@ -1556,6 +1699,8 @@ class FileStore implements JetHubStore {
         gatewayAllowLan: false,
         // 同上：恢复出的文档不含原生搜索开关信息 → 启用（与全新安装一致）。
         nativeWebSearchEnabled: true,
+        // 同上：恢复出的文档不含会话负载均衡开关信息 → 启用（与全新安装一致）。
+        sessionBalanceEnabled: true,
         // 同上：恢复出的文档不含面板入口信息 → 默认「仅侧栏」（与全新安装一致）。
         panelEntry: DEFAULT_PANEL_ENTRY,
         // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。

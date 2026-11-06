@@ -1148,8 +1148,14 @@ export class AggregateAdapter extends LlmAdapter {
     // ⚠️ **不得无条件补写**：
     //   - 用户从未关闭过（黑名单为空）⇒ 凭空补写会**静默关闭整个 provider**（灾难且难察觉）；
     //   - 用户只是**逐个**关了某几个模型（黑名单没覆盖上快照）⇒ 不该被升级成整 provider 关闭。
-    // ⚠️ 补写是**异步落盘**，不阻塞本次目录返回；失败只记 warn（下次推导会再试）。
-    this.maintainProviderClosedState(previousIds)
+    //
+    // ⚠️⚠️ **必须 `await`**（2026-11-05 三审并发 P2-1）。原实现是
+    // fire-and-forget（`void writeDisabled(...).catch(...)`），于是「读黑名单
+    // → 算 missing → 写黑名单」这三步与用户操作**交错**：用户在看到补写完成前
+    // 打开某个聚合模型，会被这次补写**重新关掉**（窗口秒级，且无任何提示）。
+    // 代价是目录返回晚一次写盘（`setModelsDisabled` 走池的串行队列）；
+    // 正确性优先 —— 用户报障的正是「开关状态自己变」。
+    await this.maintainProviderClosedState(previousIds)
     // ⚠️⚠️ **目录落地后必须广播**（与其余 12 家适配器的 `onCatalogLoaded` 同一口径）。
     //
     // 不广播的后果（本条修的就是它）：客户端 `ModelCatalogDirectory` 在
@@ -1213,7 +1219,7 @@ export class AggregateAdapter extends LlmAdapter {
    * @param previousIds - **上一次**推导出的全量目录（含 `auto`）——
    *   用它判断「用户关的是整个 provider」而不是逐个关了某几个模型。
    */
-  private maintainProviderClosedState(previousIds: readonly string[]): void {
+  private async maintainProviderClosedState(previousIds: readonly string[]): Promise<void> {
     // ⚠️ **防御性取值**：`listDisabledModels` 是 `AccountPool` 的方法，而单测的池桩
     //    往往只实现被测到的那几个（`disabledModelsFor` / `getAvailableAccount`…）。
     //    这里缺方法时**直接跳过**（而不是抛）—— 否则本方法会把 67 条既有用例全打红
@@ -1243,12 +1249,16 @@ export class AggregateAdapter extends LlmAdapter {
       setModelsDisabled?: (provider: string, ids: readonly string[]) => Promise<void>
     }).setModelsDisabled
     if (typeof writeDisabled !== 'function') return
-    void writeDisabled.call(this.options.accountPool, AGGREGATE_PROVIDER, missing)
-      .catch((error: unknown) => {
-        this.ctx.logger?.warn?.(
-          `[aggregate] 补写「整个 provider 已关闭」的黑名单失败（下次目录推导会再试）：${String(error)}`,
-        )
-      })
+    // ⚠️ 失败只记 warn（下次目录推导会再试），但**必须 `await`**：
+    // 不 await 时「读黑名单 → 算 missing → 写黑名单」会与用户操作交错，
+    // 把用户刚打开的模型重新关掉（2026-11-05 三审并发 P2-1）。
+    try {
+      await writeDisabled.call(this.options.accountPool, AGGREGATE_PROVIDER, missing)
+    } catch (error: unknown) {
+      this.ctx.logger?.warn?.(
+        `[aggregate] 补写「整个 provider 已关闭」的黑名单失败（下次目录推导会再试）：${String(error)}`,
+      )
+    }
   }
 
   /**
@@ -1326,6 +1336,43 @@ export class AggregateAdapter extends LlmAdapter {
     //    ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它** —— 那是凭空造一个上游从未
     //    承诺的重置时刻（本仓库红线「绝不编造数字」）。
     'modelscope',
+    // ⚠️ qiniu（七牛云，2026-10-29）：`channel: true` ⇒ 必须进聚合目录，否则它的
+    //    模型**永不进聚合、静默不可见**。
+    //
+    // ⚠️⚠️ **本数组只是第一道门**（模型层归并）。决定「在不在候选表里」的是
+    //    `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS` —— 而 qiniu **刻意不进
+    //    那张表**：七牛云**没有余额端点**（用量只在控制台可见）⇒ 折算恒
+    //    `UNUSABLE`，与 cline / raccoon / gemini 同格。它已登记在
+    //    `expiry-runtime-parity.spec.ts` 的 `NOT_EXPIRY_WIRED` 豁免表里，
+    //    由「豁免理由被验证」那条用例钉住。
+    'qiniu',
+    // ⚠️ monkeycode（MonkeyCode，2026-11-02）：`channel: true` ⇒ 必须进本清单，
+    //    否则它的模型**永不进聚合目录、静默不可见**。
+    //
+    // ⚠️⚠️ **本数组只是第一道门**（模型层归并）。决定「在不在候选表里」的是
+    //    `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`。
+    //
+    //    📌 **2026-11-02 三审 F🟡-1 更正**：这段注释原写「monkeycode **刻意不
+    //    进**那张表」，**已过期** —— 三家（`monkeycode` / `monkeycodeintl` /
+    //    `baizhi`）早已补进 `WIRED_EXPIRY_PROVIDERS`（`aggregate-expiry.ts:259-261`）
+    //    与 `provider-expiry.ts` 的 `createProviderExpiry()`（折算原语
+    //    `monkeycodeExpiry`）。当时的理由「wallet 报文只有标量、没有到期时刻」只对
+    //    一半：真正接入的是**每日额度的重置时刻**（次 UTC+8 零点，`nextUtc8DayStartMs`），
+    //    不是积分包的到期时间 ⇒ 属「有余额但不下发到期时间」那一类：有额度即
+    //    `NEVER`、烧光即 `UNUSABLE`。
+    //    ⚠️ 该陷阱（只改本数组、忘了那张表 ⇒ 候选层被静默剔掉）在本仓库已复发 5 次。
+    'monkeycode',
+    // ⚠️ monkeycodeintl（MonkeyCode 国际站，2026-11-02 拆站）：与 `monkeycode`
+    //    **逐字同构** —— 同一套代码的另一部署（`proxy.monkeycode-ai.net` 实测
+    //    与 .com 一样对 `GET /v1/models` 回 405），`channel: true` ⇒ 必须进本清单。
+    //    ⚠️ **已进** `WIRED_EXPIRY_PROVIDERS`（同上，2026-11-02 三审 F🟡-1 更正），
+    //    折算原语与国内站共用（`monkeycodeExpiry`），但必须传 `MONKEYCODE_INTL`
+    //    —— 两站账号池不互通、域名不同（国际站 cookie 打国内站回 401）。
+    'monkeycodeintl',
+    // 百智云（2026-11-02）：`channel: true` ⇒ 必须进本清单，否则它在聚合目录里
+    // 永远不可见（**静默**）。它是 `x-api-key: sk-…` 的按量付费网关，
+    // 与 MonkeyCode 两站的 oma_ 凭据/每日额度完全无关，只是同源上游。
+    'baizhi',
     // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
     // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
     // ⚠️ 本数组**只是第一道门**（模型层归并）。真正决定「在不在候选表里」的是
@@ -1394,6 +1441,18 @@ export class AggregateAdapter extends LlmAdapter {
     //    ⇒ 目录层有它、轮换候选层没它；上游一旦开始下发到期时间，
     //    补一个折算原语 + 两处登记即可。
     'codely',
+    // ⚠️ Magicrew（超级麦吉，2026-10-29）：与 accio / officeace / autoclaw 同款，
+    //    **只加本数组不够** —— 决定候选表可见性的是 `aggregate-expiry.ts` 的
+    //    `WIRED_EXPIRY_PROVIDERS`，漏了它 ⇒ 折算恒 UNUSABLE ⇒ 该渠道静默消失。
+    'magicrew',
+    // ⚠️ **MagiCrew 国际版**（`magicrewintl`，2026-11-01）：与 `magicrew` 是
+    //    **两个 provider**（host 不同、账号体系物理隔离）⇒ 必须各自登记，
+    //    否则国际站的模型**永不进聚合目录、静默不可见**
+    //    （同款陷阱已复发五次：cline → accio → officeace → autoclaw → magicrew）。
+    //    ⚠️ 与 `magicrew` 一样**不只加本数组**：还要进 `aggregate-expiry.ts` 的
+    //    `WIRED_EXPIRY_PROVIDERS` 与 `provider-expiry.ts` 的条目，
+    //    且后者必须传 `MAGICREW_INTL`（传国内版会拿国内基址查国际账号余额）。
+    'magicrewintl',
   ])
 
   /**
@@ -1462,7 +1521,21 @@ export class AggregateAdapter extends LlmAdapter {
       if (disabled.has(model.key)) continue
       // ⚠️ 见方法头那张表：**只有**「所有候选都 default-rejected」才跳过。
       if (this.isAllDefaultsUnopened(model)) continue
-      entries.push({ provider, id: model.key, name: this.pickerNameOf(model), inputModalities: ['text', 'image'] })
+      /**
+       * issue #36：把**已经算出来**的窗口带上（供 OpenAI 网关 `/v1/models`
+       * 使用）。这里**刻意不触发新的解析** —— `contextWindowFor()` 可能要打
+       * 全部候选的上游，放在目录列表里会拖慢每一次 `listModels`；只读缓存，
+       * 未命中就不声明（与「未知」同义，不猜）。
+       */
+      const contextWindow = this.cachedContextWindowOf(model.key)
+      const entry: LlmModelInfo & { contextWindow?: number } = {
+        provider,
+        id: model.key,
+        name: this.pickerNameOf(model),
+        inputModalities: ['text', 'image'],
+        ...contextWindow === undefined ? {} : { contextWindow },
+      }
+      entries.push(entry)
     }
     return entries
   }
@@ -2624,6 +2697,26 @@ export class AggregateAdapter extends LlmAdapter {
    * @param modelKey - 虚拟模型 id（含 `auto`），仅用于记忆化。
    * @param candidates - 该虚拟模型的候选表（`auto` 传全池候选）。
    */
+  /**
+   * 只读缓存里的窗口判决；未命中或已过期返回 `undefined`（不触发解析）。
+   *
+   * 供 `listModels` 带出 `contextWindow` 用（issue #36）：目录列表要快，
+   * 不能为了窗口去逐候选打上游。
+   */
+  private cachedContextWindowOf(modelKey: string): number | undefined {
+    const remembered = this.contextWindowCache.get(modelKey)
+    if (remembered === undefined) return undefined
+    const now = this.options.now?.() ?? Date.now()
+    const ttl = remembered.degraded
+      ? this.options.contextWindowDegradedTtlMs ?? AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS
+      : this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS
+    if (now - remembered.at >= ttl) {
+      this.contextWindowCache.delete(modelKey)
+      return undefined
+    }
+    return remembered.window
+  }
+
   private async contextWindowFor(
     modelKey: string,
     candidates: readonly { provider: string; realId: string }[],

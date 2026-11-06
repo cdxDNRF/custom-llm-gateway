@@ -152,30 +152,28 @@ fi
 # 保留这段注释是为了让后人知道「这里曾经有过一个补丁、为什么没了」——
 # 否则下一个人看到 `searchViaQoder` 调 `prepareRequest` 会以为漏了什么。
 
-# ④f 本地补丁：腾讯风控指纹表补两条触发句（2026-10-20）
-# 腾讯网关以 400/11128 拒绝时的两条「客户端身份句」指纹：
-#   ① Claude Code v2.1.293 的 system 首句：
-#        "You are Claude Code, Anthropic's official CLI for Claude"
-#   ② DeepSeek Harness（DSH）自己的 system 首句：
-#        "You are an AI agent powered by DeepSeek Harness"
-#      后者是 2026-10-20 深夜**新收录**的：同一份 DSH 提示词本机记录
-#      14:10 与 22:42 均放行，23:25 起稳定 400 ⇒ 与 DSH 改版、账号、
-#      本网关都无关（部署窗口 22:42–23:25）。
-# 两条都是整句精确匹配 + 行首锚定、大小写不敏感；改任意一处即放行。
-# 补丁只**新增两条改写规则**，既有 ZCode 规则逐字节不变。
-PATCH_TCFP="$HERE/vendor-patches/tencent-content-fingerprints.patch"
-if [ -f "$PATCH_TCFP" ]; then
-  if git -C "$HERE" apply --check "$PATCH_TCFP" 2>/dev/null; then
-    git -C "$HERE" apply "$PATCH_TCFP"
-    echo "   ✓ 已应用腾讯指纹补丁（Claude Code + DSH）"
-  elif git -C "$HERE" apply --check --reverse "$PATCH_TCFP" 2>/dev/null; then
-    echo "   ✓ 腾讯指纹补丁已在（无需重复应用）"
-  else
-    echo "   ⚠️ 腾讯指纹补丁无法应用（上游可能已改 tencent-fingerprint.ts）" >&2
-    echo "      请核对后更新：vendor-patches/tencent-content-fingerprints.patch" >&2
-    exit 1  # ⚠️ 缺失该补丁 ⇒ 外部客户端整轮 400/11128
-  fi
-fi
+# ④f 腾讯风控指纹 —— **2026-11-06 起不再是本地补丁（上游已全覆盖）**
+#
+# 历史：2026-10-20 起我们本地维护过 `vendor-patches/tencent-content-fingerprints.patch`，
+# 补了 4 条腾讯 400/11128 的触发句（Claude Code 身份句/反馈句、DSH 身份句、
+# 以及**我们独有的** x-anthropic-billing-header）。
+#
+# 现在还需要的理由**已消失**：上游 `a5b3cd1`（2026-11-06）的指纹表有 **7 条**，
+# 逐条核过、我们需要的全在里面：
+#   1 ZCode gitStatus / 2 Claude 身份句 / 3 Claude 反馈句 / 4 DSH 身份句 /
+#   5 DSH Web 运行面 / 6 **Tokens prefixed with @...（DSH 新句）** /
+#   7 **x-anthropic-billing-header**（上游终于吸收了）
+#
+# ⇒ 补丁文件已删除，本步骤一并移除。
+#
+# ⚠️⚠️ **但「不维护补丁」不等于「不用核对」**：上游的指纹表是它自己实测的，
+# 腾讯随时会加新条目。症状固定是「buddy/workbuddy 整轮 400/11128，而其它渠道正常」。
+# 排查顺序：
+#   1. 抓一份出站 system（或直接拿报障客户端的 system）
+#   2. 逐句二分，确认哪一句被拦（**必须逐格实发**，不能凭直觉 ——
+#      实测过「整句被拦、前后半句各自放行」这种跨句边界的字面量）
+#   3. 若上游还没有该句 ⇒ 重新建补丁；若上游已有 ⇒ 升级 vendor 即可
+# 详见 `docs/tencent-fingerprints.md`。
 
 echo "⑤ 类型检查（自有代码）…"
 if [ ! -x ./node_modules/.bin/tsc ]; then

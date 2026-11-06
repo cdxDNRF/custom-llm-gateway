@@ -72,7 +72,10 @@ node -e '
   // ⚠️ 加新项时**必须写进这里**，否则下次 sync-vendor 覆盖掉也没人知道。
   const checks = [
     // 腾讯风控指纹：6 条。上游陆续吸收了 5 条，计费头那条至今仍是我们独有。
+    // ⚠️ 2026-11-06 变更：指纹补丁已退役（上游 a5b3cd1 覆盖全部 7 条），
+    // 故这几条现在校验的是「上游自带是否还在」—— 上游若把某条删掉，这里会先报。
     ["678ebf7 计费头指纹",      "vendor/src/openai-gateway/tencent-fingerprint.ts", "x-anthropic-billing-header"],
+    ["1106 DSH @路径句（新）",   "vendor/src/openai-gateway/tencent-fingerprint.ts", "Tokens prefixed with @ are paths the user explicitly referenced"],
     ["eca0b0c ZCode 指纹",      "vendor/src/openai-gateway/tencent-fingerprint.ts", "Main branch (you will usually use this for PRs)"],
     ["e348519 Claude 身份句",   "vendor/src/openai-gateway/tencent-fingerprint.ts", "official CLI for Claude"],
     ["92dd6ef Claude 反馈句",   "vendor/src/openai-gateway/tencent-fingerprint.ts", "To give feedback, users should report the issue at"],

@@ -115,15 +115,106 @@ export const ANALYZE_IMAGE_TOOL = 'analyzeImage'
 /**
  * 能**原生收图**的 codearts 模型（`/v1/model/builtin` 的 `supports_images` 实测）。
  *
- * | 模型 | `supports_images` | `model_category` |
- * |---|---|---|
- * | `kimi-k2.6-vl` / `Qwen3-VL-235B` | **true** | 图片理解 |
- * | `glm-5.3` / `GLM-5.2` / `openpangu-*` / `deepseek-v4.1-flash` | false | 文本生成 |
+ * | 模型 | `supports_images` | `model_category` | 实际能收图？ |
+ * |---|---|---|---|
+ * | `kimi-k2.6-vl` / `Qwen3-VL-235B` | **true** | 图片理解 | ✅ |
+ * | `deepseek-v4.1-flash-1017` / `deepseek-v4.1-flash` | false（**目录过期**） | 文本生成 | ✅（wire 实测，见 {@link CODEARTS_IMAGE_CAPABLE_OVERRIDES}） |
+ * | `glm-5.3` / `GLM-5.2` / `openpangu-*` | false | 文本生成 | ❌ 406 |
  *
- * 其余模型发图必被上游拒：
+ * 目录未标 `supports_images` 的模型发图会被上游拒：
  * `{"error_code":"InferHub.001001020.406","error_msg":"The request model is not multimodal"}`。
+ *
+ * ## ⚠️ 本表已降级为**兜底**，权威来源是远端目录（2026-10-26 修）
+ *
+ * 上游会**持续新增/替换**多模态模型，而这张静态表**不会自己更新** ⇒ 新模型
+ * 一旦上线就必然被判成「不能收图」：`codeartsAcceptsImage` 返回 false ⇒
+ * `inputModalities` 声明成 `['text']` ⇒ DSH 在**图片入库阶段**就拒掉，请求根本
+ * 发不到上游。真实报障：`kimi-k3` 官方支持图片，但本表里没有它。
+ *
+ * ⇒ 现由 {@link setCodeartsImageModels} 把远端目录里 `supports_images: true` 的
+ * id 灌进来，判据取**并集**（目录 ∪ 本表 ∪ 覆盖表）。
  */
 export const CODEARTS_VL_MODELS: readonly string[] = ['kimi-k2.6-vl', 'Qwen3-VL-235B']
+
+/**
+ * 目录 `supports_images` 仍是 false、但 **wire 实测能收图**的主模型。
+ *
+ * ## 2026-11-05 真机实测（`image_url` 直发 `chat/completions`，4×4 纯色 PNG）
+ *
+ * | 模型 | 图片 | 结果 |
+ * |---|---|---|
+ * | `deepseek-v4.1-flash-1017` | 红 | **200**，正文「红色」 |
+ * | `deepseek-v4.1-flash` | 蓝 | **200**，正文「蓝色」 |
+ * | `glm-5.3`（对照） | — | **406** `The request model is not multimodal` |
+ *
+ * ⇒ 目录的 `supports_images: false` 对这两条**是过期数据**；而 DSH 的图片准入
+ * 只看 `inputModalities`，声明成 `['text']` 会让图**在入库阶段**被换成占位文字
+ * （插件侧根本没机会发出去）。
+ *
+ * ## ⚠️ 为什么不放进 {@link CODEARTS_VL_MODELS}
+ *
+ * 那张表同时被 {@link codeartsIsVisionModel} 当「专职 VL」判据 —— 放进去会把
+ * 这两个**主模型**的 `analyzeImage` 摘掉（它们主业是主模型，不是专职识图）。
+ * 所以这里另起一张表，只影响「能不能收图」，不影响「要不要挂识图工具」。
+ */
+export const CODEARTS_IMAGE_CAPABLE_OVERRIDES: readonly string[] = [
+  'deepseek-v4.1-flash-1017',
+  'deepseek-v4.1-flash',
+]
+
+/**
+ * 远端 `/v1/model/builtin` 里 `supports_images` 为 true 的模型 id（小写归一）。
+ *
+ * `undefined` = **目录尚未加载成功过**（离线 / 请求失败）⇒ 判据回退到静态表。
+ *
+ * ⚠️ **只增不减**：空集不清空（见 {@link setCodeartsImageModels}）、「请求失败
+ * 不灌入」由调用方（`models.ts`）负责 —— 一次网络抖动就让「刚刚还能收图」的
+ * 模型变不能收，是不可接受的抖动。
+ */
+let catalogImageModels: ReadonlySet<string> | undefined
+
+/**
+ * 灌入远端目录里**能收图**的模型 id（由 `models.ts` 在目录拉取成功后调用）。
+ *
+ * ## ⚠️ 为什么用「注入」而不是让本模块 import 目录
+ *
+ * 本模块是**无依赖叶子**（理由见模块头：两侧消费者分居依赖图两端，import 会成环）。
+ * 目录在 `models.ts` 里，而 `models.ts` 反过来依赖本模块的判据 ⇒ 只能由
+ * `models.ts` **单向**把结果灌进来，本模块绝不反向 import。
+ *
+ * ## ⚠️ 「只增不减」由**本函数**兑现，不是调用方（2026-10-31 审计 P2 修）
+ *
+ * **空集不清空**：`ids` 归一化后为空、而当前已有非空集合时，**保持原集合不变**。
+ * 理由：`builtinModels: []`（或 AgentCenter 列表为空）可能是「请求成功但该账号
+ * 无下发」的合法状态，也可能只是上游该端点**临时**漏发 —— 无论哪种，把它当成
+ * 「确认全部下架」去清空，都会让所有目录派生的多模态模型瞬间失去收图能力，
+ * 只剩静态表两个兜底；而「真的全部下架」的代价只是发图被上游 406 拒（改动前
+ * 的既有行为）。两害相权，宁可陈旧、不清空。
+ *
+ * ⚠️ 调用方**仍然**负责「请求失败不调用」（`models.ts` 在 `snapArr === undefined`
+ * 时跳过）—— 本函数只兑现「成功但空 ⇒ 不清空」这半边。
+ *
+ * @param ids - 远端 `supports_images === true` 的模型 id（原始大小写均可）
+ */
+export function setCodeartsImageModels(ids: Iterable<string>): void {
+  const next = new Set<string>()
+  for (const id of ids) {
+    if (typeof id !== 'string') continue
+    const key = id.trim().toLowerCase()
+    if (key.length > 0) next.add(key)
+  }
+  if (next.size === 0 && catalogImageModels !== undefined && catalogImageModels.size > 0) return
+  catalogImageModels = next
+}
+
+/**
+ * 清掉已灌入的目录集合（**仅供单测隔离**）。
+ *
+ * ⚠️ 生产不要调用：那会让判据退回静态表，等于把动态能力关掉。
+ */
+export function resetCodeartsImageModels(): void {
+  catalogImageModels = undefined
+}
 
 /**
  * `analyzeImage` 用哪个 VL 模型。
@@ -135,9 +226,30 @@ export const CODEARTS_VL_MODELS: readonly string[] = ['kimi-k2.6-vl', 'Qwen3-VL-
  */
 export const CODEARTS_VISION_MODEL = 'kimi-k2.6-vl'
 
-/** 该模型能否原生收图（大小写不敏感 —— 上游目录里两种写法都出现过）。 */
+/**
+ * 该模型能否原生收图（大小写不敏感 —— 上游目录里两种写法都出现过）。
+ *
+ * 判据 = **远端目录 ∪ 静态表**（目录未加载时只剩静态表）：
+ *
+ * 1. 先查 {@link setCodeartsImageModels} 灌进来的目录集合 ⇒ 上游新上的多模态
+ *    模型（如 `kimi-k3`）**自动跟随**，无需改代码；
+ * 2. 再查 {@link CODEARTS_VL_MODELS} ⇒ 目录未加载成功过时的兜底。
+ *
+ * ## ⚠️ 为什么取**并集**而不是「目录加载后以目录为准」
+ *
+ * 以目录为准的话，只要上游某天**不再下发** `supports_images` 字段（或改成
+ * `false`），`kimi-k2.6-vl` 就会**从能收图变成不能** ⇒ `analyzeImage` 借它识图
+ * 的整条链路当场失效，而症状是「工具莫名其妙不工作了」。
+ *
+ * 取并集的代价：上游**真的下线**某个静态表里的模型时，本判据仍会说它能收图，
+ * 发图会被上游 406 拒 —— **但那正是改动前的行为**，不引入新故障。两害相权，
+ * 宁可保留旧行为、也不新增一条静默失效路径。
+ */
 export function codeartsAcceptsImage(modelId: string): boolean {
   const key = modelId.trim().toLowerCase()
+  if (catalogImageModels !== undefined && catalogImageModels.has(key)) return true
+  // 目录 `supports_images` 过期、但 wire 实测能收图的主模型（2026-11-05）。
+  if (CODEARTS_IMAGE_CAPABLE_OVERRIDES.some((id) => id.toLowerCase() === key)) return true
   return CODEARTS_VL_MODELS.some((id) => id.toLowerCase() === key)
 }
 
@@ -147,28 +259,76 @@ export function codeartsVisionModel(): string {
 }
 
 /**
+ * 「专用 VL 模型」的 id 形态：`VL` 作为独立的一段（`kimi-k2.6-vl` / `Qwen3-VL-235B`）。
+ *
+ * ⚠️ **必须大小写不敏感**：真机 `kimi-k2.6-vl` 是**小写** `-vl`，而 `Qwen3-VL-235B`
+ *    是大写 —— 只认大写的判据会让前者漏网（这个坑在别处已踩过，见
+ *    `parseModelInfo` 的 `-VL` 过滤注释）。
+ */
+const VL_ID_PATTERN = /(?:^|-)vl(?:-|$)/i
+
+/**
+ * 该模型是不是**专用 VL 模型**（自己就是拿来识图的那个）。
+ *
+ * ## ⚠️ 与 {@link codeartsAcceptsImage} 是**两个不同的概念**（2026-10-26）
+ *
+ * 很容易混为一谈，但混了就会出事：
+ *
+ * | | 含义 | 用途 |
+ * |---|---|---|
+ * | `codeartsAcceptsImage` | 这个模型**能不能收图** | `inputModalities`、发图闸门 |
+ * | `codeartsIsVisionModel` | 这个模型是不是**专职识图的 VL 模型** | 要不要给它挂 `analyzeImage` |
+ *
+ * 上游新一代多模态主模型（如 `kimi-k3`）**两头都沾**：它能收图（目录
+ * `supports_images: true`），但它**不是**专用 VL 模型 —— 它的主业是当主模型。
+ * 若用「能收图」当作「不该挂工具」的判据，这类模型就会**拿不到识图工具**，
+ * 症状是「模型明明支持图片，却没有 analyze_image 可用」。
+ *
+ * ⇒ 挂不挂工具只看「是不是专职 VL」，与「能不能收图」**解耦**。
+ */
+export function codeartsIsVisionModel(modelId: string): boolean {
+  const key = modelId.trim()
+  if (VL_ID_PATTERN.test(key)) return true
+  // 兜底：将来若出现 id 形态不带 VL 段、但确实登记为专用识图模型的
+  return CODEARTS_VL_MODELS.some((id) => id.toLowerCase() === key.toLowerCase())
+}
+
+/**
  * 判断**当前路由**该不该看到 `analyzeImage`。
  *
  * 判据三条，缺一不可：
  * 1. 路由 provider 是 `codearts`（别家的图片直发上游，不需要这个中转）；
- * 2. 该模型**收不了图**（VL 模型自己就能看，给它这个工具是多余的）；
+ * 2. 该模型**不是专用 VL 模型**（专职识图的模型自己就能看，给它这个工具是多余的）；
  * 3. 路由信息可解析（拿不到就**不挂** —— 宁可少一个工具，也不要挂一个用不了的）。
+ *
+ * ## ⚠️ 第 2 条曾用「**收不了图**」当判据，是错的（2026-10-26 修）
+ *
+ * 那时写作 `!accepts(model)`。对老模型（文本模型 `glm-5.3` 收不了图 ⇒ 挂；
+ * VL 模型 `kimi-k2.6-vl` 收得了 ⇒ 不挂）**恰好等价**，所以一直没暴露。
+ *
+ * 但上游新一代多模态主模型（如 `kimi-k3`）**能收图却不是专用 VL 模型** ⇒
+ * `!accepts` 判成「不需要工具」⇒ 它**拿不到 `analyzeImage`**，症状是
+ * 「官方说支持图片，却只有直发、没有识图工具可用」。
+ *
+ * ⇒ 改用 {@link codeartsIsVisionModel}：只看「是不是专职识图的 VL」，
+ *   与「能不能收图」**解耦**。文本模型照旧挂，`kimi-k3` 这类也挂，
+ *   只有 `kimi-k2.6-vl` / `Qwen3-VL-235B` 这类专职 VL 不挂。
  *
  * ⚠️ 本函数是**唯一定义处**：工具注册（`analyze-image.ts`）、执行期断言、
  * 以及注册期逐请求摘除（{@link withAnalyzeImageScoping}）三处共用它。
  *
  * @param provider - 路由的 provider id
  * @param model - 路由的 model id
- * @param accepts - 「该模型能否收图」的判据（默认用 codearts 的实现；注入以便单测）
+ * @param isVision - 「该模型是否专用 VL 模型」的判据（默认用 codearts 的实现；注入以便单测）
  */
 export function shouldOfferAnalyzeImage(
   provider: string | undefined,
   model: string | undefined,
-  accepts: (id: string) => boolean = codeartsAcceptsImage,
+  isVision: (id: string) => boolean = codeartsIsVisionModel,
 ): boolean {
   if (provider !== CODEARTS_PROVIDER) return false
   if (model === undefined || model.length === 0) return false
-  return !accepts(model)
+  return !isVision(model)
 }
 
 /** {@link stripAnalyzeImageTool} 读到的字段（`GenerateOptions` 的最小形状）。 */

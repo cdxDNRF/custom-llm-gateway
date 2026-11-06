@@ -67,6 +67,24 @@ export interface MinimaxCredential {
    * ⚠️ 同样**不是令牌字段** ⇒ 续期必须由 `inheritMinimaxIdentity` 继承。
    */
   user_id?: string
+  /**
+   * 历史代际的 refresh_token（**新→旧**，最多 3 条；2026-10-24 本地试验版新增）。
+   *
+   * ## 为什么留它
+   *
+   * refresh_token 是**单次有效、每次轮换**的：grant 响应丢失（网络断在服务端
+   * 已轮换之后）时，手上的 RT 已经死了 ⇒ 账号报废只能重登。留最近几代旧 RT，
+   * `invalid_grant` 时逐把回退试一次 —— 上游若只作废被用的那条而非整族，就能救回。
+   * 全失败再走终态，**只多花几次注定失败的请求，无新增风险**（实验特性，
+   * 上游语义未证实；journal 会记录每次抢救结果）。
+   *
+   * ⚠️ **不是令牌字段**（是历史令牌的**记录**）⇒ 续期时由
+   * `inheritMinimaxIdentity` 的 `{ ...previous, ...refreshed }` 自然继承，
+   * 不需要单独透传；由续期路径（`grantOnce`）自己维护这个数组。
+   *
+   * ⚠️ 调用方不写它也能正常工作（`parseMinimaxCredential` 对未知字段透明透传）。
+   */
+  previous_refresh_tokens?: string[]
 }
 
 /**
@@ -141,10 +159,58 @@ export function minimaxCredentialExpiresAtMs(
   return decodeJwtExpMs(credential.access_token)
 }
 
-/** 凭据是否已过期（无过期信息时保守视为未过期）。 */
+/**
+ * 凭据是否**已过期**（无过期信息时保守视为未过期）。
+ *
+ * ⚠️⚠️ **生产代码里已无消费者**（2026-10-27 审计确认）：唯一的调用点
+ * （adapter 的请求前预判）已改为 {@link isMinimaxExpiringWithin}，因为
+ * 「过期了才续」会让用户的请求撞在**正在死掉**的 token 上（PR 描述的原始缺陷）。
+ *
+ * 保留它的两个理由，且都**不是**「以后可能用到」：
+ *
+ * 1. **它是旧判据的对照物**：`tests/unit/minimax-renew-mechanism.spec.ts` 用
+ *    「剩余 30s 时旧判据说不用续、新判据说该续」来锁住这次收紧**真的发生了** ——
+ *    删掉它，那条断言就失去对照组，退化成「只测新函数」的恒真式。
+ * 2. 语义纯粹、无副作用，删掉也不能证明任何东西被简化。
+ *
+ * ⚠️ 因此：**不要再把它接回请求路径**（那正是 2026-10-27 审计打穿的变异 W3：
+ *   把 `isMinimaxExpiringWithin` 换回它，全量测试原本全绿）。
+ *   现在由上面第 1 条用例守着。
+ */
 export function isMinimaxExpired(credential: MinimaxCredential, nowMs = Date.now()): boolean {
   const expiresAt = minimaxCredentialExpiresAtMs(credential)
   return expiresAt !== undefined && nowMs >= expiresAt
+}
+
+/**
+ * 凭据剩余有效期是否不足 `minValidityMs`（请求前预判）。
+ *
+ * 与 {@link isMinimaxExpired} 的差别：过期前一小段窗口也算「该续了」——
+ * 让请求路径在 token **临死前**就续掉，而不是等 401 回来再补
+ *（官方 `oauth-core` 的 `getAccessToken({minValidityMs})` 同一语义）。
+ *
+ * ⚠️ **读不到过期时间（`undefined`/NaN）视为「该续」**：与 `shouldRefreshNow`
+ *（`src/expiry-sync.ts`）的 fail-open 口径一致；一次成功续期就会写上
+ * `expires_at`，不会持续触发。
+ *
+ * ⚠️⚠️ **但 fail-open 有一个真实代价**（2026-10-27 审计）：adapter 里
+ * `await this.options.refresh()` **没有 try/catch** ⇒ 对于「凭据缺 / 非法
+ * `expires_at`」的账号，一旦这次续期失败，**上游请求一次都不会发**，
+ * 而旧判据（`isMinimaxExpired`）会正常放行、让请求用掉最后那段时间。
+ * 生产写入点（`parseMinimaxTokenGrant` / `inheritMinimaxIdentity`）都会写
+ * `expires_at`，故正常路径不可达；可达面是「备份导入 / 第三方转换 / 手工编辑」。
+ * ⇒ 修法在 **adapter 侧**（续期失败时降级为「用现有凭据继续发」），
+ *   不放宽本函数的 fail-open（那会让「读不到死线」变成「永不预判」，
+ *   等于回到旧判据）。
+ */
+export function isMinimaxExpiringWithin(
+  credential: MinimaxCredential,
+  minValidityMs: number,
+  nowMs = Date.now(),
+): boolean {
+  const expiresAt = minimaxCredentialExpiresAtMs(credential)
+  if (expiresAt === undefined || !Number.isFinite(expiresAt)) return true
+  return expiresAt - nowMs <= minValidityMs
 }
 
 /** 凭据是否可续期（必须有 refresh_token）。 */
