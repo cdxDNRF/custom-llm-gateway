@@ -72,6 +72,14 @@ export interface GeminiCatalogModel {
    * `gemini-3.8-flash` 正是需要后缀的）。探测会写入实测值。
    */
   needsEffortSuffix?: boolean
+  /**
+   * **固定档位**（本仓库扩展，2026-11-09）。
+   *
+   * 非 `undefined` 时，适配器**忽略外部 effort**、恒用这个 tier 拼 upstream 名。
+   * 用于「档位写进模型名」的条目（`claude-opus-5-5-high` 等），
+   * 保证「选哪个名字就跑哪一档」，不受 DSH 的档位下拉影响。
+   */
+  pinnedTier?: 'low' | 'medium' | 'high'
 }
 
 /** 已知档位后缀（与 vendor 的 `GEMINI_EFFORT_IDS` 一致）。 */
@@ -137,6 +145,88 @@ export function parseAvailableModels(payload: unknown): GeminiCatalogModel[] {
     if (existing === undefined || contextWindow > existing.contextWindow) byId.set(id, entry)
   }
   return [...byId.values()]
+}
+
+/**
+ * 把「一个模型 + 档位下拉」**展开成 N 个独立模型条目**（2026-11-09，用户要求）。
+ *
+ * ## 为什么要有这一步
+ *
+ * 原先的做法是：每个模型占**一个**条目，档位放在 `effortOptions` 下拉里
+ * （DSH 的模型名后面显示「Medium」，点开再选 low/high）。用户明确要求改成
+ * 「**每个模型分 low/medium/high 三种，共 12 个**」—— 即档位写进模型名，
+ * 在模型列表里直接可见可选，不必再进二级下拉。
+ *
+ * ## 关键事实（本机实测，2026-11-09；`daily-cloudcode-pa` + Pro 账号）
+ *
+ * 档位**只**由上游模型名的后缀决定，`thinkingBudget` 与它**解耦**：
+ *
+ * | 测试 | 结果 |
+ * |---|---|
+ * | `claude-opus-5-5-high` + budget(high) | ✅ 200 |
+ * | `claude-opus-5-5-high` + budget(low)  | ✅ 200 |
+ * | `claude-opus-5-5-low`  + budget(high) | ✅ 200 |
+ *
+ * ⇒ 后缀决定"上游用哪一档"，budget 只是附带旋钮。故每个展开条目只要
+ * **固定自己的 tier** 即可，不需要把 budget 也绑死。
+ *
+ * ## 哪些模型才展开（**逐档实测**，不是按名字猜）
+ *
+ * | 模型族 | 裸名 | `-low`/`-medium`/`-high` |
+ * |---|---|---|
+ * | `gemini-3.8-flash` | ❌ 404 | ✅ 三档全通 |
+ * | `claude-opus-5-5` | ❌ 404 | ✅ 三档全通 |
+ * | `claude-sonnet-5-5` | ❌ 404 | ✅ 三档全通 |
+ * | `gemini-3-flash` / `gemini-2.5-pro` / `gemini-*-flash-lite` | ✅ 裸名可用 | ❌ **三档全 404** |
+ *
+ * ⇒ **不能对所有模型展开**：那些"只认裸名"的族展开出来会全部 404。
+ * 判据用探测阶段写回的 `needsEffortSuffix`（实测值，不是猜的）。
+ *
+ * ⚠️ 未探测过的条目（`needsEffortSuffix === undefined`）**不展开** ——
+ * 宁可保守：展开错了会让用户点到必然失败的模型，而不展开只是少 2 个选项。
+ */
+export function expandTiers(models: readonly GeminiCatalogModel[]): GeminiCatalogModel[] {
+  /** 要展开的档位（`tiered` / `extra-low` 不在用户要求的三档里）。 */
+  const TIERS = ['low', 'medium', 'high'] as const
+  const out: GeminiCatalogModel[] = []
+  for (const model of models) {
+    /**
+     * ⚠️⚠️ **幂等：已经展开过的条目不能再展开一次**（否则
+     * `claude-opus-5-5-high` 会变成 `claude-opus-5-5-high-low`）。
+     * 判据是 `pinnedTier` 已存在 —— 展开出来的条目都带它。
+     */
+    if (model.pinnedTier !== undefined) {
+      out.push(model)
+      continue
+    }
+    // 只有「必须带后缀」的族才展开（见上方实测对照表）。
+    if (model.needsEffortSuffix !== true) {
+      out.push(model)
+      continue
+    }
+    /** 展示名去掉上游附带的 `(Medium)` 之类括号，再由我们统一拼档位。 */
+    const baseName = model.name.replace(/\s*\((?:low|medium|high|tiered|extra-low)\)\s*$/i, '').trim()
+      || model.id
+    for (const tier of TIERS) {
+      out.push({
+        ...model,
+        // ⚠️ id 带档位后缀：它同时是「模型唯一标识」和「上游准入钥匙」。
+        id: `${model.id}-${tier}`,
+        name: `${baseName} (${tier[0]!.toUpperCase()}${tier.slice(1)})`,
+        // ⚠️ **必须清掉 `effortOptions`**：档位已经写进模型名了，
+        //    再留一个下拉就是「同一件事两处可选」且可能互相矛盾
+        //    （用户选 `-high` 的模型、下拉又选 low，症状极难解释）。
+        effortOptions: undefined,
+        defaultEffort: undefined,
+        /**
+         * **固定档位**：适配器据此拼 upstream，忽略（或不许）外部 effort。
+         * 见 `vendor/src/gemini.ts` 的 `pinnedTier` 支持。
+         */
+        pinnedTier: tier,
+      })
+    }
+  }
+  return out
 }
 
 /** 探测结果缓存文件（落盘，避免每次启动都重新探测）。 */

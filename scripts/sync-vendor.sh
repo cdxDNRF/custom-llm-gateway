@@ -119,10 +119,21 @@ fi
 # 上游的 Gemini 模型表**硬编码 1 个模型**（用户拍板"不拉远端目录"），
 # 而实测账号真正可用 15 个（含 claude-sonnet-4-6 / claude-opus-4-6-thinking）。
 # 我们加了两处**增量**改动让它支持动态目录：
-#   · gemini-adapter: 新增 `modelsProvider` 选项（缺省仍走静态表，零行为变化）
-#   · gemini.ts: `geminiModelSpec` 新增第三参 `allowedModelIds`
-#     （缺省退化为"只允许 gemini-3.8-flash"，与改动前逐字节一致）
+#   · gemini-adapter: 新增 `modelsProvider` 选项（缺省仍走静态表，零行为变化）；
+#     查表改为「先按完整 id、再回退 canonical」（档位写进模型名的条目需要）
+#   · gemini.ts:   `geminiModelSpec` 新增第三参 `allowedModels`
+#     （缺省退化为"只允许 gemini-3.8-flash"，与改动前逐字节一致）；
+#     支持 `pinnedTier`（固定档位，忽略外部 effort）
+#   · gemini-messages: `maxOutputTokens` 必须 > `thinkingBudget`（Claude 系硬要求）
 # 补丁以文件形式维护（改一处要动多行，sed 不适用）。
+#
+# ⚠️ 2026-11-09 新增「档位展开」相关改动（用户要求 12 个独立模型条目）：
+#    目录层 `src/core/gemini-catalog.ts::expandTiers` 把
+#    `claude-opus-5-5` → `-low`/`-medium`/`-high` 三条；vendor 侧配合三处：
+#    ① adapter 查表先按完整 id（否则带后缀的 id 永远查不到）
+#    ② `geminiModelSpec` 校验同样先按完整 id（否则判"不在目录中"）
+#    ③ `upstream` 在 exact 命中时直接用完整 id（否则拼成 `-high-high`）
+#    这三处是本轮实际踩坑后加的，缺任一都会让 12 个条目全部 502。
 PATCH_FILE="$HERE/vendor-patches/gemini-dynamic-models.patch"
 if [ -f "$PATCH_FILE" ]; then
   if git -C "$HERE" apply --check "$PATCH_FILE" 2>/dev/null; then

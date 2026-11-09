@@ -861,8 +861,10 @@ export async function createGeminiProvider(
    */
   let catalogModels: readonly GeminiCatalogModel[] = []
   try {
-    const { readCatalogCache } = await import('../core/gemini-catalog.js')
-    catalogModels = readCatalogCache(dataDir) ?? []
+    const { readCatalogCache, expandTiers } = await import('../core/gemini-catalog.js')
+    // ⚠️ 读缓存后**再展开一次**（幂等）：老缓存里存的是「未展开」的目录，
+    //    新代码要按 12 条暴露；已展开过的条目带 `pinnedTier`，不会重复展开。
+    catalogModels = expandTiers(readCatalogCache(dataDir) ?? [])
     if (catalogModels.length > 0) {
       gateway.logger.info(`Gemini 动态目录：已载入 ${catalogModels.length} 个模型（本地缓存）`)
     }
@@ -1011,7 +1013,7 @@ export async function createGeminiProvider(
      *    故结果**落盘缓存**，只在用户显式点「重拉」时才跑。
      */
     refreshModelsImpl: async () => {
-      const [{ fetchAvailableModels, writeCatalogCache, looksDeprecated }, { GEMINI_ENDPOINTS }] =
+      const [{ fetchAvailableModels, writeCatalogCache, looksDeprecated, expandTiers }, { GEMINI_ENDPOINTS }] =
         await Promise.all([
           import('../core/gemini-catalog.js'),
           import('../../vendor/src/gemini.js') as Promise<{ GEMINI_ENDPOINTS: readonly string[] }>,
@@ -1130,8 +1132,23 @@ export async function createGeminiProvider(
       }
 
       if (usable.length === 0) throw new Error('全部候选模型都探测失败，保留原目录')
-      catalogModels = usable
-      writeCatalogCache(dataDir, usable)
+      /**
+       * **把「一个模型 + 档位下拉」展开成独立模型条目**（2026-11-09，用户要求）。
+       *
+       * 探测写回的 `needsEffortSuffix` 是**实测值**，`expandTiers` 只对
+       * `=== true` 的族展开（三档实测全通的那 3 个）；只认裸名的族保持单条目
+       * —— 展开它们会得到一堆必然 404 的模型名。
+       *
+       * ⚠️ 缓存里存的是**展开后**的目录：下次启动直接读出 12 条，
+       *    不必重探测（探测有成本，每个模型一次真实推理）。
+       */
+      const expanded = expandTiers(usable)
+      catalogModels = expanded
+      writeCatalogCache(dataDir, expanded)
+      gateway.logger.info(
+        `Gemini 目录已更新：${expanded.length} 个模型条目（探测可用 ${usable.length} 个，`
+        + `其中 ${usable.filter((m) => m.needsEffortSuffix === true).length} 个按档位展开）`,
+      )
       gateway.logger.info(`Gemini 目录已更新：${usable.length} 个可用模型（候选 ${candidates.length} 个）`)
       return { count: usable.length }
     },

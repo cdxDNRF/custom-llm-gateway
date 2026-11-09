@@ -546,12 +546,29 @@ export function geminiModelSpec(
    * 接线侧把远端目录（`fetchAvailableModels`）的 id 集合传进来，即可支持
    * 账号真正可用的全部模型（实测 15 个，含 Claude 系列）。
    */
-  allowedModels?: readonly { id: string; needsEffortSuffix?: boolean }[],
+  allowedModels?: readonly {
+    id: string
+    needsEffortSuffix?: boolean
+    /** **固定档位**（本仓库扩展）：非空时忽略 `effort`，恒用该档。 */
+    pinnedTier?: 'low' | 'medium' | 'high'
+  }[],
 ): GeminiModelSpec {
-  const canonical = geminiCanonicalModelId(modelId)
   const allowed = allowedModels === undefined || allowedModels.length === 0
     ? [{ id: GEMINI_UPSTREAM_FLASH, needsEffortSuffix: true }]
     : allowedModels
+  /**
+   * ⚠️⚠️ **先按完整 id 命中，再退回 canonical**（本仓库扩展，2026-11-09）。
+   *
+   * 目录里有「档位写进模型名」的条目（`claude-opus-5-5-high`），它们的 id
+   * **本身就带后缀**；而 `geminiCanonicalModelId` 会把 `-high` 剥掉
+   * ⇒ 只按 canonical 校验会**永远判不在目录中**。
+   *
+   * 这个坑实际踩过：目录层（`expandTiers`）已正确产出 12 条、`loadModels()`
+   * 也返回 18 条，但请求仍报「不在目录中」—— 因为校验用的是剥掉后缀的
+   * canonical，与表里的完整 id 对不上。**查表与校验必须用同一套 id 规则。**
+   */
+  const exact = allowed.find((m) => m.id === modelId)
+  const canonical = exact?.id ?? geminiCanonicalModelId(modelId)
   const allowedIds = allowed.map((m) => m.id)
   if (!allowedIds.includes(canonical)) {
     throw new LlmError(
@@ -562,7 +579,18 @@ export function geminiModelSpec(
       { status: 404 },
     )
   }
-  const tier = geminiEffortToTier(effort)
+  /**
+   * **固定档位优先于外部 effort**（本仓库扩展，2026-11-09）。
+   *
+   * 用于「档位写进模型名」的目录条目（`claude-opus-5-5-high` 等）：
+   * 用户选哪个名字就必须跑哪一档。否则会与 DSH 的档位下拉相互矛盾
+   * （选了 `-high` 的模型、下拉又停在 low ⇒ 到底跑哪个无法解释）。
+   *
+   * ⚠️ 实测依据（本机 2026-11-09）：档位**只**由上游名后缀决定，
+   * `thinkingBudget` 与它解耦 —— `claude-opus-5-5-high` 配低 budget 仍 200。
+   */
+  const pinned = exact?.pinnedTier
+  const tier = pinned ?? geminiEffortToTier(effort)
   // ⚠️ **upstream 必须用本模型的裸名**（不是恒为 GEMINI_UPSTREAM_FLASH）——
   //    否则表里多个模型会撞车：用户选 A、实际跑 B，且没有任何征兆。
   //
@@ -571,9 +599,21 @@ export function geminiModelSpec(
   //    `gemini-3.8-flash` / `gpt-oss-120b` **必须**带后缀；
   //    `claude-sonnet-4-6` / `gemini-3-flash` / `gemini-2.5-flash` 用**裸名**。
   //    统一拼接会让后者全部 404（实测把 11 个可用模型误判成不可用）。
-  const needsSuffix = allowed.find((m) => m.id === canonical)?.needsEffortSuffix !== false
+  const needsSuffix = (exact ?? allowed.find((m) => m.id === canonical))?.needsEffortSuffix !== false
+  /**
+   * ⚠️⚠️ **upstream 名的拼法分两种情形**（本仓库扩展，2026-11-09）：
+   *
+   * - **`exact` 命中**（档位已写进模型名，如 `claude-opus-5-5-high`）：
+   *   `exact.id` **本身就是完整的上游名** ⇒ 直接用，不再拼后缀。
+   *   拼了会得到 `claude-opus-5-5-high-high`（实测 404）。
+   * - **回退到 canonical**（旧形态：裸 id + 档位下拉）：按 `needsSuffix` 决定
+   *   拼不拼 —— 这是上游各模型族的实测差异（见下方对照表）。
+   */
+  const upstream = exact !== undefined
+    ? exact.id
+    : needsSuffix ? `${canonical}-${tier}` : canonical
   return {
-    upstream: needsSuffix ? `${canonical}-${tier}` : canonical,
+    upstream,
     tier,
     thinkingBudget: geminiThinkingBudget(tier),
     includeThoughts: true,

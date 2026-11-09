@@ -532,7 +532,20 @@ export class GeminiAdapter extends LlmAdapter {
     // ⚠️ 限流标记 / `account.test` 探测链路传来的是**带档位的名字**
     // （写标记用请求原始 id），先归一化再查表 —— 否则「测一下被限流的
     // 档位」会被误拒（探测功能回归）。
-    const entry = this.loadModels().find((item) => item.id === geminiCanonicalModelId(options.model))
+    /**
+     * ⚠️ **先按完整 id 查，再回退 canonical**（本仓库扩展，2026-11-09）。
+     *
+     * 目录里有「档位写进模型名」的条目（`claude-opus-5-5-high`），它们的 id
+     * **本身就是带后缀的完整名**；而 `geminiCanonicalModelId` 会把 `-high` 剥掉
+     * ⇒ 只按 canonical 查会**永远找不到**这些条目（症状：用户选
+     * `claude-opus-5-5-high` 直接被判「不在目录中」）。
+     *
+     * 回退保留是为了兼容旧形态（限流标记 / 探测链路传来的是带档位的
+     * `gemini-3.8-flash-high`，而表里存的是裸 id）。
+     */
+    const allModels = this.loadModels()
+    const entry = allModels.find((item) => item.id === options.model)
+      ?? allModels.find((item) => item.id === geminiCanonicalModelId(options.model))
     if (entry === undefined) {
       throw new LlmError(
         `gemini: 模型 "${options.model}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
@@ -569,6 +582,9 @@ export class GeminiAdapter extends LlmAdapter {
       this.loadModels().map((entry) => ({
         id: entry.id,
         needsEffortSuffix: entry.needsEffortSuffix,
+        // ⚠️ 传 `pinnedTier`（本仓库扩展）：档位写进模型名的条目必须
+        //    恒跑自己那一档，不能被 DSH 的档位下拉覆盖。
+        pinnedTier: entry.pinnedTier,
       })),
     )
 
