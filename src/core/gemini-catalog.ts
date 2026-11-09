@@ -185,11 +185,44 @@ export function parseAvailableModels(payload: unknown): GeminiCatalogModel[] {
  * ⚠️ 未探测过的条目（`needsEffortSuffix === undefined`）**不展开** ——
  * 宁可保守：展开错了会让用户点到必然失败的模型，而不展开只是少 2 个选项。
  */
+/**
+ * **只保留这些模型族**（2026-11-09，用户要求）。
+ *
+ * 用户原话：「那几个老的模型：3，3.1，3.5 就没必要了去掉就好」。
+ * 上游 `fetchAvailableModels` 会返回一堆历史族（`gemini-3-flash`、
+ * `gemini-3.1-flash-lite`、`gemini-3.5-flash-lite`、`gemini-2.5-*`），
+ * 它们的显示名还互相串（4 个不同 id 的 displayName 都是
+ * "Gemini 3.5 Flash Lite"，因为上游按当前别名渲染）—— 留着只制造噪音。
+ *
+ * ⚠️ **白名单而不是黑名单**：上游随时会加新的历史族，黑名单必然漏。
+ * 用户实际要用的就是截图里那 4 个（3 个可用 + GPT-OSS），故白名单最省心。
+ *
+ * ⚠️ 这是**用户偏好**，不是技术约束 —— 想恢复全部模型，删掉这个过滤即可
+ * （`parseAvailableModels` 拿到的仍是上游全集）。
+ */
+const KEPT_FAMILIES: readonly string[] = [
+  'gemini-3.8-flash',
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'gpt-oss-120b',
+]
+
+/** 该模型族是否保留（按去掉档位后缀的裸 id 判）。 */
+export function isKeptFamily(id: string): boolean {
+  return KEPT_FAMILIES.includes(stripEffortSuffix(id))
+}
+
 export function expandTiers(models: readonly GeminiCatalogModel[]): GeminiCatalogModel[] {
   /** 要展开的档位（`tiered` / `extra-low` 不在用户要求的三档里）。 */
   const TIERS = ['low', 'medium', 'high'] as const
   const out: GeminiCatalogModel[] = []
   for (const model of models) {
+    /**
+     * **丢掉用户不要的历史族**（见 `KEPT_FAMILIES`）。
+     * ⚠️ 放在幂等判断**之前**：已展开的旧族条目（带 `pinnedTier`）也要能滤掉，
+     *    否则老缓存里的 `gemini-3.5-flash-lite` 会一直显形。
+     */
+    if (!isKeptFamily(model.id)) continue
     /**
      * ⚠️⚠️ **幂等：已经展开过的条目不能再展开一次**（否则
      * `claude-opus-5-5-high` 会变成 `claude-opus-5-5-high-low`）。
@@ -204,9 +237,18 @@ export function expandTiers(models: readonly GeminiCatalogModel[]): GeminiCatalo
       out.push(model)
       continue
     }
-    /** 展示名去掉上游附带的 `(Medium)` 之类括号，再由我们统一拼档位。 */
-    const baseName = model.name.replace(/\s*\((?:low|medium|high|tiered|extra-low)\)\s*$/i, '').trim()
+    /**
+     * 展示名去掉上游附带的 `(Medium)` 之类括号，再由我们统一拼档位。
+     *
+     * ⚠️ `gemini-3.8-flash` 的上游 displayName 是**小写开头**（就是 id 本身），
+     * 混在 `Claude Opus 5.5` / `GPT-OSS 120B` 里很扎眼 ⇒ 归一成标题式。
+     * 只影响展示，不改 id。
+     */
+    const rawName = model.name.replace(/\s*\((?:low|medium|high|tiered|extra-low)\)\s*$/i, '').trim()
       || model.id
+    const baseName = rawName === model.id && /^[a-z]/.test(rawName)
+      ? rawName.replace(/(^|[-\s])([a-z])/g, (_m, sep: string, ch: string) => sep + ch.toUpperCase())
+      : rawName
     for (const tier of TIERS) {
       out.push({
         ...model,

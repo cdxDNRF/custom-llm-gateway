@@ -455,16 +455,47 @@ function renderProvider(provider) {
   return card
 }
 
+/**
+ * 展开区并发令牌：**最后一次发起的渲染胜出**（真实缺陷，2026-11-09）。
+ *
+ * ## 修的是什么（用户实测报障）
+ *
+ * 「点『查积分』后再点『模型管理』，列表又变回积分了」。
+ *
+ * 根因是 `renderProvider()` 末尾那句 `if (view) void renderExtra(...)`
+ * —— **不等待**的异步调用。于是同一张卡片上可能同时有两次
+ * `renderExtra` 在飞（一次是重渲染后恢复上一次视图，一次是用户刚点的新视图）。
+ * 而它们是**各自 await 网络、然后各自写 `box.innerHTML`** ⇒
+ * 先发起的如果后返回，就会把用户真正想看的那份覆盖掉。
+ *
+ * 网络越慢越容易复现（查积分要打上游、比查本地模型列表慢得多，
+ * 所以「积分回来得晚」正好盖掉「模型列表」）。
+ *
+ * 修法：每个 box 记一个自增令牌，异步返回后比对 —— 不是最新那次就丢弃。
+ */
+const renderTokens = new Map()
+
 /** 渲染展开区（积分 / 模型管理）。 */
 async function renderExtra(provider, box, kind) {
+  /**
+   * ⚠️ 令牌按 **provider.id**（不是 DOM 节点）：`load()` 会把整张卡片重建，
+   * 节点换了但「同一家供应商的展开区」语义没变。按节点记会让重建后的
+   * 旧请求认为自己是「最新」，反而更糟。
+   */
+  const token = (renderTokens.get(provider.id) ?? 0) + 1
+  renderTokens.set(provider.id, token)
+  /** 本次渲染是否仍是「最新那次」——离开 await 后必须重新确认。 */
+  const stale = () => renderTokens.get(provider.id) !== token
   box.innerHTML = '<div class="empty">加载中…</div>'
   try {
     if (kind === 'balance') {
       const { balance } = await api(`/api/p/${provider.id}/balance`)
+      if (stale()) return
       box.innerHTML = renderBalance(balance)
       return
     }
     const { models } = await api(`/api/p/${provider.id}/models`)
+    if (stale()) return
     if (models.length === 0) {
       box.innerHTML = '<div class="empty">没有模型（未登录，或上游目录为空）</div>'
       return

@@ -175,6 +175,17 @@ export interface GeminiBalanceResult {
    * 配额行跟着报错 —— 它只是一栏附注信息。拿不到就不渲染那一行。
    */
   tier?: GeminiAccountTier
+  /**
+   * **按配额池分组的读数**（本仓库扩展，2026-11-09）。
+   *
+   * 上游响应本来就有多个 group（Pro 账号至少两个：
+   * `Gemini Models` 与 `Claude and GPT models`），而 {@link balance}
+   * 只装 Gemini 那两个桶 ⇒ Claude/GPT 那一池的余量看不到。
+   * 本字段保留**完整分组**，供面板逐池展示。
+   *
+   * ⚠️ 与 `balance` 并存而非替代：`balance` 仍供只认单一数字的消费者使用。
+   */
+  groups?: { name: string; windows: { window: string; bucketId: string; percent: number; resetTime: string }[] }[]
 }
 
 /** {@link fetchGeminiCreditBalance} 的可选参数。 */
@@ -230,6 +241,72 @@ export function parseGeminiQuotaWindow(raw: unknown): GeminiQuotaWindow | undefi
  * ⚠️ 按 `bucketId` 匹配，**不按 `displayName` / `window`**：显示名是文案、
  * 会变；`window` 字段在实测里出现过缺失。id 是唯一稳定判据。
  */
+/**
+ * **按配额组（pool）解析**（本仓库扩展，2026-11-09）。
+ *
+ * ## 为什么要它
+ *
+ * Pro 账号的额度**不是一个池子**，上游按模型族分成多个 group：
+ *
+ * ```json
+ * {"groups":[
+ *   {"displayName":"Gemini Models","buckets":[gemini-weekly, gemini-5h]},
+ *   {"displayName":"Claude and GPT models","buckets":[3p-weekly, 3p-5h]}]}
+ * ```
+ *
+ * 而 {@link parseGeminiQuotaWindows} **只认** `gemini-5h` / `gemini-weekly`
+ * 两个 id ⇒ 第二个 group（Claude / GPT 用的 `3p-*` 桶）被**整个丢掉**。
+ * 用户实测看到的「合计 97%」其实是两个 Gemini 窗口的均值，而 Claude 那一池
+ * 当时只剩 48% —— 完全没显示出来，这会让用户误以为额度还很充裕。
+ *
+ * ## 判据：按 `bucketId` 的**前缀**分组，不按 displayName
+ *
+ * displayName 是文案会变；但 bucketId 的前缀稳定（实测）：
+ * `gemini-*` = Gemini 池，`3p-*` = 第三方（Claude/GPT）池。
+ * 未知前缀归到 "其他"，**不丢数据**（宁可多显示一行也不要静默丢掉一池额度）。
+ *
+ * @returns 每个 group 一条，含展示名与它的窗口；解析不出任何组时返回 `[]`。
+ */
+export function parseGeminiQuotaGroups(payload: unknown): {
+  name: string
+  windows: { window: string; bucketId: string; percent: number; resetTime: string }[]
+}[] {
+  if (typeof payload !== 'object' || payload === null) return []
+  const groups = (payload as Record<string, unknown>).groups
+  if (!Array.isArray(groups)) return []
+  const out: { name: string; windows: { window: string; bucketId: string; percent: number; resetTime: string }[] }[] = []
+  for (const group of groups) {
+    if (typeof group !== 'object' || group === null || Array.isArray(group)) continue
+    const rec = group as Record<string, unknown>
+    const buckets = rec.buckets
+    if (!Array.isArray(buckets)) continue
+    const windows: { window: string; bucketId: string; percent: number; resetTime: string }[] = []
+    for (const bucket of buckets) {
+      const parsed = parseGeminiQuotaWindow(bucket)
+      if (parsed === undefined) continue
+      windows.push({
+        // `window` 字段实测偶有缺失，回退到 bucketId 的尾段（`gemini-5h` → `5h`）。
+        window: parsed.window !== '' ? parsed.window : parsed.bucketId.split('-').pop() ?? '',
+        bucketId: parsed.bucketId,
+        percent: Math.round(Math.min(1, Math.max(0, parsed.remainingFraction)) * 100),
+        resetTime: parsed.resetTime,
+      })
+    }
+    if (windows.length === 0) continue
+    const displayName = typeof rec.displayName === 'string' && rec.displayName !== ''
+      ? rec.displayName
+      : ''
+    out.push({
+      name: displayName !== ''
+        ? displayName
+        // 没有 displayName 时按 bucketId 前缀兜底（不写死文案）。
+        : (windows[0]!.bucketId.startsWith('3p-') ? 'Claude and GPT models' : 'Gemini Models'),
+      windows,
+    })
+  }
+  return out
+}
+
 export function parseGeminiQuotaWindows(payload: unknown): {
   fiveHour?: GeminiQuotaWindow
   weekly?: GeminiQuotaWindow
@@ -393,13 +470,21 @@ async function requestQuotaSummary(
   }
 
   const { fiveHour, weekly } = parseGeminiQuotaWindows(payload)
+  const groups = parseGeminiQuotaGroups(payload)
   // ⚠️ 两个桶都没认出来 ⇒ `null`（真失败），**不伪造 100%**。
   // 原版此时返回空 `Quota{}`；在插件侧空余额会被面板渲染成「0」，
   // 那比「查询失败」更误导（用户会以为额度用光了）。
   if (fiveHour === undefined && weekly === undefined) {
-    return { balance: null, error: '配额响应里没有 Gemini 配额桶' }
+    // ⚠️ 但**若 groups 有数据**，说明账号只有非 Gemini 池（例如纯 3p 额度）：
+    //    此时不该报「没有配额桶」，而应把池原样交出去（下面 groups 会带上）。
+    return groups.length > 0
+      ? { balance: null, groups }
+      : { balance: null, error: '配额响应里没有 Gemini 配额桶' }
   }
-  return { balance: toGeminiCreditBalance(fiveHour, weekly) }
+  return {
+    balance: toGeminiCreditBalance(fiveHour, weekly),
+    ...(groups.length > 0 ? { groups } : {}),
+  }
 }
 
 /**

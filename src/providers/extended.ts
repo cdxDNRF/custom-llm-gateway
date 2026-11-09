@@ -1187,12 +1187,38 @@ export async function createGeminiProvider(
           //    `{ balance: null, error: '尚未授权 Google 账号' }`。
           const result = await fetchGeminiCreditBalance(credential as never, GEMINI)
           got = true
-          if (result.balance === null) {
+          if (result.balance === null && (result.groups === undefined || result.groups.length === 0)) {
             // 未授权/查不到：如实记一条（不静默跳过，否则用户只看到"无数据"）。
             items.push({ name: `${account.nickname}：${result.error ?? '查不到额度'}`, remain: 0, note: true })
             continue
           }
-          for (const pkg of result.balance.packages ?? []) {
+          /**
+           * **按配额池逐条输出**（2026-11-09，用户要求）。
+           *
+           * 上游对 Pro 账号返回多个 group（实测：`Gemini Models` 与
+           * `Claude and GPT models`），而 `result.balance.packages` **只含
+           * Gemini 那两个桶** ⇒ Claude/GPT 池的余量完全看不到。
+           * 用户实测时 Gemini 池 97%、Claude 池 48%，只显示前者会让人
+           * 误以为额度充裕。
+           *
+           * 故优先用 `result.groups`（全量分组）；没有 groups 时才退回
+           * `balance.packages`（老响应/非 Pro 账号）。
+           */
+          if (result.groups !== undefined && result.groups.length > 0) {
+            for (const group of result.groups) {
+              for (const w of group.windows) {
+                items.push({
+                  name: `${account.nickname} · ${group.name} · ${w.window}`,
+                  remain: w.percent,
+                  // 重置时刻让用户知道「什么时候回血」（上游给的是绝对时间）。
+                  ...(Number.isNaN(Date.parse(w.resetTime)) ? {} : { expireAt: Date.parse(w.resetTime) }),
+                })
+              }
+            }
+          }
+          for (const pkg of result.groups !== undefined && result.groups.length > 0
+            ? []
+            : result.balance?.packages ?? []) {
             // ⚠️ `CreditPackage` **没有 `expireAt`**（那是别的 provider 的字段名）：
             //    它的失效时间是 `deductionEndTime`（毫秒，实测才是"何时作废"的真相源
             //    —— `expiredTime` 只在包**真正失效后**才由服务端回填，见 credits.ts 长注释）。
@@ -1211,7 +1237,7 @@ export async function createGeminiProvider(
             // 正是 DSH 面板"账号规格"那一栏的取值。
             items.push({ name: `${account.nickname} · 账号规格 ${result.tier.label}`, remain: 0, note: true })
           }
-          total += result.balance.total
+          total += result.balance?.total ?? 0
         } catch (error) {
           gateway.logger.warn(`账号 ${account.id} 额度查询失败:`, error)
         }
