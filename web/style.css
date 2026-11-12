@@ -1047,36 +1047,178 @@ body {
  * 这样既保留了「标志被拆成线条」的观感，又不干扰任何可读内容。
  */
 /*
- * 线场位置（2026-11-12 第三轮，两次截图后定下来的）。
+ * 线场位置：**随折叠状态切换**（2026-11-12 第四轮，用户要求重做交互）。
  *
- * 迭代过程，记下来免得后人重走：
- *   ① 铺满整张卡 → 线条盖住账号名和按钮，字看不清（最差）
- *   ② 只占下半部 → 卡片高度随账号数变化，账号多时线场被挤成一条缝
- *   ③ **当前**：固定在右上角一块 150×110 的「徽章区」 ——
- *      那片区域永远是空白（标题在左、锁定开关在同行的右，但只在账号少时才有），
- *      线场作为**装饰纹理**待在那里，不会随账号数量时有时无。
+ * 用户原话：「你是把动态交互效果做到每个卡片的右下角，非常的不明显……
+ * 卡片本身就做成这种动态交互的，加一个小箭头，点击小箭头就丝滑的出现
+ * 目前直接就用的文字按钮和功能」。
  *
- * 配合 `border-radius` 裁切，看起来像卡片的「水印徽记」。
+ * 折叠态：线场**铺满整张卡**，它就是卡片的主体（参照 StyleKit 示例）
+ * 展开态：线场缩到底部当背景，控制区占主位
+ *
+ * 前几轮迭代留下的教训（别再走回去）：
+ *   ① 铺满 + 高透明度 → 盖住文字，看不清
+ *   ② 只占下半部 → 卡片高度随账号数变，账号多时挤成一条缝
+ *   ③ 固定右下角小徽章 → 太不明显（用户本轮指出的）
  */
 .card-field {
   position: absolute;
-  right: 0;
-  bottom: 0;
-  width: 190px;
-  height: 130px;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   z-index: 0;
   pointer-events: none;
-  opacity: .75;
-  /* 从右下角往外淡出，线场像卡片的「底纹」而不是一个贴上去的方块 */
-  -webkit-mask-image: radial-gradient(130% 120% at 100% 100%, #000 30%, transparent 76%);
-  mask-image: radial-gradient(130% 120% at 100% 100%, #000 30%, transparent 76%);
+  opacity: .9;
+  transition: opacity .3s ease, transform .3s ease;
+  /*
+   * ⚠️ 顶部要淡出：线场铺满后，标志的线条会**盖住标题和品牌名**
+   * （实测截图：CodeBuddy 的名字与线条混在一起看不清）。
+   * 用渐隐遮罩把上 1/3 压掉，只在标题行留出干净背景。
+   */
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, transparent 18%, #000 42%, #000 100%);
+  mask-image: linear-gradient(180deg, transparent 0%, transparent 18%, #000 42%, #000 100%);
+}
+
+/* ═══════════════ 折叠 / 展开 ═══════════════
+ *
+ * 折叠时 `.card-body` 高度为 0（用 grid-rows 过渡，比 max-height 更平滑 ——
+ * max-height 的过渡时长和内容高度脱钩，内容少时会「先快后慢」）。
+ * `grid-template-rows: 0fr → 1fr` 是纯 CSS 的「按内容高度动画」标准做法。
+ */
+/**
+ * 折叠动画用 `grid-template-rows: 0fr → 1fr`。
+ *
+ * ⚠️⚠️ 两个必踩的坑（本轮第二次实现才跑通）：
+ *
+ * 1. **子元素必须 `min-height: 0` + `overflow: hidden`** —— 只在外层设 `0fr`
+ *    时，grid item 的默认 `min-height: auto` 会按内容撑开，折叠**完全不生效**
+ *    （实测：折叠态 card-body 高度仍是 184px，控制区照常显示）。
+ * 2. **必须只有一个直接子元素**承担「被折叠的内容」。`card-body` 里若有多个
+ *    并列子元素，每行是独立的 grid row，`0fr` 只作用于第一行。
+ *    故结构上把全部内容包在一个 `.card-body-inner` 里。
+ */
+.card-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .34s cubic-bezier(.2, .7, .3, 1);
+}
+.card-body-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+.card:not(.is-collapsed) .card-body {
+  grid-template-rows: 1fr;
+}
+/* 展开态的线场：只在底部一条，当背景纹理 */
+.card:not(.is-collapsed) .card-field {
+  top: auto;
+  bottom: 0;
+  height: 46%;
+  opacity: .5;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 55%, #000 100%);
+  mask-image: linear-gradient(180deg, transparent 0%, #000 55%, #000 100%);
+}
+
+/* 折叠态：卡片是一块「展示面」——给足高度让线场有地方画 */
+.card.is-collapsed {
+  min-height: 210px;
+  padding-bottom: 26px;
+  cursor: pointer;
+}
+/* 折叠态下隐藏控制区里的标签（保留 body 结构给动画用） */
+.card.is-collapsed .card-body { grid-template-rows: 0fr; }
+
+/**
+ * 展开箭头：一个圆形按钮 + 旋转的箭头。
+ *
+ * 位置固定在卡片右下（展开/折叠都在同一处 —— 移动的按钮会让用户找不到）。
+ * 折叠时向上指（暗示「点我展开」），展开时向下指。
+ */
+.card-expand {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 3;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-1) 82%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transition: background .2s, border-color .2s, color .2s, transform .2s;
+}
+.card-expand:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--surface-1) 95%, transparent);
+}
+.card-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/*
+ * 箭头本身：用两条边框拼的 V 形，不用图标字体。
+ *
+ * 方向语义（容易写反，记一下）：
+ * - **折叠态**（默认）：箭头朝**下** `rotate(45deg)` —— 暗示「点我展开下方内容」
+ * - **展开态**：箭头朝**上** `rotate(-135deg)` —— 暗示「点我收起」
+ *
+ * ⚠️ 第一版写反了（折叠朝上、展开朝下），实测截图发现。
+ */
+.card-expand-arrow {
+  width: 7px;
+  height: 7px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(45deg) translate(-1px, -1px);
+  transition: transform .3s cubic-bezier(.2, .7, .3, 1);
+}
+/* 展开后箭头朝上 = 收起 */
+.card:not(.is-collapsed) .card-expand-arrow {
+  transform: rotate(-135deg) translate(-1px, -1px);
 }
 /* 卡片内容必须在画布之上 */
-.card > *:not(.card-field) { position: relative; z-index: 1; }
+/*
+ * 卡片内容的层叠：画布在 z-index 0，其余内容提到 1 层以上。
+ *
+ * ⚠️⚠️ **不能写成 `position: relative`**（第一版就是这么写的，导致箭头跑到
+ * 卡片左上角）：`.card-expand` 自己需要 `position: absolute` 定位到右下角，
+ * 这条通配规则把它覆盖成 relative ⇒ 箭头变成了普通流内元素。
+ *
+ * 正确做法：只提 `z-index`，**不动 position** —— 本来就在流里的元素继续在流里，
+ * 需要绝对定位的元素自己声明 absolute 即可。
+ */
+.card > *:not(.card-field) { z-index: 1; }
 
 /* 卡片悬停时线场更明显一点（与线场自身的脉冲呼应） */
 .card:hover .card-field { opacity: 1; }
 
-/* 亮色主题下线场偏淡（白底上深线太抢眼） */
-[data-theme="light"] .card-field { opacity: .55; }
-[data-theme="light"] .card:hover .card-field { opacity: .8; }
+/*
+ * 亮色主题下的线场透明度。
+ *
+ * ⚠️ 之前是 .55，用户反馈「在亮色里几乎等于没有」—— 因为线色本身也只有
+ * .55 透明度，两层相乘后只剩 .3。现在线色提到 .92，CSS 层给 .75，
+ * 净效果与暗色可比（深灰线画在白底上，对比度反而更高）。
+ */
+[data-theme="light"] .card-field { opacity: .75; }
+[data-theme="light"] .card:hover .card-field { opacity: .9; }
+
+/* ═══════════════ 折叠态卡片：标题区可读性 ═══════════════
+ *
+ * 线场铺满后标题会与线条重叠。除了 canvas 的渐隐遮罩，
+ * 再给标题行加一层**半透明实色底**（不用 blur/backdrop-filter，
+ * 保持「只用实色分层」的设计纪律）。
+ */
+.card.is-collapsed .card-head {
+  position: relative;
+  z-index: 2;
+  padding: 2px 0 10px;
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--surface-1) 92%, transparent) 0%,
+    color-mix(in srgb, var(--surface-1) 78%, transparent) 62%,
+    transparent 100%);
+  border-radius: 10px 10px 0 0;
+}
+/* 折叠态下 head-right 里的「锁定永久积分」开关对小卡片太挤，缩小 */
+.card.is-collapsed .card-head-right .switch { font-size: 11px; opacity: .8; }

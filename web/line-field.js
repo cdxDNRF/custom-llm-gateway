@@ -43,9 +43,15 @@
  * 且不需要为 30 家手抄路径。**仍然只读一次像素**。
  */
 
-/** 网格尺寸。⚠️ 比原示例（60×30）低一档，理由见文件头性能表。 */
-const GRID_W = 40
-const GRID_H = 30
+/**
+ * 网格尺寸。
+ *
+ * ⚠️ 折叠态卡片约 447×210（比例 2.1:1），网格要按这个比例取才不变形 ——
+ * 用正方形的 60×60 会把标志拉长。这里 56×34 ≈ 1.65:1，配合卡片比例观感正常。
+ * 比原示例（60×30）密一档：本轮实测 40×30 时标志线条太稀，看不出是什么。
+ */
+const GRID_W = 56
+const GRID_H = 34
 const COUNT = GRID_W * GRID_H
 /** 四档线宽（与原示例一致）。 */
 const LINE_WIDTHS = [0.38, 1.12, 2.28, 3.8]
@@ -57,7 +63,7 @@ const LINE_WIDTHS = [0.38, 1.12, 2.28, 3.8]
  * 按钮、到期时间 —— 用示例那套透明度会让线条盖过文字（实测截图确认过，
  * 卡片里的字直接看不清）。这里按同一比例压缩到 0.32 档，线场退成**背景纹理**。
  */
-const LINE_ALPHAS = [0.05, 0.13, 0.22, 0.32]
+const LINE_ALPHAS = [0.12, 0.38, 0.66, 0.95]
 
 /** 共享噪声格点：128×128，xorshift seed 7319（与原示例一致）。 */
 const NOISE_SIZE = 128
@@ -113,34 +119,40 @@ async function sampleIconLuminance(src) {
     return undefined
   }
 
-  /** 超采样倍数：每个网格单元取 5×5 像素的平均（与原示例同一思路）。 */
+  /**
+   * 超采样倍数：每个网格单元取 5×5 像素的平均（与原示例同一思路）。
+   *
+   * ⚠️⚠️ **采样画布必须与网格同比例**（`GRID_W:GRID_H`），否则标志会被拉伸。
+   * 第一版用正方形画布（`side×side`）+ 正方形网格，画到宽扁的卡片上时
+   * 格子不是正方形 ⇒ 标志横向拉宽。现在画布按网格比例（56:34）建，
+   * 图标**按短边等比缩放到铺满**（不是居中留白 —— 那样在宽卡上标志太小）。
+   */
   const SS = 5
-  const side = Math.max(GRID_W, GRID_H) * SS
+  const sideW = GRID_W * SS
+  const sideH = GRID_H * SS
   const scratch = document.createElement('canvas')
-  scratch.width = side
-  scratch.height = side
+  scratch.width = sideW
+  scratch.height = sideH
   const context = scratch.getContext('2d', { willReadFrequently: true })
   if (context === null) return undefined
   context.fillStyle = '#000'
-  context.fillRect(0, 0, side, side)
-  // 图标等比居中放进画布（留 12% 边距，避免贴边被裁）
-  const pad = side * 0.12
-  const box = side - pad * 2
-  const scale = Math.min(box / image.width, box / image.height)
+  context.fillRect(0, 0, sideW, sideH)
+  // 图标等比放大到**铺满短边**，长边居中（保持标志原始比例，不拉伸）
+  const scale = Math.max(sideW / image.width, sideH / image.height) * 0.92
   const drawW = image.width * scale
   const drawH = image.height * scale
-  context.drawImage(image, (side - drawW) / 2, (side - drawH) / 2, drawW, drawH)
+  context.drawImage(image, (sideW - drawW) / 2, (sideH - drawH) / 2, drawW, drawH)
 
-  const pixels = context.getImageData(0, 0, side, side).data
+  const pixels = context.getImageData(0, 0, sideW, sideH).data
   const luminance = new Float32Array(COUNT)
   for (let gy = 0; gy < GRID_H; gy += 1) {
     for (let gx = 0; gx < GRID_W; gx += 1) {
       let sum = 0
       for (let sy = 0; sy < SS; sy += 1) {
         for (let sx = 0; sx < SS; sx += 1) {
-          const px = Math.min(side - 1, gx * SS + sx)
-          const py = Math.min(side - 1, gy * SS + sy)
-          const index = (py * side + px) * 4
+          const px = Math.min(sideW - 1, gx * SS + sx)
+          const py = Math.min(sideH - 1, gy * SS + sy)
+          const index = (py * sideW + px) * 4
           // Rec. 709（与原示例一致）
           sum += (0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2]) / 255
         }
@@ -234,8 +246,23 @@ class LineFieldCard {
     if (width === 0 || height === 0) return
     ctx.clearRect(0, 0, width, height)
 
-    const cellW = width / GRID_W
-    const cellH = height / GRID_H
+    /**
+     * ⚠️⚠️ **格子必须是正方形**，否则标志会被拉伸变形。
+     *
+     * 卡片是宽扁的（如 445×208），而网格 56×34 若按 `width/GRID_W`、
+     * `height/GRID_H` 分别算，格子是 7.9×6.1 ⇒ 标志横向拉宽（实测截图确认）。
+     *
+     * 正确做法：取两者较小值作为「单元边长」，再算出实际占用的网格区域并居中。
+     * 这样标志保持原始比例，多出来的横向空间留白（线场本该是纹理，不必铺满）。
+     */
+    const cellSize = Math.min(width / GRID_W, height / GRID_H)
+    const plotW = cellSize * GRID_W
+    const plotH = cellSize * GRID_H
+    /** 绘图区在画布内的偏移（居中）。 */
+    const originX = (width - plotW) / 2
+    const originY = (height - plotH) / 2
+    const cellW = cellSize
+    const cellH = cellSize
     this.time += dt
     // 脉冲衰减（与原示例一致：exp(-dt*5.5)）
     this.pointer.pulse *= Math.exp(-dt * 5.5)
@@ -268,8 +295,8 @@ class LineFieldCard {
         // 图标为空白处不画线（否则整张卡是均匀噪声，看不出是什么标志）
         if (luminance < 0.045) continue
 
-        let x = gx * cellW + cellW / 2
-        let y0 = gy * cellH + (cellH - cellW * 0.6) / 2
+        let x = originX + gx * cellW + cellW / 2
+        let y0 = originY + gy * cellH + (cellH - cellW * 0.6) / 2
         let y1 = y0 + cellW * 0.6
 
         // ── 指针径向散开（原示例：影响 = max(0,1-d/r)² × pulse × 25）──
@@ -307,7 +334,7 @@ class LineFieldCard {
     ctx.globalAlpha = 1
 
     // ── 检测框（只在交互时画；静止时省掉这一整块）──
-    if (interaction) this.drawCallouts(ctx, cellW, cellH)
+    if (interaction) this.drawCallouts(ctx, cellW, cellH, originX, originY)
   }
 
   /**
@@ -317,7 +344,7 @@ class LineFieldCard {
    *    那是演示页的视觉卖点，在监控面板里会持续闪烁、干扰读数。
    *    这里保留「框住标志亮部 + 连线」的观感，成本从 O(n²) 降到 O(n)。
    */
-  drawCallouts(ctx, cellW, cellH) {
+  drawCallouts(ctx, cellW, cellH, originX = 0, originY = 0) {
     // 4×3 分块找最亮块（块内亮度和最高即「标志主体」所在）
     const BLOCK = 8
     let bestScore = 0
@@ -343,10 +370,14 @@ class LineFieldCard {
     if (bestScore / (BLOCK * BLOCK) < 0.04) return
 
     const padding = 1
-    const x = Math.max(0, bestX - padding) * cellW
-    const y = Math.max(0, bestY - padding) * cellH
-    const w = Math.min(GRID_W, bestX + BLOCK + padding) * cellW - x
-    const h = Math.min(GRID_H, bestY + BLOCK + padding) * cellH - y
+    const gx0 = Math.max(0, bestX - padding)
+    const gy0 = Math.max(0, bestY - padding)
+    const gx1 = Math.min(GRID_W, bestX + BLOCK + padding)
+    const gy1 = Math.min(GRID_H, bestY + BLOCK + padding)
+    const x = originX + gx0 * cellW
+    const y = originY + gy0 * cellH
+    const w = (gx1 - gx0) * cellW
+    const h = (gy1 - gy0) * cellH
 
     ctx.save()
     ctx.globalAlpha = 0.9

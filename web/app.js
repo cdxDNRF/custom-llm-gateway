@@ -137,6 +137,14 @@ const modelFilter = new Map()
 const expandedView = new Map()
 
 /**
+ * 每个供应商卡片的**折叠状态**（true = 只显示线场 + 标题）。
+ *
+ * ⚠️ 与 `expandedView` 是两套独立状态，见 renderProvider 里的注释。
+ * Map 里没有 = 默认折叠（new Map 不预填，省一次循环）。
+ */
+const collapsedCards = new Map()
+
+/**
  * 取供应商图标（`window.PROVIDER_ICONS` 由 `/static/icons.js` 提供）。
  *
  * 返回 `<img>` 的 HTML；没有图标时返回空串（**不占位** —— 空 `<img>` 会显示
@@ -165,12 +173,20 @@ function attachLineField(card, provider) {
   if (canvas === null || IconApi === undefined) return
 
   // ── 主题色：线色取卡片前景色，检测色固定蓝（与示例的 detection 同源） ──
+  /**
+   * 线色按主题取：**亮色用深灰、暗色用浅灰**。
+   *
+   * ⚠️ 亮色下原来的 `.55` 透明度几乎看不见（用户反馈「在亮色里几乎等于没有」）——
+   * 根因不是透明度，而是**亮色卡片表面是白色**，而线场透明度还要再乘一层 CSS
+   * `opacity`（亮色我设了 .55），两层一乘只剩 .3，等于没有。
+   * 现在：亮色用更深的不透明线（.92），CSS 层给 .75，净效果与暗色可比。
+   */
   const isLight = document.documentElement.dataset.theme === 'light'
   const field = new IconApi.LineFieldCard(card, {
     canvas,
     seed: IconApi.seedOf(provider.id),
-    ink: isLight ? 'rgba(37,39,37,.55)' : 'rgba(237,237,239,.42)',
-    detection: '#267dff',
+    ink: isLight ? 'rgba(28,30,28,.92)' : 'rgba(237,237,239,.9)',
+    detection: isLight ? '#1f5fdb' : '#267dff',
   })
 
   let raf = 0
@@ -206,6 +222,24 @@ function attachLineField(card, provider) {
   }
   const observer = new ResizeObserver(() => sync(true))
   observer.observe(canvas)
+
+  /**
+   * 折叠/展开切换后画布尺寸变了（CSS 按 `.is-collapsed` 切 inset），
+   * ResizeObserver 会在下一帧自动触发 —— 但折叠动画有 300ms 过渡，
+   * 期间连续变化会让 observer 反复回调（可接受，`syncSize` 有去重）。
+   * 这里额外监听一次自定义事件，保证「动画结束那一刻」也有一次精确重绘。
+   */
+  card.addEventListener('card-field-resize', () => {
+    requestAnimationFrame(() => sync(true))
+  })
+
+  // 主题切换 → 线色必须跟着换（线色是构造时的常量，不是 CSS 变量）
+  card.addEventListener('theme-changed', () => {
+    const nowLight = document.documentElement.dataset.theme === 'light'
+    field.ink = nowLight ? 'rgba(28,30,28,.92)' : 'rgba(237,237,239,.9)'
+    field.detection = nowLight ? '#1f5fdb' : '#267dff'
+    sync(true)
+  })
 
   const dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
   const onDpr = () => { sync(true); dprQuery.removeEventListener('change', onDpr) }
@@ -293,6 +327,23 @@ function renderProvider(provider) {
 
   const view = expandedView.get(provider.id) || ''
 
+  /**
+   * **卡片折叠态**（2026-11-12 用户要求，重做交互）。
+   *
+   * 用户原话：「卡片本身就做成这种动态交互的，加一个小箭头，点击小箭头就
+   * 丝滑的出现目前直接就用的文字按钮和功能，这样美观很多」。
+   *
+   * 结构：
+   * - **折叠**（默认）：整张卡就是一块线场画布 + 品牌图标 + 名称 + 箭头
+   * - **展开**：控制区（标签、按钮、账号列表）从下方滑出，线场缩到底部当背景
+   *
+   * ⚠️ 折叠状态存 `expandedView`（与「模型管理/查积分」是**两套**状态：
+   *    这里管「卡片是否展开控制区」，那边管「展开区显示哪个子视图」）。
+   *    合成一个会让「点了查积分」意外把卡片撑开。
+   */
+  const collapsed = collapsedCards.get(provider.id) ?? true
+  if (collapsed) card.classList.add('is-collapsed')
+
   card.innerHTML = `
     <canvas class="card-field" aria-hidden="true"></canvas>
     <div class="card-head">
@@ -307,10 +358,9 @@ function renderProvider(provider) {
           <input type="checkbox" data-act="lock" ${provider.permanentLocked ? 'checked' : ''}>
           <span>锁定永久积分</span>
         </label>` : ''}
-        <button class="btn btn-sm btn-danger-ghost" data-act="disableProvider"
-                title="停用后立即释放端口。已登录的账号仍保存在本地，随时可再启用。">停用</button>
       </div>
     </div>
+    <div class="card-body"><div class="card-body-inner">
     <div class="tags">${tags}</div>
     <div class="card-actions">
       ${/* ⚠️ Build 渠道没有「账号」概念：它不登录、无凭据、无积分、无限流标记。
@@ -338,6 +388,11 @@ function renderProvider(provider) {
     </div>
     <div class="accounts" data-role="accounts"></div>
     <div data-role="extra" class="${view ? 'extra-open' : ''}"></div>
+    </div></div>
+    <button class="card-expand" data-act="toggleCollapse" aria-expanded="${collapsed ? 'false' : 'true'}"
+            title="${collapsed ? '展开控制区' : '收起'}" aria-label="${collapsed ? '展开控制区' : '收起控制区'}">
+      <span class="card-expand-arrow" aria-hidden="true"></span>
+    </button>
   `
 
   const accountsBox = card.querySelector('[data-role="accounts"]')
@@ -389,6 +444,20 @@ function renderProvider(provider) {
     }
   }
 
+  /**
+   * 折叠态下**点卡片任意处也能展开**（不只点小箭头）。
+   *
+   * 理由：折叠时卡片整个是一块「展示面」，用户直觉是点它；只让 30px 的箭头
+   * 可点会让触屏用户很难命中（用户强调过「适合触控」）。
+   * 展开态则**不**这样 —— 那时卡片里全是按钮，点空白就收起会很烦。
+   */
+  card.addEventListener('click', (event) => {
+    if (!card.classList.contains('is-collapsed')) return
+    // 别劫持卡片内真实控件（折叠态理论上没有，但防御性判断）
+    if (event.target.closest('button, a, input, label, select')) return
+    card.querySelector('.card-expand')?.click()
+  })
+
   // ── 线条动效（2026-11-12）──
   //
   // 只在**悬停 / 聚焦**时跑满帧，其余时候画一帧静态（见 line-field.js 文件头的
@@ -425,6 +494,18 @@ function renderProvider(provider) {
           break
         }
         case 'login': await startLogin(provider); break
+        case 'toggleCollapse': {
+          const nowCollapsed = !(collapsedCards.get(provider.id) ?? true)
+          collapsedCards.set(provider.id, nowCollapsed)
+          card.classList.toggle('is-collapsed', nowCollapsed)
+          button.setAttribute('aria-expanded', nowCollapsed ? 'false' : 'true')
+          const label = nowCollapsed ? '展开控制区' : '收起控制区'
+          button.title = label
+          button.setAttribute('aria-label', label)
+          // 展开后线场缩到底部（CSS 里按 is-collapsed 切尺寸），要重算 backing store
+          card.dispatchEvent(new CustomEvent('card-field-resize', { bubbles: false }))
+          break
+        }
         case 'balance':
           expandedView.set(provider.id, 'balance')
           await renderExtra(provider, extraBox, 'balance')
@@ -1246,6 +1327,16 @@ function applyTheme() {
   }
   if (label !== null) label.textContent = theme === 'light' ? '亮色' : '暗色'
   if (icon !== null) icon.textContent = theme === 'light' ? '☀' : '☾'
+  /**
+   * 通知所有卡片「主题变了，线色要重取」。
+   *
+   * ⚠️ 线色是构造时确定的常量（不是 CSS 变量），主题切换不会自动生效 ——
+   * 不重新挂载就会「切到亮色后线场还是浅灰的，看不见」。
+   * 这里不重挂整个卡片（会丢展开状态），只让 attachLineField 更新 ink 并重绘。
+   */
+  for (const card of document.querySelectorAll('#providers .card')) {
+    card.dispatchEvent(new CustomEvent('theme-changed', { bubbles: false }))
+  }
 }
 
 $('#theme-toggle')?.addEventListener('click', () => {
