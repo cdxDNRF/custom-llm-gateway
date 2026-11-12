@@ -46,12 +46,20 @@
 /**
  * 网格尺寸。
  *
- * ⚠️ 折叠态卡片约 447×210（比例 2.1:1），网格要按这个比例取才不变形 ——
- * 用正方形的 60×60 会把标志拉长。这里 56×34 ≈ 1.65:1，配合卡片比例观感正常。
- * 比原示例（60×30）密一档：本轮实测 40×30 时标志线条太稀，看不出是什么。
+ * ⚠️ 网格比例要接近卡片宽高比（现在卡片约 380×380 见方，网格 72:48 = 1.5:1，
+ * 配合采样时按短边铺满 + 正方形格子，标志不会变形）。
+ *
+ * 密度迭代（用户要求「动态粒子紧凑一点」）：
+ *   40×30 → 56×34 → 72×48 → **60×60**
+ *
+ * ⚠️⚠️ **72×48 是错的**：那是 1.5:1 的宽幅网格，而折叠态卡片现在接近正方形
+ * （380×380）。绘制时格子按「较小边」取正方形并居中 ⇒ 横向留出大片空白，
+ * 标志看起来偏左（实测截图确认）。**正方形网格 60×60 与正方形卡片匹配**，
+ * 铺满且不变形 —— 这也是示例页选 60×60 的原因（它的卡片是 0.70 竖向，
+ * 但标志区本身是方的）。
  */
-const GRID_W = 56
-const GRID_H = 34
+const GRID_W = 60
+const GRID_H = 60
 const COUNT = GRID_W * GRID_H
 /** 四档线宽（与原示例一致）。 */
 const LINE_WIDTHS = [0.38, 1.12, 2.28, 3.8]
@@ -280,10 +288,10 @@ class LineFieldCard {
     const cellH = cellSize
     this.time += dt
     // 脉冲衰减（与原示例一致：exp(-dt*5.5)）
-    this.pointer.pulse *= Math.exp(-dt * 5.5)
+    this.pointer.pulse *= Math.exp(-dt * 7.5)  // 衰减更快 = 更跟手
 
     /** 指针影响半径：四分之一绘图宽度（原示例口径）。 */
-    const radius = width / 4
+    const radius = Math.min(width, height) / 3  // 影响半径更大 = 更连贯
     const interaction = this.pointer.active || this.focused
     const pointerX = this.pointer.x
     const pointerY = this.pointer.y
@@ -348,81 +356,21 @@ class LineFieldCard {
     }
     ctx.globalAlpha = 1
 
-    // ── 检测框（只在交互时画；静止时省掉这一整块）──
-    if (interaction) this.drawCallouts(ctx, cellW, cellH, originX, originY)
+    /*
+     * ⚠️ 检测框已移除（2026-11-12，用户要求）。
+     *
+     * 用户原话：「这个蓝色小框框你不做动态的就没必要了，单独放有点丑」。
+     * 它确实是示例页的卖点（「AI 检测标注」），但本项目里它只是个静态装饰框，
+     * 既不随粒子流动也不算真实检测 —— 留着反而像「界面出错了」。
+     * 上一轮又为了性能砍成单目标，视觉上更孤立，故整套删掉。
+     */
   }
 
-  /**
-   * 画检测框：在**当前亮度场**上找最亮的 2×2 区域并画蓝框。
-   *
-   * ⚠️ 只做「最亮局部」而不是原示例的积分图 + NMS 三目标：
-   *    那是演示页的视觉卖点，在监控面板里会持续闪烁、干扰读数。
-   *    这里保留「框住标志亮部 + 连线」的观感，成本从 O(n²) 降到 O(n)。
+  /*
+   * `drawCallouts()` 已移除（见 renderFrame 里的说明）：
+   * 蓝色检测框是本项目里一个静态装饰，不随粒子流动、也不是真实检测，
+   * 用户认为「单独放有点丑」，故整套删掉（连同 detection 配色参数）。
    */
-  drawCallouts(ctx, cellW, cellH, originX = 0, originY = 0) {
-    // 4×3 分块找最亮块（块内亮度和最高即「标志主体」所在）
-    const BLOCK = 8
-    let bestScore = 0
-    let bestX = 0
-    let bestY = 0
-    for (let by = 0; by < GRID_H - BLOCK; by += BLOCK) {
-      for (let bx = 0; bx < GRID_W - BLOCK; bx += BLOCK) {
-        let sum = 0
-        for (let y = by; y < by + BLOCK; y += 1) {
-          for (let x = bx; x < bx + BLOCK; x += 1) {
-            const v = this.luminance === undefined ? 0 : this.luminance[y * GRID_W + x]
-            sum += v
-          }
-        }
-        if (sum > bestScore) {
-          bestScore = sum
-          bestX = bx
-          bestY = by
-        }
-      }
-    }
-    // 空场（几乎全黑）不画框（原示例同判据：最亮均值 < 0.04 忽略）
-    if (bestScore / (BLOCK * BLOCK) < 0.04) return
-
-    const padding = 1
-    const gx0 = Math.max(0, bestX - padding)
-    const gy0 = Math.max(0, bestY - padding)
-    const gx1 = Math.min(GRID_W, bestX + BLOCK + padding)
-    const gy1 = Math.min(GRID_H, bestY + BLOCK + padding)
-    const x = originX + gx0 * cellW
-    const y = originY + gy0 * cellH
-    const w = (gx1 - gx0) * cellW
-    const h = (gy1 - gy0) * cellH
-
-    ctx.save()
-    ctx.globalAlpha = 0.9
-    ctx.strokeStyle = this.detection
-    ctx.lineWidth = 1.2
-    // 淡填充
-    ctx.fillStyle = this.detection
-    ctx.globalAlpha = 0.06
-    ctx.fillRect(x, y, w, h)
-    // 框
-    ctx.globalAlpha = 0.9
-    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1)
-
-    // 四角强调（每角两段短线，比整框更「仪器感」）
-    const corner = Math.min(10, w / 3, h / 3)
-    ctx.lineWidth = 1.8
-    ctx.beginPath()
-    ctx.moveTo(x, y + corner); ctx.lineTo(x, y); ctx.lineTo(x + corner, y)
-    ctx.moveTo(x + w - corner, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + corner)
-    ctx.moveTo(x, y + h - corner); ctx.lineTo(x, y + h); ctx.lineTo(x + corner, y + h)
-    ctx.moveTo(x + w - corner, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - corner)
-    ctx.stroke()
-
-    // 坐标标签
-    ctx.globalAlpha = 0.75
-    ctx.font = '9px ui-monospace, monospace'
-    ctx.fillStyle = this.detection
-    ctx.fillText(`${(bestX).toFixed(0)},${(bestY).toFixed(0)}`, x + 3, y + h - 4)
-    ctx.restore()
-  }
 
   destroy() {
     this.canvas.width = 0

@@ -1155,29 +1155,38 @@ body {
  * 位置固定在卡片右下（展开/折叠都在同一处 —— 移动的按钮会让用户找不到）。
  * 折叠时向上指（暗示「点我展开」），展开时向下指。
  */
+/**
+ * 展开箭头：**纯文字式小箭头**，不要圆形按钮（2026-11-12，用户要求）。
+ *
+ * 用户原话：「那个箭头不要用圆形图标了，就用示例的那种小箭头就行」。
+ * 示例里是 `Reveal the source →` 那种「文字 + 箭头」的极简形态，
+ * 圆形按钮显得笨重，也破坏了卡片的展示感。
+ *
+ * 故：无边框、无底色，只有一个小箭头；hover 时箭头轻微下移并变亮。
+ */
 .card-expand {
   position: absolute;
-  right: 14px;
-  bottom: 12px;
+  right: 22px;
+  bottom: 16px;
   z-index: 3;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--surface-1) 82%, transparent);
-  color: var(--text-dim);
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--text-faint);
   cursor: pointer;
   display: grid;
   place-items: center;
   padding: 0;
-  transition: background .2s, border-color .2s, color .2s, transform .2s;
+  transition: color .22s ease, transform .22s ease;
 }
 .card-expand:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--surface-1) 95%, transparent);
+  color: var(--text);
+  transform: translateY(2px);
 }
-.card-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card:not(.is-collapsed) .card-expand:hover { transform: translateY(-2px); }
+.card-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
 /*
  * 箭头本身：用两条边框拼的 V 形，不用图标字体。
  *
@@ -1190,8 +1199,8 @@ body {
 .card-expand-arrow {
   width: 7px;
   height: 7px;
-  border-right: 1.6px solid currentColor;
-  border-bottom: 1.6px solid currentColor;
+  border-right: 1.4px solid currentColor;
+  border-bottom: 1.4px solid currentColor;
   transform: rotate(45deg) translate(-1px, -1px);
   transition: transform .3s cubic-bezier(.2, .7, .3, 1);
 }
@@ -1250,3 +1259,192 @@ body {
 }
 /* 折叠态下 head-right 里的「锁定永久积分」开关对小卡片太挤，缩小 */
 .card.is-collapsed .card-head-right .switch { font-size: 11px; opacity: .8; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 亮色主题补全（2026-11-12 第二轮，用户反馈「很多地方沒有更改」）
+ *
+ * 根因：上面那批组件（pill / tag / endpoint / copyable / logs / heat / chart）
+ * 的颜色是**硬编码的深色值**，没走 CSS 变量 ⇒ 切到亮色后仍是深底浅字，
+ * 表现为「蓝字在浅底上完全看不清」。
+ *
+ * 这里逐个覆盖成亮色对应值。原则：**同语义、同对比度**，不是简单反相。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* ① 状态药丸 */
+[data-theme="light"] .pill-ok { color: #0f7a4e; border-color: #a7ddc4; background: #e8f7f0; }
+[data-theme="light"] .pill-err { color: #b3372c; border-color: #f0c0bb; background: #fdecea; }
+[data-theme="light"] .pill-muted { color: var(--text-dim); background: var(--surface-2); }
+
+/* ② 标签 */
+[data-theme="light"] .tag { background: var(--surface-2); border-color: var(--border-soft); }
+[data-theme="light"] .tag-ok { color: #0f7a4e; background: #e8f7f0; border-color: #b7e2cd; }
+[data-theme="light"] .tag-warn { color: #8a5a00; background: #fdf4e3; border-color: #ecd9b0; }
+[data-theme="light"] .tag-err { color: #b3372c; background: #fdecea; border-color: #f2c8c3; }
+[data-theme="light"] .tag-accent { color: #2a4fb8; background: #eaf0ff; border-color: #ccd9ff; }
+[data-theme="light"] .tag-on { color: #2a4fb8; background: #eaf0ff; border-color: #d5e0ff; }
+
+/* ③ 端点卡片：局域网那块原本是深蓝渐变 */
+[data-theme="light"] .endpoint-lan {
+  border-color: #cdd9f5;
+  background: linear-gradient(180deg, #f4f7ff, #ffffff);
+}
+[data-theme="light"] .endpoint-current {
+  border-color: #a8bdf0;
+  box-shadow: 0 0 0 1px #2f6df61a;
+}
+[data-theme="light"] .endpoint code {
+  background: #eef2fb; color: #2a4fb8;
+}
+[data-theme="light"] .endpoint-decision {
+  background: #f7f9ff; border-color: #c3cff2;
+}
+
+/* ④ 可复制代码块 */
+[data-theme="light"] .copyable {
+  background: #eef2fb; border-color: #d5deef; color: #2a4fb8;
+}
+[data-theme="light"] .copyable:hover { border-color: #a8bdf0; background: #e4ebfa; }
+[data-theme="light"] .inline-code { background: #eef2fb; color: #2a4fb8; }
+
+/* ⑤ 日志区（原本是近黑底 + 浅字） */
+[data-theme="light"] .logs {
+  background: #f7f8f5; border-color: var(--border-soft); color: #4a4f47;
+}
+
+/* ⑥ 活跃度方块 */
+[data-theme="light"] .heat-cell.lv0 { background: #eceee7; }
+[data-theme="light"] .heat-cell.lv1 { background: #c9d7fb; }
+[data-theme="light"] .heat-cell.lv2 { background: #a3bcf8; }
+[data-theme="light"] .heat-cell.lv3 { background: #7098f2; }
+[data-theme="light"] .heat-cell.lv4 { background: #2f6df6; }
+
+/* ⑦ 图表：SVG 里的点与网格线也是硬编码深色 */
+[data-theme="light"] .chart-svg .grid-line { stroke: #e4e6de; }
+[data-theme="light"] .chart-svg .axis-label { fill: #8a8d84; }
+[data-theme="light"] .chart-svg .dot { fill: #ffffff; stroke: #2f6df6; }
+[data-theme="light"] .chart-svg .area { fill: url(#gradArea); opacity: .18; }
+
+/* ⑧ 账号卡片 */
+[data-theme="light"] .account { background: var(--surface-2); border-color: var(--border-soft); }
+[data-theme="light"] .account:hover { background: var(--surface-3); }
+
+/* ⑨ 模型管理面板 */
+[data-theme="light"] .model-row { background: var(--surface-2); border-color: var(--border-soft); }
+[data-theme="light"] .model-row:hover { background: var(--surface-3); }
+[data-theme="light"] .model-id { color: var(--text-faint); }
+
+/* ⑩ 顶栏按钮与输入框 */
+[data-theme="light"] .btn {
+  background: #ffffff; border-color: #dcdcd4; color: var(--text-dim);
+}
+[data-theme="light"] .btn:hover { background: #f4f4f0; border-color: #c9cac2; color: var(--text); }
+[data-theme="light"] .btn-primary {
+  background: var(--accent); border-color: var(--accent); color: #ffffff;
+}
+[data-theme="light"] .btn-primary:hover { background: #2159d8; border-color: #2159d8; }
+[data-theme="light"] .model-search, [data-theme="light"] input[type="search"],
+[data-theme="light"] input[type="url"], [data-theme="light"] input[type="text"] {
+  background: #ffffff; border-color: #dcdcd4; color: var(--text);
+}
+
+/*
+ * ⑪ **渐变文字在亮色下失真**（用户反馈「蓝色字体在亮色下完全看不清」）
+ *
+ * `.usage-num` / `.brand h1` 用 `--grad` 做 `background-clip: text`。
+ * 亮色下渐变末端是浅紫（#b48cff），叠在白底上对比度极低。
+ * 亮色改为**纯色深蓝**，不用渐变 —— 数字要的是「一眼可读」，不是装饰。
+ */
+[data-theme="light"] .usage-num,
+[data-theme="light"] .brand h1 {
+  background: none;
+  -webkit-background-clip: initial;
+  background-clip: initial;
+  -webkit-text-fill-color: var(--text);
+  color: var(--text);
+}
+/* 数字用强调色，比正文更有层级（但仍保证对比度 ≥ 4.5:1） */
+[data-theme="light"] .usage-num { color: #1c47c4; -webkit-text-fill-color: #1c47c4; }
+[data-theme="light"] .usage-card-warn .usage-num {
+  color: #8a5a00; -webkit-text-fill-color: #8a5a00;
+}
+
+/* ⑫ 时间范围切换按钮 */
+[data-theme="light"] .range { background: #ffffff; border-color: #dcdcd4; color: var(--text-dim); }
+[data-theme="light"] .range.is-active { background: #1c2b4a; border-color: #1c2b4a; color: #ffffff; }
+
+/* ⑬ 侧栏/更多菜单 */
+[data-theme="light"] .more { background: var(--surface-2); border-color: var(--border-soft); }
+
+/* ═══════════════ 2026-11-12 第三轮：卡片比例与页面留白 ═══════════════
+ *
+ * 用户反馈：「感觉供应商这里是不是感觉还是太瘪了，更具例子做长一点吧，
+ * 整个界面左右留白多一些，看着不臃肿，里面的动态粒子紧凑一点」
+ *
+ * 参照示例的卡片：宽高比 **0.70**（也就是 1:1.43，竖向更修长）。
+ * 我们之前是 1.47:1（横向偏扁），与示例正好反着 —— 难怪「瘪」。
+ */
+
+/* ① 卡片改成竖向修长的比例，接近示例的 0.70 */
+.card.is-collapsed {
+  min-height: 380px;
+}
+@media (max-width: 1100px) {
+  .card.is-collapsed { min-height: 330px; }
+}
+@media (max-width: 900px) {
+  .card.is-collapsed { min-height: 300px; }
+}
+@media (max-width: 620px) {
+  .card.is-collapsed { min-height: 260px; }
+}
+
+/* ② 内容区左右留白加大，卡片网格从 3 列 → 更宽的 2~3 列，看着不臃肿 */
+main { max-width: 1320px; margin: 0 auto; padding: 28px 44px 60px; }
+@media (max-width: 1100px) { main { padding: 24px 28px 48px; } }
+@media (max-width: 720px) { main { padding: 18px 16px 40px; } }
+
+/* 卡片网格：最小宽度提上去，列数自然减少，每张卡更舒展 */
+.grid {
+  gap: 20px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+@media (min-width: 1180px) {
+  .grid { grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }
+}
+
+/* ③ 折叠态卡片内边距：给标志更多呼吸空间 */
+.card.is-collapsed {
+  padding: 16px 18px 30px;
+}
+
+/* ④ 标题行的字号略提，与更大的卡片匹配 */
+.card.is-collapsed .card-title { font-size: 15.5px; }
+.card.is-collapsed .card-id { font-size: 11.5px; }
+
+/*
+ * ⑤ 展开箭头：更靠外、更小、更淡 —— 只是「提示还能展开」，不是主按钮
+ */
+.card-expand {
+  right: 18px;
+  bottom: 14px;
+  opacity: .55;
+}
+.card:hover .card-expand { opacity: .9; }
+/* 折叠态下整张卡可点，箭头只是视觉提示 */
+.card.is-collapsed .card-expand { pointer-events: auto; }
+
+/* ═══════════════ 亮色表格可读性（第三轮补）═══════════════
+ *
+ * `.usage-key` / `.extra code` 硬编码成 `#c8d2ff` / `#a9b6e8`（浅蓝紫），
+ * 那是给深色底设计的 —— 换成亮色后这两个颜色在 #fafaf8 上的对比度只有
+ * 约 1.6:1，**几乎看不见**（截图确认：表格第一列的供应商名/模型名糊成一片）。
+ * 亮色改用深蓝，对比度 > 7:1。
+ */
+[data-theme="light"] .usage-key { color: #1c47c4; }
+[data-theme="light"] .extra code { color: #2a4fb8; }
+[data-theme="light"] .usage-table td { border-bottom-color: var(--border-soft); }
+[data-theme="light"] .extra td { border-bottom-color: var(--border-soft); }
+[data-theme="light"] .usage-table tbody tr:hover td { background: #2527250a; }
+/* 表格数字在亮色下要够深（默认继承 --text，但表头稍淡仍要能读） */
+[data-theme="light"] .usage-table th { color: #6a6e66; }
+[data-theme="light"] .usage-table td { color: var(--text); }

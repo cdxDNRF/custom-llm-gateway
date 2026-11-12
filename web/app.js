@@ -189,16 +189,39 @@ function attachLineField(card, provider) {
     detection: isLight ? '#1f5fdb' : '#267dff',
   })
 
+  /**
+   * 帧循环策略（2026-11-12 第三轮调整）。
+   *
+   * 上一版：只在悬停的卡上跑满帧，其余静止 —— 用户觉得「粒子不够活」。
+   * 现在：**所有卡都持续缓慢流动**，但用**降帧**控制成本：
+   *
+   * | 状态 | 目标帧率 |
+   * |---|---|
+   * | 空闲（默认） | ~20 fps（噪声本身很慢，20fps 看不出卡顿） |
+   * | 悬停 / 聚焦 | 满帧 60 fps（指针脉冲要跟手） |
+   *
+   * 成本对比：7 卡 × 3456 段 × 20fps ≈ 48 万次/秒（空闲）
+   *           单卡 × 3456 × 60fps ≈ 20 万次/秒（悬停时只 1 张卡满帧）
+   * 远低于「全部满帧」的 145 万次/秒。
+   */
   let raf = 0
   let last = 0
   let active = false
+  let hovered = false
+  /** 空闲时的最小帧间隔（毫秒）。1000/20 = 50ms。 */
+  const IDLE_FRAME_MS = 50
+  let lastDraw = 0
 
   const tick = (now) => {
     if (!active) { raf = 0; return }
-    // dt clamp：长暂停（切标签页回来）不能给巨大步长，否则线条会「炸开」
     const dt = last === 0 ? 1 / 60 : Math.min(1 / 30, (now - last) / 1000)
     last = now
-    field.renderFrame(dt)
+    // 空闲降帧：没到下一帧的时间点就跳过（不绘制，但仍保持 rAF 循环）
+    const interval = hovered ? 0 : IDLE_FRAME_MS
+    if (now - lastDraw >= interval) {
+      lastDraw = now
+      field.renderFrame(dt)
+    }
     raf = requestAnimationFrame(tick)
   }
 
@@ -208,11 +231,11 @@ function attachLineField(card, provider) {
     last = 0
     if (raf === 0) raf = requestAnimationFrame(tick)
   }
+  /** 只停指针脉冲效果，**不停帧循环**（卡片要一直缓慢流动）。 */
   const stop = () => {
-    active = false
-    if (raf !== 0) { cancelAnimationFrame(raf); raf = 0 }
-    // 停在静态一帧（不留半截状态）
-    field.renderFrame(1 / 60)
+    hovered = false
+    field.clearPointer()
+    field.focused = false
   }
 
   // ── 尺寸 / DPR 同步（DPR 单独变化 ResizeObserver 不触发，故也监听 matchMedia）──
@@ -246,17 +269,16 @@ function attachLineField(card, provider) {
   dprQuery.addEventListener('change', onDpr)
 
   // ── 指针 / 焦点 ──
+  card.addEventListener('pointerenter', () => { hovered = true })
   card.addEventListener('pointermove', (event) => {
+    hovered = true
     const rect = canvas.getBoundingClientRect()
     field.movePointer(event.clientX - rect.left, event.clientY - rect.top)
     start()
   })
-  card.addEventListener('pointerleave', () => {
-    field.clearPointer()
-    stop()
-  })
-  card.addEventListener('focusin', () => { field.focused = true; start() })
-  card.addEventListener('focusout', () => { field.focused = false; stop() })
+  card.addEventListener('pointerleave', () => stop())
+  card.addEventListener('focusin', () => { hovered = true; field.focused = true; start() })
+  card.addEventListener('focusout', () => stop())
 
   // ── 静态首帧：等图标采样完（只读一次像素）──
   const src = window.PROVIDER_ICONS?.[provider.id]
@@ -269,6 +291,8 @@ function attachLineField(card, provider) {
   } else {
     paint()
   }
+  // 所有卡片都持续缓慢流动（不只在悬停时）
+  start()
 }
 
 /**
