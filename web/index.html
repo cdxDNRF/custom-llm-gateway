@@ -3,8 +3,30 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>dsh-llm-gateway · 多供应商 LLM 网关</title>
+<!--
+  首屏主题预置：**必须放在 CSS 之前**。
+
+  否则会闪一下暗色再变亮（浏览器先按默认 :root 渲染，等 app.js 跑完才改
+  data-theme）。这段内联脚本同步执行、零网络请求，把闪白/闪黑压到看不见。
+
+  ⚠️ 与 app.js 里的 `resolvedTheme()` 是**同一套规则**（显式设置优先、
+    否则跟系统）。两处必须同步改，否则首屏与后续切换会不一致。
+-->
+<script>
+  (function () {
+    try {
+      var saved = localStorage.getItem('dsh-gateway-theme')
+      var theme = (saved === 'light' || saved === 'dark')
+        ? saved
+        : (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+      document.documentElement.dataset.theme = theme
+    } catch (e) {
+      document.documentElement.dataset.theme = 'dark'
+    }
+  })()
+</script>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -26,6 +48,9 @@
 
   <div class="topbar-actions">
     <span id="conn" class="pill pill-muted">连接中…</span>
+    <button id="theme-toggle" class="btn btn-icon" title="切换亮色 / 暗色主题（也可跟随系统）" aria-pressed="false">
+      <span id="theme-icon" aria-hidden="true">◐</span><span id="theme-label">暗色</span>
+    </button>
     <button id="set-token" class="btn btn-icon" title="设置/清除访问令牌（局域网访问需要；本机 127.0.0.1 可留空）">令牌</button>
     <button id="checkin-all" class="btn btn-icon" title="对所有支持签到的供应商各签一次（今天已领的会跳过）">一键签到</button>
     <button id="refresh-models-all" class="btn btn-icon" title="从上游重新拉取所有供应商的模型目录">重拉模型</button>
@@ -236,6 +261,10 @@
 </main>
 
 <div id="toast" class="toast" hidden></div>
+<!-- 供应商图标（内联 data URI，零网络请求） -->
+<script src="/static/icons.js"></script>
+<!-- 卡片线条动效（Canvas 2D，纯本地计算） -->
+<script src="/static/line-field.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

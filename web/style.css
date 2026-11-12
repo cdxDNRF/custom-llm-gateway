@@ -914,3 +914,169 @@ body {
 /* 概览卡片：数值与标签之间留白更从容 */
 .usage-num { font-family: var(--font-display); font-size: 26px; letter-spacing: -.01em; }
 .usage-label { font-size: 11.5px; color: var(--text-faint); margin-top: 5px; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 亮色 / 暗色主题（2026-11-12 用户要求「ui做个亮色和暗色两种切换」）
+ *
+ * 做法：`<html data-theme="dark|light">` 上挂变量覆盖。
+ * 暗色是默认（沿用上面的 :root），亮色在下面整块重定义。
+ *
+ * ⚠️ 亮色不是「把暗色反相」—— 那样会得到刺眼的纯白 + 纯黑字。参照
+ *    StyleKit 示例用的是 **暖白底（#fafaf8）+ 近黑字（#252725）**，
+ *    卡片表面比底色**更白**（#ffffff），层级靠边框而不是阴影。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+[data-theme="light"] {
+  --bg: #fafaf8;
+  --surface-1: #ffffff;
+  --surface-2: #f4f4f0;
+  --surface-3: #ecece6;
+  --border: #dcdcd4;
+  --border-soft: #e6e6df;
+
+  --text: #252725;
+  --text-dim: #5f635c;
+  --text-faint: #8a8d84;
+
+  --accent: #2f6df6;
+  --accent-2: #7a55e8;
+  --accent-soft: #2f6df614;
+  --grad: linear-gradient(135deg, #2f6df6 0%, #7a55e8 100%);
+
+  --ok: #1f9d6b;
+  --warn: #b26a05;
+  --err: #cc3f34;
+
+  /* 亮色下用极轻的层叠阴影（不是模糊大阴影，只是 1-2px 的接触感） */
+  --shadow: 0 1px 2px #25272514, 0 2px 6px #2527250f;
+}
+
+[data-theme="light"] body {
+  background-image:
+    radial-gradient(900px 360px at 10% -6%, #2f6df60b, transparent 60%),
+    radial-gradient(700px 300px at 92% -10%, #7a55e80a, transparent 62%);
+}
+[data-theme="light"] .topbar { background: #fafaf8; }
+[data-theme="light"] .logo { border-color: var(--accent); }
+[data-theme="light"] .tab:hover { color: var(--text-dim); }
+[data-theme="light"] .btn-primary { color: #ffffff; }
+[data-theme="light"] .btn-accent { background: #f0f4ff; }
+[data-theme="light"] .btn-accent:hover { background: #e6edff; }
+[data-theme="light"] .dialog { box-shadow: 0 24px 64px #2527252e; }
+[data-theme="light"] .dialog::backdrop { background: #25272559; }
+[data-theme="light"] .switch-track { background: #dcdcd4; border-color: #cfcfc6; }
+[data-theme="light"] .switch-track::after { background: #ffffff; }
+[data-theme="light"] .switch-mini input:checked + .switch-track { background: var(--accent-soft); }
+[data-theme="light"] .usage-card-warn {
+  border-color: #e5cf9d; background: linear-gradient(180deg, #fffaf0, #fff6e6);
+}
+[data-theme="light"] .token-ring circle:first-child { stroke: rgba(37,39,37,.08); }
+[data-theme="light"] .token-key-in i { background: #2f6df6; }
+[data-theme="light"] .token-key-out i { background: #7a55e8; }
+[data-theme="light"] .token-ring-num { fill: var(--text); }
+[data-theme="light"] .endpoint-decision {
+  background: #f7f8ff; border-color: #c5cdf0;
+}
+[data-theme="light"] .topbar-actions .btn { border-color: #dedfd9; color: var(--text-dim); }
+[data-theme="light"] .topbar-actions .btn:hover { border-color: #c9cac2; color: var(--text); }
+[data-theme="light"] .card:hover { border-color: #cfcfc6; }
+[data-theme="light"] .copyable { background: var(--surface-2); color: #2f6df6; }
+[data-theme="light"] .inline-code { background: var(--surface-2); color: #2f6df6; }
+[data-theme="light"] pre, [data-theme="light"] .logs {
+  background: var(--surface-2); color: var(--text-dim); border-color: var(--border-soft);
+}
+[data-theme="light"] .tag-on { background: #f0f4ff; color: #2f6df6; border-color: #d5e0ff; }
+[data-theme="light"] .heat-cell.lv0 { background: #ecece6; }
+[data-theme="light"] .heat-cell.lv1 { background: #c8d6ff; }
+[data-theme="light"] .heat-cell.lv2 { background: #94aeff; }
+[data-theme="light"] .heat-cell.lv3 { background: #5f83f8; }
+[data-theme="light"] .heat-cell.lv4 { background: #2f6df6; }
+
+/* 主题切换按钮：小图标 + 文字，图标随主题转 180° */
+#theme-toggle { display: inline-flex; align-items: center; gap: 6px; }
+#theme-icon {
+  display: inline-block; font-size: 13px; line-height: 1;
+  transition: transform .35s cubic-bezier(.2,.7,.3,1);
+}
+[data-theme="light"] #theme-icon { transform: rotate(180deg); }
+
+/* ═══════════════ 供应商图标 ═══════════════
+ *
+ * 图标来自 `web/icons.js`（从上游插件导出的内联 data URI）。
+ * 尺寸用 `em` 跟随字号，方便卡片/开关面板两处复用同一套类名。
+ */
+.provider-icon {
+  flex: none;
+  object-fit: contain;
+  border-radius: 6px;
+  /* 深色图标在暗色底上会糊掉，给一点极淡的衬底（不描边、不模糊） */
+  background: rgba(255, 255, 255, .06);
+  padding: 2px;
+}
+[data-theme="light"] .provider-icon { background: rgba(0, 0, 0, .04); }
+.provider-icon-lg { width: 30px; height: 30px; border-radius: 8px; padding: 3px; }
+.provider-icon-sm { width: 20px; height: 20px; border-radius: 6px; padding: 1px; }
+/* 没有图标的供应商：不占位（img 元素压根不渲染） */
+
+/* 开关面板栅格：多了一列图标 */
+.switch-row { grid-template-columns: 18px 20px 1fr auto 52px 46px; }
+@media (max-width: 720px) {
+  .switch-row { grid-template-columns: 18px 20px 1fr auto 46px; }
+}
+
+/* 卡片头部：图标与标题同行对齐 */
+.card-head { align-items: center; }
+
+/* ═══════════════ 供应商卡片：线条动效画布 ═══════════════
+ *
+ * canvas 铺满卡片、垫在内容下面（`z-index: 0`），卡片内容提到上面。
+ * `overflow: hidden` + 圆角 = 线场被裁进卡片形状（同示例）。
+ * `pointer-events: none`：不能让画布抢走卡片上的点击事件。
+ */
+.card {
+  position: relative;
+  overflow: hidden;
+}
+/*
+ * 线场**只占卡片下半部**（2026-11-12 第二轮，看截图后改的）。
+ *
+ * 第一版铺满整张卡，结果线条盖在账号名/按钮上 —— 文字直接看不清。
+ * 现在：上 42% 完全透明（那里是标题 + 操作按钮），渐变过渡到底部，
+ * 只在「账号列表下方」那块空白处透出图标纹理。
+ *
+ * 这样既保留了「标志被拆成线条」的观感，又不干扰任何可读内容。
+ */
+/*
+ * 线场位置（2026-11-12 第三轮，两次截图后定下来的）。
+ *
+ * 迭代过程，记下来免得后人重走：
+ *   ① 铺满整张卡 → 线条盖住账号名和按钮，字看不清（最差）
+ *   ② 只占下半部 → 卡片高度随账号数变化，账号多时线场被挤成一条缝
+ *   ③ **当前**：固定在右上角一块 150×110 的「徽章区」 ——
+ *      那片区域永远是空白（标题在左、锁定开关在同行的右，但只在账号少时才有），
+ *      线场作为**装饰纹理**待在那里，不会随账号数量时有时无。
+ *
+ * 配合 `border-radius` 裁切，看起来像卡片的「水印徽记」。
+ */
+.card-field {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 190px;
+  height: 130px;
+  z-index: 0;
+  pointer-events: none;
+  opacity: .75;
+  /* 从右下角往外淡出，线场像卡片的「底纹」而不是一个贴上去的方块 */
+  -webkit-mask-image: radial-gradient(130% 120% at 100% 100%, #000 30%, transparent 76%);
+  mask-image: radial-gradient(130% 120% at 100% 100%, #000 30%, transparent 76%);
+}
+/* 卡片内容必须在画布之上 */
+.card > *:not(.card-field) { position: relative; z-index: 1; }
+
+/* 卡片悬停时线场更明显一点（与线场自身的脉冲呼应） */
+.card:hover .card-field { opacity: 1; }
+
+/* 亮色主题下线场偏淡（白底上深线太抢眼） */
+[data-theme="light"] .card-field { opacity: .55; }
+[data-theme="light"] .card:hover .card-field { opacity: .8; }

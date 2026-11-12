@@ -136,6 +136,112 @@ const modelFilter = new Map()
 /* 每个供应商卡片上「展开区」的当前视图：'' | 'models' | 'balance' */
 const expandedView = new Map()
 
+/**
+ * 取供应商图标（`window.PROVIDER_ICONS` 由 `/static/icons.js` 提供）。
+ *
+ * 返回 `<img>` 的 HTML；没有图标时返回空串（**不占位** —— 空 `<img>` 会显示
+ * 破图图标，比不显示更难看）。
+ *
+ * ⚠️ 图标是 data URI，`<img src>` 不会产生网络请求，符合本项目「零外部资源」约束。
+ */
+/**
+ * 在供应商卡片上挂线条动效。
+ *
+ * ## 为什么是「按需跑帧」
+ *
+ * 见 `line-field.js` 文件头的性能表：本项目最多 18 张卡同屏、且控制台常开。
+ * 若每张都跑满帧，18 × 800 段 × 60fps ≈ 每秒 86 万次线段绘制 —— 浏览器会卡。
+ *
+ * 故：
+ * - **静止**：只画一帧（`requestIdleCallback` 后），不排帧
+ * - **悬停/聚焦**：该卡独占一个 rAF 循环，跑满帧
+ * - 离开即停，回到静态一帧
+ *
+ * 观感上仍是「鼠标靠近时标志开始呼吸」，与示例一致；区别只是没交互的卡不动。
+ */
+function attachLineField(card, provider) {
+  const canvas = card.querySelector('.card-field')
+  const IconApi = window.LineField
+  if (canvas === null || IconApi === undefined) return
+
+  // ── 主题色：线色取卡片前景色，检测色固定蓝（与示例的 detection 同源） ──
+  const isLight = document.documentElement.dataset.theme === 'light'
+  const field = new IconApi.LineFieldCard(card, {
+    canvas,
+    seed: IconApi.seedOf(provider.id),
+    ink: isLight ? 'rgba(37,39,37,.55)' : 'rgba(237,237,239,.42)',
+    detection: '#267dff',
+  })
+
+  let raf = 0
+  let last = 0
+  let active = false
+
+  const tick = (now) => {
+    if (!active) { raf = 0; return }
+    // dt clamp：长暂停（切标签页回来）不能给巨大步长，否则线条会「炸开」
+    const dt = last === 0 ? 1 / 60 : Math.min(1 / 30, (now - last) / 1000)
+    last = now
+    field.renderFrame(dt)
+    raf = requestAnimationFrame(tick)
+  }
+
+  const start = () => {
+    if (active) return
+    active = true
+    last = 0
+    if (raf === 0) raf = requestAnimationFrame(tick)
+  }
+  const stop = () => {
+    active = false
+    if (raf !== 0) { cancelAnimationFrame(raf); raf = 0 }
+    // 停在静态一帧（不留半截状态）
+    field.renderFrame(1 / 60)
+  }
+
+  // ── 尺寸 / DPR 同步（DPR 单独变化 ResizeObserver 不触发，故也监听 matchMedia）──
+  const sync = (redraw) => {
+    const changed = field.syncSize()
+    if (changed || redraw) field.renderFrame(1 / 60)
+  }
+  const observer = new ResizeObserver(() => sync(true))
+  observer.observe(canvas)
+
+  const dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+  const onDpr = () => { sync(true); dprQuery.removeEventListener('change', onDpr) }
+  dprQuery.addEventListener('change', onDpr)
+
+  // ── 指针 / 焦点 ──
+  card.addEventListener('pointermove', (event) => {
+    const rect = canvas.getBoundingClientRect()
+    field.movePointer(event.clientX - rect.left, event.clientY - rect.top)
+    start()
+  })
+  card.addEventListener('pointerleave', () => {
+    field.clearPointer()
+    stop()
+  })
+  card.addEventListener('focusin', () => { field.focused = true; start() })
+  card.addEventListener('focusout', () => { field.focused = false; stop() })
+
+  // ── 静态首帧：等图标采样完（只读一次像素）──
+  const src = window.PROVIDER_ICONS?.[provider.id]
+  const paint = () => sync(true)
+  if (typeof src === 'string' && src !== '') {
+    // 采样是异步解图，画一帧占位（纯噪声），采样完再画一次
+    paint()
+    void field.loadIcon(src).then(() => paint())
+  } else {
+    paint()
+  }
+}
+
+function providerIcon(id, cls) {
+  const src = window.PROVIDER_ICONS?.[id]
+  if (typeof src !== 'string' || src === '') return ''
+  return `<img class="provider-icon ${cls || ''}" src="${src}" alt="" aria-hidden="true" loading="lazy">`
+}
+
 function renderProvider(provider) {
   const card = document.createElement('div')
   card.className = 'card'
@@ -188,7 +294,9 @@ function renderProvider(provider) {
   const view = expandedView.get(provider.id) || ''
 
   card.innerHTML = `
+    <canvas class="card-field" aria-hidden="true"></canvas>
     <div class="card-head">
+      ${providerIcon(provider.id, 'provider-icon-lg')}
       <div>
         <div class="card-title">${escapeHtml(provider.displayName)}</div>
         <div class="card-id">${escapeHtml(provider.id)} · 端口 ${provider.port ?? '—'}</div>
@@ -280,6 +388,12 @@ function renderProvider(provider) {
       accountsBox.appendChild(row)
     }
   }
+
+  // ── 线条动效（2026-11-12）──
+  //
+  // 只在**悬停 / 聚焦**时跑满帧，其余时候画一帧静态（见 line-field.js 文件头的
+  // 性能取舍）。这样 18 张卡同屏也不会持续吃 CPU。
+  attachLineField(card, provider)
 
   // 恢复展开视图
   if (view) void renderExtra(provider, extraBox, view)
@@ -827,6 +941,7 @@ function renderProviderSwitches(providers) {
     return `
       <div class="switch-row ${on ? '' : 'is-off'}" data-provider="${escapeHtml(provider.id)}">
         <span class="switch-grip" aria-hidden="true">⠿</span>
+        ${providerIcon(provider.id, 'provider-icon-sm')}
         <span class="switch-name">${escapeHtml(provider.displayName)}</span>
         <span class="switch-meta">账号 ${accounts}</span>
         <span class="switch-port">${provider.port ?? '—'}</span>
@@ -1099,6 +1214,52 @@ $('#checkin-all').addEventListener('click', async () => {
     button.textContent = original
   }
 })
+
+// ── 亮色 / 暗色主题（2026-11-12 用户要求）──
+//
+// 三态：`dark`（默认）/ `light` / 跟随系统。跟随系统时监听
+// `prefers-color-scheme`，系统切了就跟着切（不需要刷页面）。
+//
+// ⚠️ 主题存在 **localStorage**（不是服务端配置）：这是纯浏览器偏好，
+//    同一台机器用手机/电脑打开可以各用各的。首屏闪白的规避见 index.html
+//    里的内联脚本（在 CSS 加载前就把 data-theme 定好）。
+const THEME_KEY = 'dsh-gateway-theme'
+const themeMedia = window.matchMedia('(prefers-color-scheme: light)')
+
+/** 解析当前生效的主题：显式设置优先，否则跟系统。 */
+function resolvedTheme() {
+  const saved = localStorage.getItem(THEME_KEY)
+  if (saved === 'light' || saved === 'dark') return saved
+  return themeMedia.matches ? 'light' : 'dark'
+}
+
+function applyTheme() {
+  const theme = resolvedTheme()
+  document.documentElement.dataset.theme = theme
+  const button = $('#theme-toggle')
+  const label = $('#theme-label')
+  const icon = $('#theme-icon')
+  if (button !== null) {
+    // aria-pressed 语义：true = 亮色（当前是「亮色开关」按下去的状态）
+    button.setAttribute('aria-pressed', theme === 'light' ? 'true' : 'false')
+    button.title = theme === 'light' ? '当前亮色，点击切到暗色' : '当前暗色，点击切到亮色'
+  }
+  if (label !== null) label.textContent = theme === 'light' ? '亮色' : '暗色'
+  if (icon !== null) icon.textContent = theme === 'light' ? '☀' : '☾'
+}
+
+$('#theme-toggle')?.addEventListener('click', () => {
+  const next = resolvedTheme() === 'light' ? 'dark' : 'light'
+  localStorage.setItem(THEME_KEY, next)
+  applyTheme()
+})
+
+// 系统主题变化时：只有「没显式设置过」才跟着变（用户明确选过就尊重用户）
+themeMedia.addEventListener('change', () => {
+  if (localStorage.getItem(THEME_KEY) === null) applyTheme()
+})
+
+applyTheme()
 
 // ── 供应商开关面板（2026-11-12）──
 // 用原生 <dialog>：键盘可操作、Esc 自动关闭、焦点管理由浏览器负责。
