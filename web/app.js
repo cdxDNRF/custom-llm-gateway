@@ -181,12 +181,17 @@ function attachLineField(card, provider) {
    * `opacity`（亮色我设了 .55），两层一乘只剩 .3，等于没有。
    * 现在：亮色用更深的不透明线（.92），CSS 层给 .75，净效果与暗色可比。
    */
-  const isLight = document.documentElement.dataset.theme === 'light'
+  /**
+   * 线色：**用图标自己的品牌主色**（用户要求「改成彩色的，跟图标一致」）。
+   *
+   * ⚠️ 这里的初始值只是「采样完成前的占位」：`field.loadIcon()` 采完会把
+   *    `field.ink` 覆盖成从图标算出来的实际主色（见 line-field.js 的
+   *    `sampleIcon`）。故占位色用中性灰即可，不必按主题区分。
+   */
   const field = new IconApi.LineFieldCard(card, {
     canvas,
     seed: IconApi.seedOf(provider.id),
-    ink: isLight ? 'rgba(28,30,28,.92)' : 'rgba(237,237,239,.9)',
-    detection: isLight ? '#1f5fdb' : '#267dff',
+    ink: 'rgba(160,163,168,.9)',
   })
 
   /**
@@ -256,13 +261,11 @@ function attachLineField(card, provider) {
     requestAnimationFrame(() => sync(true))
   })
 
-  // 主题切换 → 线色必须跟着换（线色是构造时的常量，不是 CSS 变量）
-  card.addEventListener('theme-changed', () => {
-    const nowLight = document.documentElement.dataset.theme === 'light'
-    field.ink = nowLight ? 'rgba(28,30,28,.92)' : 'rgba(237,237,239,.9)'
-    field.detection = nowLight ? '#1f5fdb' : '#267dff'
-    sync(true)
-  })
+  /**
+   * 主题切换：**线色不再需要换**（它是图标主色，两个主题下都成立），
+   * 只需要重绘一帧 —— 亮度/透明度的差异由 CSS 的 `[data-theme]` 规则处理。
+   */
+  card.addEventListener('theme-changed', () => sync(true))
 
   const dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
   const onDpr = () => { sync(true); dprQuery.removeEventListener('change', onDpr) }
@@ -305,6 +308,8 @@ function attachLineField(card, provider) {
 const ICON_FALLBACK = {
   aistudio: 'gemini',
   build: 'gemini',
+  // Vertex AI 也是 Google 系（同一朵四色云），上游图标表没有它的 id
+  vertex: 'gemini',
 }
 
 function providerIcon(id, cls) {

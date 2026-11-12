@@ -117,7 +117,20 @@ function bucketOf(value) {
  * @returns 长度 `COUNT` 的 Float32Array；图片加载失败时返回 `undefined`
  *          （卡片退化为纯噪声线场，不影响功能）。
  */
-async function sampleIconLuminance(src) {
+/**
+ * 从图标采样出「亮度表 + 品牌主色」。
+ *
+ * ## 为什么顺带算主色
+ *
+ * 用户要求「动态 UI 改成彩色的，跟图标一致」。手写一张 id→颜色表会有两个问题：
+ * ① 30 家要手抄，必然有错；② 图标换了颜色表不会跟着变。
+ * ⇒ **直接从图标像素里算主色**，永远一致。
+ *
+ * 算法：对**非黑**（有内容的）像素做**饱和度加权平均** ——
+ * 纯白/纯灰的图标（如 OpenCode 的灰标）会退化成中性灰，这是正确的
+ * （它本来就没品牌色）。
+ */
+async function sampleIcon(src) {
   const image = new Image()
   // data URI 不是网络请求；`decode()` 保证画进 canvas 时已就绪。
   image.src = src
@@ -168,6 +181,17 @@ async function sampleIconLuminance(src) {
 
   const pixels = context.getImageData(0, 0, sideW, sideH).data
   const luminance = new Float32Array(COUNT)
+
+  /**
+   * 主色累计：按「饱和度 × 亮度」加权。
+   *
+   * ⚠️ 权重用饱和度而不是纯平均：图标里常有大片白底/透明区，
+   *    纯平均会把品牌色冲淡成灰。
+   */
+  let colorR = 0
+  let colorG = 0
+  let colorB = 0
+  let colorWeight = 0
   for (let gy = 0; gy < GRID_H; gy += 1) {
     for (let gx = 0; gx < GRID_W; gx += 1) {
       let sum = 0
@@ -181,12 +205,56 @@ async function sampleIconLuminance(src) {
         }
       }
       luminance[gy * GRID_W + gx] = sum / (SS * SS)
+
+      // 主色：用该格的中心像素（省掉再循环一遍 5×5）
+      const cx = Math.min(sideW - 1, gx * SS + Math.floor(SS / 2))
+      const cy = Math.min(sideH - 1, gy * SS + Math.floor(SS / 2))
+      const ci = (cy * sideW + cx) * 4
+      const pr = pixels[ci] / 255
+      const pg = pixels[ci + 1] / 255
+      const pb = pixels[ci + 2] / 255
+      const max = Math.max(pr, pg, pb)
+      const min = Math.min(pr, pg, pb)
+      // 饱和度（HSV 的 S）；纯黑/纯白/纯灰的 S 都是 0 ⇒ 权重 0，不影响主色
+      const sat = max === 0 ? 0 : (max - min) / max
+      const weight = sat * max
+      if (weight > 0.02) {
+        colorR += pr * weight
+        colorG += pg * weight
+        colorB += pb * weight
+        colorWeight += weight
+      }
     }
   }
   // 显式释放（原示例同款：把尺寸归零，让像素缓冲可回收）
   scratch.width = 0
   scratch.height = 0
-  return luminance
+
+  /** 主色（无彩色图标时返回 undefined，由调用方回退到主题色）。 */
+  let accent
+  if (colorWeight > 0) {
+    let r = colorR / colorWeight
+    let g = colorG / colorWeight
+    let b = colorB / colorWeight
+    /**
+     * ⚠️⚠️ **必须提亮**（真实问题，2026-11-12 截图确认）。
+     *
+     * 图标主色往往偏暗（Qoder 的深蓝 `rgb(30,41,63)` 画在深色底上几乎看不见，
+     * 实测三张卡里它最糊）。而线场是**细线**，比实心图标对亮度更敏感。
+     *
+     * 做法：把颜色往**高亮度方向**推 —— 保持色相，把最大分量拉到至少 0.85。
+     * 这样深色的图标也能得到一条看得清的、同色相的线。
+     */
+    const max = Math.max(r, g, b)
+    if (max > 0 && max < 0.85) {
+      const scale = 0.85 / max
+      r = Math.min(1, r * scale)
+      g = Math.min(1, g * scale)
+      b = Math.min(1, b * scale)
+    }
+    accent = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`
+  }
+  return { luminance, accent }
 }
 
 /**
@@ -220,7 +288,12 @@ class LineFieldCard {
   /** 加载图标并采样亮度（只做一次；失败也不抛错）。 */
   async loadIcon(src) {
     if (typeof src !== 'string' || src === '') return
-    this.luminance = await sampleIconLuminance(src)
+    const sampled = await sampleIcon(src)
+    if (sampled !== undefined) {
+      this.luminance = sampled.luminance
+      // 主色来自图标本身 ⇒ 线与图标永远同色（用户要求「跟图标一致」）
+      if (sampled.accent !== undefined) this.ink = sampled.accent
+    }
   }
 
   /** 尺寸/DPR 变化时重建 backing store（**不重采样图标**）。 */

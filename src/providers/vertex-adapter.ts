@@ -23,18 +23,39 @@
  *
  * ⇒ Vertex 有**两套并存协议**，同一账号可能只开通其中一套。本渠道走后者。
  *
- * ## `thought_signature` 为什么必须原样回传
+ * ## `thought_signature` —— 本项目最容易踩的坑，完整移植了参考实现
  *
- * 思考模型（gemini-4-* 等）的响应里带
- * `choices[].delta.extra_content.google.thought_signature`，
- * 上游要求**下一轮把 tool_call 连同签名一起传回**，否则 400。
- * 这里按「工具调用 id」缓存 —— 与参考实现 `ThoughtSignatureCache` 同思路。
+ * Gemini 3/4 在返回工具调用时，会在 `tool_calls[]` 上附带
+ * `extra_content.google.thought_signature`。官方文档明确：
+ * **多步工具调用循环中必须原样回传该签名**，否则 400
+ * `Function call is missing a thought_signature in functionCall parts`。
+ *
+ * 而**很多客户端（ZCode 实测）在保存/回传历史时会剥离 `extra_content`**，
+ * 只留 `id` / `type` / `function` ⇒ 第 3 轮起必然 400（前两轮可能因为
+ * 刚好插了 user 消息而「碰巧」通过，极具迷惑性）。
+ *
+ * 故适配器必须**替客户端补全**，三件事缺一不可：
+ *
+ * | 环节 | 做法 |
+ * |---|---|
+ * | ① 录制（非流式） | 从响应 `choices[].message.tool_calls[]` 提取签名 |
+ * | ② 录制（流式） | 解析 SSE，按 `(choice_index, tool_index)` 暂存 id 与签名，**两者都到齐才落缓存** |
+ * | ③ 回传时还原 | 扫描请求 `messages`，给被剥离的 `assistant.tool_calls` 补签名 |
+ *
+ * ⚠️ **缓存未命中时必须兜底**：重启服务前的历史会话没有缓存，此时给该步
+ * **第一个 tool_call** 注入官方兜底标记 `skip_thought_signature_validator`，
+ * 让上游跳过校验而不是整轮 400。
  *
  * ⚠️ 缓存**不落盘**：签名只在同一次多轮对话内有效，跨会话无意义。
+ *
+ * 📌 这段逻辑不是「猜」的 —— 移植自用户已验证的参考实现
+ * （`D:\AIagent\vertex\server.py` 的 `ThoughtSignatureCache` /
+ * `_StreamSignatureTracker` / `_restore_thought_signatures`），
+ * 本轮补上是因为我上一版**只写了读、忘了写**（缓存恒空 ⇒ 等于没有）。
  */
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk, GenerateOptions } from '@deepseek-ai/dsh-llm'
-import { consumeOpenAiSse } from '../../vendor/src/openai-compat.js'
+import { consumeOpenAiSse, serializeMessages } from '../../vendor/src/openai-compat.js'
 import {
   buildVertexChatUrl,
   normalizeVertexModel,
@@ -81,16 +102,224 @@ export interface VertexAdapterOptions {
   warn?: (message: string) => void
 }
 
+/** 官方兜底标记：让上游跳过签名校验（用于缓存未命中的历史会话）。 */
+const SKIP_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator'
+/** 缓存上限（与参考实现一致）。 */
+const MAX_CACHED_SIGNATURES = 4096
+
+/** 从一个 OpenAI tool_call 里读 `extra_content.google.thought_signature`。 */
+function getThoughtSignature(call: unknown): string {
+  if (typeof call !== 'object' || call === null) return ''
+  const extra = (call as Record<string, unknown>).extra_content
+  if (typeof extra !== 'object' || extra === null) return ''
+  const google = (extra as Record<string, unknown>).google
+  if (typeof google !== 'object' || google === null) return ''
+  const signature = (google as Record<string, unknown>).thought_signature
+  return typeof signature === 'string' ? signature : ''
+}
+
+/**
+ * 把 `extra_content` 合并进 tool_call（**不覆盖同名兄弟键**）。
+ *
+ * ⚠️ 用「合并」而不是「赋值」：上游可能在未来往 `extra_content` 里加别的键，
+ * 直接覆盖会把它们抹掉（参考实现也是合并）。
+ */
+function setThoughtSignature(call: Record<string, unknown>, extraContent: Record<string, unknown>): void {
+  const existingExtra = typeof call.extra_content === 'object' && call.extra_content !== null
+    ? { ...(call.extra_content as Record<string, unknown>) }
+    : {}
+  const existingGoogle = typeof existingExtra.google === 'object' && existingExtra.google !== null
+    ? { ...(existingExtra.google as Record<string, unknown>) }
+    : {}
+  const incomingGoogle = extraContent.google
+  if (typeof incomingGoogle === 'object' && incomingGoogle !== null) {
+    Object.assign(existingGoogle, incomingGoogle as Record<string, unknown>)
+  }
+  for (const [key, value] of Object.entries(extraContent)) {
+    if (key !== 'google' && existingExtra[key] === undefined) existingExtra[key] = value
+  }
+  if (Object.keys(existingGoogle).length > 0) existingExtra.google = existingGoogle
+  call.extra_content = existingExtra
+}
+
+/** 有界 LRU：tool_call id → 签名。 */
+class ThoughtSignatureCache {
+  private readonly items = new Map<string, string>()
+
+  get size(): number { return this.items.size }
+
+  put(callId: string, signature: string): void {
+    if (callId === '' || signature === '') return
+    // Map 保序：先删再插 = 移到末尾（最近使用）
+    this.items.delete(callId)
+    this.items.set(callId, signature)
+    while (this.items.size > MAX_CACHED_SIGNATURES) {
+      const oldest = this.items.keys().next().value
+      if (oldest === undefined) break
+      this.items.delete(oldest)
+    }
+  }
+
+  get(callId: string): string | undefined {
+    const signature = this.items.get(callId)
+    if (signature !== undefined) {
+      this.items.delete(callId)
+      this.items.set(callId, signature)
+    }
+    return signature
+  }
+}
+
+/**
+ * 从**流式 SSE**里被动提取签名。
+ *
+ * ⚠️⚠️ 这是最容易写错的一环：SSE 的 `tool_calls` 是**分片**的 ——
+ * `id` 可能在第一个 delta 里，`extra_content.google.thought_signature`
+ * 可能在同一个、也可能在后续 delta 里。故必须按
+ * **`(choiceIndex, toolIndex)` 先暂存两者，都到齐才落缓存**。
+ * 直接对单个 delta 查「有 id 又有签名」会漏掉大半（我上一版就是没做这一步）。
+ */
+class StreamSignatureTracker {
+  private buffer = ''
+  private readonly ids = new Map<string, string>()
+  private readonly signatures = new Map<string, string>()
+
+  constructor(private readonly cache: ThoughtSignatureCache) {}
+
+  /** 喂入原始 SSE 字节（按行解析，不完整的行留到下一次）。 */
+  feed(chunk: Uint8Array): void {
+    this.buffer += new TextDecoder().decode(chunk, { stream: true })
+    let newline = this.buffer.indexOf('\n')
+    while (newline >= 0) {
+      const line = this.buffer.slice(0, newline).trim()
+      this.buffer = this.buffer.slice(newline + 1)
+      newline = this.buffer.indexOf('\n')
+      if (!line.startsWith('data:') || !line.includes('tool_calls')) continue
+      const payload = line.slice(5).trim()
+      if (payload === '' || payload === '[DONE]') continue
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(payload)
+      } catch {
+        continue
+      }
+      this.process(parsed)
+    }
+  }
+
+  private process(data: unknown): void {
+    if (typeof data !== 'object' || data === null) return
+    const choices = (data as Record<string, unknown>).choices
+    if (!Array.isArray(choices)) return
+    choices.forEach((choice, choiceFallback) => {
+      if (typeof choice !== 'object' || choice === null) return
+      const record = choice as Record<string, unknown>
+      const choiceIndex = typeof record.index === 'number' ? record.index : choiceFallback
+      const delta = record.delta
+      if (typeof delta !== 'object' || delta === null) return
+      const toolCalls = (delta as Record<string, unknown>).tool_calls
+      if (!Array.isArray(toolCalls)) return
+      toolCalls.forEach((call, toolFallback) => {
+        if (typeof call !== 'object' || call === null) return
+        const entry = call as Record<string, unknown>
+        const toolIndex = typeof entry.index === 'number' ? entry.index : toolFallback
+        const key = `${choiceIndex}:${toolIndex}`
+        const id = typeof entry.id === 'string' ? entry.id : ''
+        if (id !== '') this.ids.set(key, id)
+        const signature = getThoughtSignature(entry)
+        if (signature !== '') this.signatures.set(key, signature)
+        // 两者都到齐才落缓存
+        const finalId = this.ids.get(key)
+        const finalSignature = this.signatures.get(key)
+        if (finalId !== undefined && finalSignature !== undefined) {
+          this.cache.put(finalId, finalSignature)
+        }
+      })
+    })
+  }
+}
+
+/** 从**非流式**响应里提取签名。 */
+function recordNonStreamSignatures(data: unknown, cache: ThoughtSignatureCache): void {
+  if (typeof data !== 'object' || data === null) return
+  const choices = (data as Record<string, unknown>).choices
+  if (!Array.isArray(choices)) return
+  for (const choice of choices) {
+    if (typeof choice !== 'object' || choice === null) continue
+    const message = (choice as Record<string, unknown>).message
+    if (typeof message !== 'object' || message === null) continue
+    const toolCalls = (message as Record<string, unknown>).tool_calls
+    if (!Array.isArray(toolCalls)) continue
+    for (const call of toolCalls) {
+      if (typeof call !== 'object' || call === null) continue
+      const entry = call as Record<string, unknown>
+      const id = typeof entry.id === 'string' ? entry.id : ''
+      const signature = getThoughtSignature(entry)
+      if (id !== '' && signature !== '') cache.put(id, signature)
+    }
+  }
+}
+
+/**
+ * 回传前补全签名（**这是修复 400 的关键一步**）。
+ *
+ * @returns `[新 body, 还原数, 兜底数]`
+ */
+function restoreThoughtSignatures(
+  body: Record<string, unknown>,
+  cache: ThoughtSignatureCache,
+): [Record<string, unknown>, number, number] {
+  const messages = body.messages
+  if (!Array.isArray(messages)) return [body, 0, 0]
+
+  let restored = 0
+  let fallback = 0
+  let changed = false
+  const updated = messages.map((message) => {
+    if (typeof message !== 'object' || message === null) return message
+    const record = message as Record<string, unknown>
+    if (record.role !== 'assistant') return message
+    const toolCalls = record.tool_calls
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return message
+
+    let messageChanged = false
+    const newCalls = toolCalls.map((call, index) => {
+      if (typeof call !== 'object' || call === null) return call
+      const entry = { ...(call as Record<string, unknown>) }
+      if (getThoughtSignature(entry) !== '') return entry
+      const id = typeof entry.id === 'string' ? entry.id : ''
+      const cached = id !== '' ? cache.get(id) : undefined
+      if (cached !== undefined) {
+        setThoughtSignature(entry, { google: { thought_signature: cached } })
+        restored += 1
+        messageChanged = true
+        return entry
+      }
+      // ⚠️ 只给**第一个** tool_call 兜底：Gemini 只校验每步首个 functionCall。
+      if (index === 0) {
+        setThoughtSignature(entry, {
+          google: { thought_signature: SKIP_THOUGHT_SIGNATURE_SENTINEL },
+        })
+        fallback += 1
+        messageChanged = true
+      }
+      return entry
+    })
+
+    if (!messageChanged) return message
+    changed = true
+    return { ...record, tool_calls: newCalls }
+  })
+
+  if (!changed) return [body, 0, 0]
+  return [{ ...body, messages: updated }, restored, fallback]
+}
+
 export class VertexAdapter extends LlmAdapter {
   private readonly options: VertexAdapterOptions
   private readonly tokens = new VertexTokenManager()
-  /**
-   * `thought_signature` 缓存：键是工具调用 id，值是签名串。
-   *
-   * ⚠️ 只增不减会有内存泄漏风险 ⇒ 用简单上限（256 条）淘汰最旧的
-   *    （`Map` 保序，删第一个键即可）。
-   */
-  private readonly signatures = new Map<string, string>()
+  /** `thought_signature` 缓存（有界 LRU，见文件头说明）。 */
+  private readonly signatures = new ThoughtSignatureCache()
 
   constructor(options: VertexAdapterOptions) {
     super()
@@ -166,13 +395,24 @@ export class VertexAdapter extends LlmAdapter {
       model: normalizeVertexModel(model),
       stream: true,
     }
-    restoreSignatures(payload, this.signatures)
+    /**
+     * **回传前补全签名**（修复 ZCode 那类「客户端剥离 extra_content」导致的 400）。
+     * 详见文件头「thought_signature」一节。
+     */
+    const [withSignatures, restored, fallback] = restoreThoughtSignatures(
+      payload as Record<string, unknown>,
+      this.signatures,
+    )
+    if (restored > 0 || fallback > 0) {
+      this.options.warn?.(`[vertex] thought_signature: restored=${restored} fallback=${fallback}`)
+    }
+    const finalPayload = withSignatures
 
-    let response = await this.post(url, account.credential, payload, options.signal)
+    let response = await this.post(url, account.credential, finalPayload, options.signal)
     // 401：token 可能被提前吊销 ⇒ 强制刷新后重试一次（**只重试一次**）。
     if (response.status === 401) {
       this.tokens.invalidate()
-      response = await this.post(url, account.credential, payload, options.signal)
+      response = await this.post(url, account.credential, finalPayload, options.signal)
     }
 
     if (response.status !== 200) {
@@ -185,8 +425,30 @@ export class VertexAdapter extends LlmAdapter {
       )
     }
 
+    /**
+     * **流式响应包一层**：旁路录制 `thought_signature`（不改变下游看到的数据）。
+     *
+     * ⚠️ 用 `TransformStream` 而不是「先读完再给下游」——后者会让流式变成
+     * 一次性输出（本项目在 Build 渠道踩过这个坑，见 build-relay 的注释）。
+     */
+    const tracker = new StreamSignatureTracker(this.signatures)
+    const body = response.body
+    if (body === null) throw new LlmError('vertex: 响应没有 body', 'EMPTY_RESPONSE')
+    const tapped = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        // 旁路解析（异常绝不影响转发：签名录制是尽力而为）
+        try { tracker.feed(chunk) } catch { /* 忽略 */ }
+        controller.enqueue(chunk)
+      },
+    }))
+    const tappedResponse = new Response(tapped, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+
     yield* consumeOpenAiSse(
-      response,
+      tappedResponse,
       { ...(options.signal === undefined ? {} : { signal: options.signal }) },
       {
         label: 'vertex',
@@ -236,12 +498,62 @@ export class VertexAdapter extends LlmAdapter {
  */
 function toOpenAiBody(options: GenerateOptions): Record<string, unknown> {
   const source = options as unknown as Record<string, unknown>
+  /**
+   * ⚠️⚠️ **必须用 `serializeMessages` 转换，不能直接传 `options.messages`**
+   * （真实缺陷，2026-11-12 实测）。
+   *
+   * DSH 的内部消息格式里，content 是**带 `type` 字段的块数组**
+   * （`{type:'text', text}` / `{type:'tool-result', …}`）；而 OpenAI wire 格式
+   * 的 content 是纯字符串或 `{type:'text', text}` 的标准块。
+   *
+   * 直接把内部格式发给 Vertex，上游报
+   * `Expected input to contain field: 'type'`
+   * —— 因为它把内部块当成了 OpenAI 的 content part。
+   *
+   * 其它所有 OpenAI 兼容渠道（buddy/qoder/autoclaw…）都走这个函数，
+   * 它还顺带处理了：工具结果配对、图片内联、预填充剥离。
+   */
   const body: Record<string, unknown> = {
-    messages: options.messages,
+    messages: serializeMessages(options.messages as never),
   }
+  /**
+   * ⚠️⚠️ **`tools` 必须转换，不能直接透传**（真实缺陷，2026-11-12 实测）。
+   *
+   * DSH 的 `ToolSchema` 是**扁平**结构：
+   * ```
+   * { name, description, parameters }
+   * ```
+   * 而 OpenAI wire 格式要**嵌套**：
+   * ```
+   * { type: 'function', function: { name, description, parameters } }
+   * ```
+   * 直接透传 ⇒ 上游报 `Expected input to contain field: 'type'`
+   * （它把扁平对象当成缺 `type` 的 content part）。
+   *
+   * 📌 这个坑在所有「直接透传给 OpenAI 兼容上游」的适配器都会遇到；
+   *    buddy/qoder 那些走 `serializeMessages` + 各自封装的没暴露，
+   *    因为它们的 tools 由 vendor 自己转换。
+   */
+  const tools = source.tools
+  if (Array.isArray(tools) && tools.length > 0) {
+    body.tools = tools.map((tool) => {
+      const entry = tool as Record<string, unknown>
+      // 已经是 OpenAI 形态的（含 type+function）原样保留，避免双重包装
+      if (entry.type === 'function' && typeof entry.function === 'object') return entry
+      return {
+        type: 'function',
+        function: {
+          name: entry.name,
+          ...(entry.description === undefined ? {} : { description: entry.description }),
+          ...(entry.parameters === undefined ? {} : { parameters: entry.parameters }),
+        },
+      }
+    })
+  }
+
   // 其余标量/数组字段原样带过去（`model` 与 `stream` 由调用方覆盖）。
   for (const key of [
-    'tools', 'tool_choice', 'temperature', 'top_p', 'max_tokens', 'stop',
+    'tool_choice', 'temperature', 'top_p', 'max_tokens', 'stop',
     'reasoning_effort', 'response_format', 'seed',
   ]) {
     const value = source[key]
@@ -270,34 +582,6 @@ function toOpenAiBody(options: GenerateOptions): Record<string, unknown> {
     body.max_tokens = MIN_THINKING_TOKENS
   }
   return body
-}
-
-/**
- * 把缓存的 `thought_signature` 回填到**历史 tool_calls** 上。
- *
- * 上游要求：assistant 消息里的 tool_call 必须带上一轮拿到的签名，
- * 否则报 `thought_signature is required`。缓存的键是 tool_call id。
- */
-function restoreSignatures(body: Record<string, unknown>, signatures: Map<string, string>): void {
-  const messages = body.messages
-  if (!Array.isArray(messages) || signatures.size === 0) return
-  for (const message of messages) {
-    if (typeof message !== 'object' || message === null) continue
-    const record = message as Record<string, unknown>
-    const toolCalls = record.tool_calls
-    if (!Array.isArray(toolCalls)) continue
-    for (const call of toolCalls) {
-      if (typeof call !== 'object' || call === null) continue
-      const entry = call as Record<string, unknown>
-      const id = typeof entry.id === 'string' ? entry.id : ''
-      if (id === '') continue
-      const signature = signatures.get(id)
-      if (signature === undefined) continue
-      const extra = (entry.extra_content ?? {}) as Record<string, unknown>
-      const google = (extra.google ?? {}) as Record<string, unknown>
-      entry.extra_content = { ...extra, google: { ...google, thought_signature: signature } }
-    }
-  }
 }
 
 /** 错误文案（把上游的英文说明保留，便于排查）。 */
