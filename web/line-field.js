@@ -137,11 +137,26 @@ async function sampleIconLuminance(src) {
   if (context === null) return undefined
   context.fillStyle = '#000'
   context.fillRect(0, 0, sideW, sideH)
-  // 图标等比放大到**铺满短边**，长边居中（保持标志原始比例，不拉伸）
-  const scale = Math.max(sideW / image.width, sideH / image.height) * 0.92
+  /**
+   * 缩放策略：**铺满短边、长边居中**。
+   *
+   * 采样画布是宽幅（56:34 ≈ 1.65:1）而图标多为正方形 ⇒ 取 `max` 让图标
+   * 填满高度（短边），横向自然留白居中。
+   *
+   * ⚠️ 系数迭代：0.92 顶到边缘太挤 → 0.86 仍偏满 → **0.72**（留 28% 边距）。
+   * 这是参照 StyleKit 示例的量感定的：标志占卡片中上部约 60-70%，
+   * 四周留白，才是「展示品」而不是「贴纸」。
+   */
+  const scale = Math.max(sideW / image.width, sideH / image.height) * 0.72
   const drawW = image.width * scale
   const drawH = image.height * scale
-  context.drawImage(image, (sideW - drawW) / 2, (sideH - drawH) / 2, drawW, drawH)
+  /**
+   * ⚠️ **垂直方向下移 6%**：卡片顶部有标题行（图标 + 名称 + 端口），
+   * 标志若在画布正中，上半截会压到标题下面，观感「顶到字上」。
+   * 下移后标志主体落在标题与箭头之间的净空区。
+   */
+  const offsetY = sideH * 0.06
+  context.drawImage(image, (sideW - drawW) / 2, (sideH - drawH) / 2 + offsetY, drawW, drawH)
 
   const pixels = context.getImageData(0, 0, sideW, sideH).data
   const luminance = new Float32Array(COUNT)

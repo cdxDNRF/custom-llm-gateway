@@ -1075,8 +1075,14 @@ body {
    * （实测截图：CodeBuddy 的名字与线条混在一起看不清）。
    * 用渐隐遮罩把上 1/3 压掉，只在标题行留出干净背景。
    */
-  -webkit-mask-image: linear-gradient(180deg, transparent 0%, transparent 18%, #000 42%, #000 100%);
-  mask-image: linear-gradient(180deg, transparent 0%, transparent 18%, #000 42%, #000 100%);
+  /*
+   * ⚠️ 顶部渐隐**不要压太低**：第一版写到 42% 才全显，结果标志的下半部分
+   * 被「上淡下浓」的观感骗了 —— 实际是标题行的半透明底把标志切断了
+   * （TRAE 的方框、Gemini 的三角形底部都缺一块）。
+   * 现在只压最上面 12%，标志主体完整。
+   */
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 20%, #000 100%);
+  mask-image: linear-gradient(180deg, transparent 0%, #000 20%, #000 100%);
 }
 
 /* ═══════════════ 折叠 / 展开 ═══════════════
@@ -1119,11 +1125,26 @@ body {
   mask-image: linear-gradient(180deg, transparent 0%, #000 55%, #000 100%);
 }
 
-/* 折叠态：卡片是一块「展示面」——给足高度让线场有地方画 */
+/*
+ * 折叠态卡片高度。
+ *
+ * ⚠️ 用户反馈「卡片和图片是不是不太协调，挤到一起了」—— 根因是卡片太扁
+ * （210px 高 / 447px 宽 ≈ 2.1:1），而标志是**正方形**的：等比缩放后只能占
+ * 中间一小块，上下还留白，看着就像「被压扁塞进去」。
+ *
+ * 加高到 **300px**（≈1.5:1）后，正方形标志能占到 70% 以上高度，
+ * 与 StyleKit 示例的 0.70 宽高比观感接近。窄屏再降一档，避免一屏只看两张卡。
+ */
 .card.is-collapsed {
-  min-height: 210px;
-  padding-bottom: 26px;
+  min-height: 300px;
+  padding-bottom: 30px;
   cursor: pointer;
+}
+@media (max-width: 900px) {
+  .card.is-collapsed { min-height: 250px; }
+}
+@media (max-width: 620px) {
+  .card.is-collapsed { min-height: 210px; }
 }
 /* 折叠态下隐藏控制区里的标签（保留 body 结构给动画用） */
 .card.is-collapsed .card-body { grid-template-rows: 0fr; }
@@ -1210,13 +1231,20 @@ body {
  * 再给标题行加一层**半透明实色底**（不用 blur/backdrop-filter，
  * 保持「只用实色分层」的设计纪律）。
  */
+/**
+ * 折叠态标题行：**只用很窄的一条实色底**，不要渐变大背景。
+ *
+ * ⚠️ 第一版给到 62% 还是 78% 不透明的渐变大底，视觉上像一块「压在标志上的板子」，
+ * 而且把标志上半截盖住了 —— 用户会看到「标志缺一块」。
+ * 现在只覆盖文字那一条，并在 100% 处就透明收尾。
+ */
 .card.is-collapsed .card-head {
   position: relative;
   z-index: 2;
-  padding: 2px 0 10px;
+  padding: 2px 0 8px;
   background: linear-gradient(180deg,
-    color-mix(in srgb, var(--surface-1) 92%, transparent) 0%,
-    color-mix(in srgb, var(--surface-1) 78%, transparent) 62%,
+    color-mix(in srgb, var(--surface-1) 88%, transparent) 0%,
+    color-mix(in srgb, var(--surface-1) 55%, transparent) 70%,
     transparent 100%);
   border-radius: 10px 10px 0 0;
 }

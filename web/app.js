@@ -260,6 +260,7 @@ function attachLineField(card, provider) {
 
   // ── 静态首帧：等图标采样完（只读一次像素）──
   const src = window.PROVIDER_ICONS?.[provider.id]
+    ?? window.PROVIDER_ICONS?.[ICON_FALLBACK[provider.id]]
   const paint = () => sync(true)
   if (typeof src === 'string' && src !== '') {
     // 采样是异步解图，画一帧占位（纯噪声），采样完再画一次
@@ -270,8 +271,20 @@ function attachLineField(card, provider) {
   }
 }
 
+/**
+ * 图标回退表：上游 `PROVIDER_ICONS` 里**没有**这几个 id 的图标。
+ *
+ * - `aistudio` / `build`：都是 Google AI Studio 体系（一个走 API Key、
+ *   一个走 App 反代），上游图标表没收录 ⇒ 回落到 Gemini 的图标
+ *   （用户反馈「另外两个谷歌相关的空着很不协调」，回落到同品牌图标最自然）
+ */
+const ICON_FALLBACK = {
+  aistudio: 'gemini',
+  build: 'gemini',
+}
+
 function providerIcon(id, cls) {
-  const src = window.PROVIDER_ICONS?.[id]
+  const src = window.PROVIDER_ICONS?.[id] ?? window.PROVIDER_ICONS?.[ICON_FALLBACK[id]]
   if (typeof src !== 'string' || src === '') return ''
   return `<img class="provider-icon ${cls || ''}" src="${src}" alt="" aria-hidden="true" loading="lazy">`
 }
