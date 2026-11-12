@@ -561,6 +561,19 @@ export class OverviewServer {
       await this.aggregateMessages(request, response)
       return
     }
+    /**
+     * **Gemini Decisions API**（2026-11-12）。
+     *
+     * ⚠️ 为什么不是 `/v1/models` 里的一个模型：`gemini-decision-1` **不生成文字**
+     *    （对候选选项打分、零输出 token），且上游只开放 `/v1beta/decisions`
+     *    一个端点 —— 选它发 `messages` 必然 400。详见 `gemini-decisions.ts` 文件头。
+     *
+     * 鉴权与其余端点一致（`authorized()` 已在本函数入口统一处理）。
+     */
+    if (path === '/v1/decisions' && request.method === 'POST') {
+      await this.handleDecisions(request, response)
+      return
+    }
 
     sendJson(response, 404, { error: `未知路径 ${path}` })
   }
@@ -844,6 +857,83 @@ export class OverviewServer {
   }
 
   // ─────────── 聚合端点 ───────────
+
+  /**
+   * `POST /v1/decisions` —— 透传给 Gemini Decisions API。
+   *
+   * 与其它聚合端点的差异：**不需要 `provider/model` 前缀**，也不需要解析
+   * 供应商管线 —— 决策模型只有一个来源（AI Studio API Key），且请求体
+   * 形状与 chat 完全不同（`input` + `questions`，不是 `messages`）。
+   *
+   * 错误映射（让调用方一眼看出该改什么）：
+   * - 请求体骨架不对 → **400**（可操作文案）
+   * - 没有 AI Studio 账号 → **401**
+   * - 上游 4xx → **原样透传状态码**（决策参数错就是 4xx，别包成 502）
+   * - 网络失败 → **502**
+   */
+  private async handleDecisions(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const { callDecisions, validateDecisionsRequest, summarizeDecisions } = await import('./gemini-decisions.js')
+
+    let raw: unknown
+    try {
+      raw = JSON.parse(await readBody(request))
+    } catch {
+      sendJson(response, 400, { error: { message: '请求体不是合法 JSON', code: 'invalid_json' } })
+      return
+    }
+
+    const validated = validateDecisionsRequest(raw)
+    if (!validated.ok) {
+      sendJson(response, 400, { error: { message: validated.message, code: 'invalid_request' } })
+      return
+    }
+
+    /**
+     * 取 AI Studio 的 API Key（多账号轮询）。
+     *
+     * ⚠️ **不走 Provider 接口**：`Provider` 没有暴露 apiKey，而给全部 18 家
+     *    加一个「可能为空」的方法是为了两处调用点扩大接口面。这里直接读
+     *    账号池 + 凭据库，语义与 `createAiStudioProvider` 内部的 `apiKey()`
+     *    一致（同样的「只认 enabled、跳过坏条目」规则）。
+     */
+    const provider = this.findProvider('aistudio')
+    const keys: string[] = []
+    if (provider !== undefined) {
+      for (const account of await provider.listAccounts().catch(() => [])) {
+        if (account.enabled !== true) continue
+        const ref = provider.pool.findAccount(account.id)?.credentialRef
+        if (ref === undefined) continue
+        const stored = provider.gateway.credentials.get(ref)
+        if (stored === undefined) continue
+        try {
+          const parsed = JSON.parse(stored) as { api_key?: unknown }
+          const key = typeof parsed.api_key === 'string' ? parsed.api_key.trim() : ''
+          if (key.length > 0) keys.push(key)
+        } catch {
+          // 凭据损坏：跳过（与 provider 内部同口径）
+        }
+      }
+    }
+    let cursor = 0
+    const apiKey = async (): Promise<string | undefined> => {
+      if (keys.length === 0) return undefined
+      const key = keys[cursor % keys.length]
+      cursor = (cursor + 1) % keys.length
+      return key
+    }
+
+    const result = await callDecisions(validated.value, {
+      apiKey,
+      warn: (message: string) => this.catalogWarn?.(message),
+    })
+    if (!result.ok) {
+      // 网络层失败没有 status ⇒ 502（网关侧问题）；上游 4xx/5xx 原样透传。
+      sendJson(response, result.status === 0 ? 502 : result.status, result.body ?? { error: { message: result.error } })
+      return
+    }
+    this.catalogInfo?.(`决策（gemini-decision-1）：${summarizeDecisions(result.body)}`)
+    sendJson(response, 200, result.body)
+  }
 
   private async aggregateModels(response: ServerResponse): Promise<void> {
     const data: unknown[] = []
