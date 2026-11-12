@@ -1689,3 +1689,136 @@ export async function createAiStudioProvider(
     },
   })
 }
+
+// ───────────────────────── Vertex AI（GCP 服务账号） ─────────────────────────
+/**
+ * **Vertex AI 渠道**（2026-11-12 用户要求，照搬 `D:\AIagent\vertex` 的实现）。
+ *
+ * ## 与前两条 Google 渠道的关系
+ *
+ * | 渠道 | 认证 | 端点 | 额度池 |
+ * |---|---|---|---|
+ * | `gemini`（反重力） | OAuth Bearer（浏览器登录） | `/v1internal:*`（私有协议） | Antigravity |
+ * | `aistudio` | `x-goog-api-key` | `generativelanguage` | API Key 免费层 |
+ * | **`vertex`** | **服务账号 JWT → OAuth** | **`/endpoints/openapi`（OpenAI 兼容）** | GCP 按项目计费 |
+ *
+ * ⇒ 三者**额度与模型表互不相同**。vertex 的表最宽（含 `gemini-4-argon`）。
+ *
+ * ## 登录方式：粘贴 Service Account JSON
+ *
+ * 没有授权页 —— GCP 服务账号就是一段 JSON。用「填文本」型登录。
+ * ⚠️ 校验要**指出具体哪一步错**（JSON 语法 / 缺 project_id / 缺 private_key /
+ * 缺 client_email 是四种不同的用户错误，混成一句"凭据无效"让人无从下手）。
+ */
+export async function createVertexProvider(
+  dataDir: string,
+  logLevel?: 'debug' | 'info' | 'warn' | 'error',
+): Promise<Provider> {
+  const { gateway, pool } = await makeBase('vertex', dataDir, logLevel)
+  const { VertexAdapter } = await import('./vertex-adapter.js')
+  const { parseServiceAccount } = await import('./vertex-transport.js')
+
+  // 装代理路由（与 gemini/aistudio 共用同一个按 host 分流的拦截器）。
+  {
+    const { installGeminiProxyRouting } = await import('../core/gemini-proxy.js')
+    const proxyUrl = installGeminiProxyRouting(dataDir)
+    if (proxyUrl === undefined) {
+      gateway.logger.warn(
+        'Vertex 未配置代理出口：Google 域名在国内网络不可直连，请求会超时。'
+        + '请设置 GATEWAY_GEMINI_PROXY=http://127.0.0.1:7897，'
+        + `或在 ${dataDir}/gemini.env 写一行 PROXY=http://127.0.0.1:7897。`,
+      )
+    } else {
+      gateway.logger.info(`Vertex 出口已配置：仅 Google 域名经 ${proxyUrl}，其余直连`)
+    }
+  }
+
+  /**
+   * 取当前可用的服务账号（**每次现读**，多账号轮询）。
+   *
+   * ⚠️ 不缓存：停用/新增账号后应立刻生效（与 aistudio 的 `apiKey` 同口径）。
+   */
+  let cursor = 0
+  const resolveAccount = async () => {
+    const usable = (await pool.listAccounts('vertex')).filter((entry) => entry.enabled)
+    if (usable.length === 0) return undefined
+    const start = cursor % usable.length
+    cursor = (cursor + 1) % usable.length
+    for (let offset = 0; offset < usable.length; offset += 1) {
+      const entry = usable[(start + offset) % usable.length]!
+      const credential = parseServiceAccount(gateway.credentials.get(entry.credentialRef) ?? '')
+      if (credential !== undefined) return { accountId: entry.id, credential }
+    }
+    return undefined
+  }
+
+  const adapter = new VertexAdapter({
+    resolveAccount,
+    warn: (message: string) => gateway.logger.warn(message),
+  }) as LlmAdapter
+
+  return new GenericImpl({
+    id: 'vertex',
+    displayName: 'Vertex AI (GCP)',
+    capabilities: {
+      login: true, dailyCheckin: false,
+      // GCP 没有「剩余额度」接口（按 token 计费、走月度账单）⇒ 不声明 balance。
+      // 声明了却返回空会让 UI 出现一个点了没反应的按钮。
+      balance: false,
+      permanentLock: false, multiAccount: true, refresh: false,
+    },
+    adapter, pool, gateway,
+    loginImpl: async () => ({
+      loginUrl: '',
+      accountId: '',
+      completed: Promise.resolve({ ok: true }),
+      input: {
+        placeholder: '把 GCP 服务账号 JSON 整个粘进来（以 {"type":"service_account" 开头）',
+        hint: 'GCP Console → IAM → 服务账号 → 密钥 → 添加密钥 → JSON 下载。'
+          + '本渠道用它换 OAuth token，再调 Vertex 的 OpenAI 兼容端点。',
+      },
+    }),
+    submitLoginImpl: async ({ value }) => {
+      const raw = String(value).trim()
+      if (raw === '') return { ok: false, error: '请粘贴服务账号 JSON' }
+
+      // ① JSON 语法
+      const credential = parseServiceAccount(raw)
+      if (credential === undefined) {
+        return { ok: false, error: '不是合法 JSON —— 请粘贴整个文件内容（从 { 到 }）' }
+      }
+      // ② 类型
+      if (credential.type !== undefined && credential.type !== 'service_account') {
+        return { ok: false, error: `这是 "${credential.type}" 类型的凭据，需要 service_account` }
+      }
+      // ③ 三个必需字段（缺哪个说哪个）
+      const projectId = String(credential.project_id ?? '').trim()
+      if (projectId === '') return { ok: false, error: 'JSON 里缺少 project_id' }
+      if (String(credential.private_key ?? '').trim() === '') {
+        return { ok: false, error: 'JSON 里缺少 private_key（下载的密钥文件应是完整 JSON）' }
+      }
+      if (String(credential.client_email ?? '').trim() === '') {
+        return { ok: false, error: 'JSON 里缺少 client_email' }
+      }
+
+      const id = `vertex-${shortId()}`
+      const refName = `VERTEX_ACCOUNT_${shortId().toUpperCase()}`
+      await pool.addAccount({
+        id, provider: 'vertex',
+        // 昵称用项目 id：一个项目一个账号，比随机串好认
+        nickname: projectId,
+        enabled: true,
+        credentialRef: refName,
+        refreshable: false,
+        createdAt: Date.now(),
+      })
+      // 存**原始 JSON**（含 private_key）—— token 管理器自己解析换 token
+      await gateway.credentials.set(refName, raw)
+      gateway.logger.info(`Vertex 账号 ${id} 已创建（项目 ${projectId}）`)
+      return { ok: true }
+    },
+    refreshAll: async () => {
+      // 服务账号无过期概念（private_key 长期有效，access_token 由 adapter 自动续期）。
+    },
+  })
+}

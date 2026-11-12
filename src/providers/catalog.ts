@@ -42,6 +42,12 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   //    aistudio = 普通 API Key（API Key 免费层额度）—— 门槛最低，一个 AIza 密钥即可
   { id: 'aistudio',   displayName: 'AI Studio (API Key)',   defaultPort: 3918, defaultEnabled: false, note: '填 AIza… 开头的 API Key 即可；额度与「Gemini (Google)」独立；需 Clash 代理' },
   { id: 'build',      displayName: 'Build (AI Studio)',     defaultPort: 3917, defaultEnabled: false, note: '需浏览器常开 AI Studio App 页面；实测 5 个 flash 模型（含 3.5/3.6/3.7）' },
+  // ⚠️ vertex 是**第三条 Google 渠道**，与前两条的差别是「协议 + 认证」：
+  //    gemini   = 反重力 OAuth + `/v1internal:*`（私有协议）
+  //    aistudio = API Key        + `generativelanguage`
+  //    vertex   = 服务账号 OAuth + **OpenAI 兼容端点** `/endpoints/openapi`
+  //    ⇒ 三者额度池互不相同；vertex 的模型表也最宽（含 gemini-4-argon/carbon）
+  { id: 'vertex',     displayName: 'Vertex AI (GCP)',       defaultPort: 3919, defaultEnabled: false, note: '粘贴 GCP Service Account JSON；走 OpenAI 兼容端点；含 gemini-4-argon；需 Clash 代理' },
 ]
 
 export function catalogEntry(id: string): ProviderCatalogEntry | undefined {

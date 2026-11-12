@@ -27,6 +27,7 @@ import {
   createGeminiProvider,
   createOpencodeProvider,
   createAiStudioProvider,
+  createVertexProvider,
 } from './extended.js'
 import { createAccioProvider, createOfficeAceProvider } from './extended.js'
 import { createBuildProvider } from './build.js'
@@ -344,6 +345,7 @@ function factoryFor(
     accio: () => createAccioProvider(dir, level),
     officeace: () => createOfficeAceProvider(dir, level),
     aistudio: () => createAiStudioProvider(dir, level),
+    vertex: () => createVertexProvider(dir, level),
     build: () => createBuildProvider(
       dir,
       level,
@@ -405,8 +407,27 @@ export async function createProviders(config: GatewayConfig): Promise<Provider[]
     () => createOfficeAceProvider(dir, level),
     () => createAiStudioProvider(dir, level),
     () => createBuildProviderBuild(config),
+    () => createVertexProvider(dir, level),
   ]
   const ids = PROVIDER_CATALOG.map((e) => e.id)
+
+  /**
+   * ⚠️⚠️ **jobs 与 PROVIDER_CATALOG 靠位置对齐**（真实缺陷，2026-11-12）。
+   *
+   * 加 vertex 时我只往 catalog 追了一条、忘了 jobs 也追 —— 启动后
+   * `jobs[18]` 是 `undefined` ⇒ `TypeError: jobs[i] is not a function`，
+   * vertex 静默没起来（症状是「配置里 enabled:true 但端口不监听」）。
+   *
+   * 现在加一道**启动时自检**：数量不等就直接报出具体差了几个，
+   * 而不是等到运行期某个下标爆 not a function。
+   */
+  if (jobs.length !== ids.length) {
+    console.error(
+      `[registry] ⚠️ jobs(${jobs.length}) 与 PROVIDER_CATALOG(${ids.length}) 数量不一致 —— `
+      + '新增供应商时**两处都要加**，否则对应渠道会静默不启动。'
+      + `catalog 末尾: ${ids.slice(jobs.length).join(', ') || '(无)'}`,
+    )
+  }
 
   // ⚠️ 串行创建：withStateDir 内部要临时设置进程环境变量，
   // 并行会互相踩（虽然 withStateDir 已有内部锁，这里串行更直白）。
