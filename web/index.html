@@ -30,19 +30,35 @@
     <button id="checkin-all" class="btn btn-icon" title="对所有支持签到的供应商各签一次（今天已领的会跳过）">一键签到</button>
     <button id="refresh-models-all" class="btn btn-icon" title="从上游重新拉取所有供应商的模型目录">重拉模型</button>
     <button id="refresh-all" class="btn btn-icon" title="对所有账号执行一次静默续期">续期全部</button>
+    <button id="open-switches" class="btn btn-icon btn-accent" title="管理全部供应商的开关（主界面只显示已启用的）">供应商开关</button>
   </div>
 </header>
 
 <main>
   <!-- ─────────────── 第 1 页：供应商 ─────────────── -->
   <section class="page" data-page="providers">
-    <div class="page-head">
-      <h2>供应商</h2>
-      <p class="hint">
-        每个供应商独立监听一个端口，可直接接入任意 OpenAI 兼容客户端；也可用「网关」页的聚合端点一次接入全部。
-      </p>
+    <div class="page-head page-head-row">
+      <div>
+        <h2>已启用的供应商</h2>
+        <p class="hint">
+          每个供应商独立监听一个端口，可直接接入任意 OpenAI 兼容客户端；也可用「网关」页的聚合端点一次接入全部。
+          <b>未启用的</b>已收进右上角 <button class="link-btn" id="open-switches-2">供应商开关</button>。
+        </p>
+      </div>
     </div>
     <div id="providers" class="grid"></div>
+
+    <!-- 供应商开关面板（原生 dialog，键盘可操作、Esc 关闭） -->
+    <dialog id="switches-dialog" class="dialog">
+      <div class="dialog-head">
+        <div>
+          <h3>供应商开关 <span class="stamp" id="switches-count"></span></h3>
+          <p class="hint">关闭一个供应商 = 停止它的监听并卸下它的全部模型。开启后立即生效，无需重启。</p>
+        </div>
+        <button class="btn btn-sm" id="switches-close">完成</button>
+      </div>
+      <div id="switches-body" class="switch-list"></div>
+    </dialog>
   </section>
 
   <!-- ─────────────── 第 2 页：网关 ─────────────── -->

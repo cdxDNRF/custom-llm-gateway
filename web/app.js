@@ -760,18 +760,109 @@ async function load() {
     const { providers, lan } = await api('/api/overview')
     // 缓存后端令牌，供 Build 页拼 WebSocket 地址用（见 lanTokenCache 注释）。
     if (lan && typeof lan.accessToken === 'string') lanTokenCache = lan.accessToken
+    /**
+     * **主界面只显示已启用的供应商**（2026-11-12 用户要求）。
+     *
+     * 之前 18 家全铺在主界面上，其中 11 家是「未启用」的空壳卡片 —— 主界面
+     * 又长又空（用户原话「太空虚，利用区域太少」）。现在：
+     *   · 已启用 → 主界面完整卡片（账号、账号池、操作按钮）
+     *   · 未启用 → 收进「供应商开关」面板，一处统一管理
+     *
+     * ⚠️ `running`（进程在监听）与 `enabledInConfig`（配置里开启）不是一回事：
+     *    刚改完配置还没重启时二者会不一致。判据用 **running** —— 卡片上的按钮
+     *    （登录/查积分/模型管理）都依赖进程真的在跑，否则点了只会报错。
+     */
+    const runningProviders = providers.filter((p) => p.running === true)
     const box = $('#providers')
     box.innerHTML = ''
-    for (const provider of providers) box.appendChild(renderProvider(provider))
+    for (const provider of runningProviders) box.appendChild(renderProvider(provider))
+    if (runningProviders.length === 0) {
+      box.innerHTML = '<div class="empty">还没有启用任何供应商 —— 点右上角「供应商开关」开启。</div>'
+    }
 
+    renderProviderSwitches(providers)
     renderEndpoints(providers, lan)
 
     $('#conn').className = 'pill pill-ok'
-    $('#conn').textContent = `正常 · ${providers.length} 个供应商`
+    $('#conn').textContent = `正常 · ${runningProviders.length}/${providers.length} 家已启用`
   } catch {
     $('#conn').className = 'pill pill-err'
     $('#conn').textContent = '网关无响应'
   }
+}
+
+/**
+ * 渲染「供应商开关」面板（2026-11-12 新增，用户要求）。
+ *
+ * ## 为什么要有它
+ *
+ * 主界面现在只显示**已启用**的供应商，未启用的必须有个地方能开 ——
+ * 否则用户永远看不到它们。这个面板就是那个入口：
+ * 全部 18 家一行一个，右边开关，已开/未开自动分组排序。
+ *
+ * ## 交互
+ *
+ * 开关走 `/api/config/enable`（与原来卡片上的「启用」按钮**同一个接口**），
+ * 写配置后**无需重启**（注册表支持热启用）。切换后刷新整个页面数据。
+ *
+ * ⚠️ 开关的 `checked` 用 **running** 而不是 enabledInConfig：二者不一致时
+ *    （配置刚改、进程还没起来）以「实际在跑」为准，否则开关显示开着但卡片没了。
+ */
+function renderProviderSwitches(providers) {
+  const body = $('#switches-body')
+  const count = $('#switches-count')
+  const dialog = $('#switches-dialog')
+  if (body === null) return
+
+  const running = providers.filter((p) => p.running === true)
+  const stopped = providers.filter((p) => p.running !== true)
+  // 已开的排前面；未开的排后面（两组内部保持后端给的顺序 = 端口顺序）
+  const ordered = [...running, ...stopped]
+
+  if (count !== null) count.textContent = `${running.length} 开 · ${stopped.length} 关`
+
+  body.innerHTML = ordered.map((provider) => {
+    const on = provider.running === true
+    const accounts = Array.isArray(provider.accounts) ? provider.accounts.length : 0
+    return `
+      <div class="switch-row ${on ? '' : 'is-off'}" data-provider="${escapeHtml(provider.id)}">
+        <span class="switch-grip" aria-hidden="true">⠿</span>
+        <span class="switch-name">${escapeHtml(provider.displayName)}</span>
+        <span class="switch-meta">账号 ${accounts}</span>
+        <span class="switch-port">${provider.port ?? '—'}</span>
+        <label class="switch switch-mini" title="${on ? '关闭' : '开启'} ${escapeHtml(provider.displayName)}">
+          <input type="checkbox" data-act="toggleProvider" data-id="${escapeHtml(provider.id)}" ${on ? 'checked' : ''}>
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+      </div>
+    `
+  }).join('')
+
+  // 事件只绑一次（面板 DOM 在每次 load 时重建 innerHTML，故用委托）
+  if (body.dataset.bound === '1') return
+  body.dataset.bound = '1'
+  body.addEventListener('change', async (event) => {
+    const input = event.target.closest('input[data-act="toggleProvider"]')
+    if (input === null) return
+    const providerId = input.dataset.id
+    const enabled = input.checked
+    input.disabled = true
+    try {
+      const result = await api('/api/config/enable', {
+        method: 'POST',
+        body: JSON.stringify({ id: providerId, enabled }),
+      })
+      toast(result.note || (enabled ? '已启用' : '已停用'), 'ok')
+      await load()
+    } catch (error) {
+      toast(String(error.message || error), 'err')
+      // 失败时回滚开关外观（否则界面与实际不一致）
+      input.checked = !enabled
+    } finally {
+      input.disabled = false
+    }
+  })
+  void dialog
 }
 
 /** 小工具：把文本放进可点击复制的 <code>（点击即复制，手机上尤其好用）。 */
@@ -858,8 +949,15 @@ function renderEndpoints(providers, lan) {
     }
   }
 
-  // ── 供应商独立端点（OpenAI 与 Anthropic 同端口、不同路径）──
-  html += providers.map((p) => {
+  /**
+   * ── 供应商独立端点（OpenAI 与 Anthropic 同端口、不同路径）──
+   *
+   * ⚠️ **只列已启用的**（2026-11-12 用户要求「没有启用的没必要显示」）。
+   * 之前 18 家全列，其中 11 家是「未启动 / —」的空条目 —— 把真正能用的地址
+   * 埋在噪音里。未启用的现在只出现在「供应商开关」面板。
+   */
+  const runningForEndpoints = providers.filter((p) => p.running === true)
+  html += runningForEndpoints.map((p) => {
     const base = p.baseUrl || ''
     // ⚠️ 独立端口的 Anthropic 地址由 OpenAI 地址推导（同 host:port，换路径）：
     // 网关在这两个路径上挂了同一套管线，模型都写裸名。
@@ -901,6 +999,34 @@ function renderEndpoints(providers, lan) {
         <div class="endpoint-note">
           模型同样写 <code style="font-size:11px">供应商/模型</code>；
           API Key 填访问令牌（客户端若要求 <code style="font-size:11px">x-api-key</code> 同样用它）
+        </div>
+      </div>
+    </div>
+    <!--
+      **决策端点**（2026-11-12 新增）。
+
+      ⚠️ 它**不是聊天端点**：请求体是「材料 + 问题集」，返回的是概率/置信度，
+      不是文字。所以单独列一张卡，并把「为什么不在模型列表里」写清楚 ——
+      否则用户会去 /v1/models 里找 gemini-decision-1 然后找不到。
+    -->
+    <div class="endpoint endpoint-decision">
+      <div>
+        <div class="endpoint-label">
+          🧭 决策端点 · Gemini Decisions <span class="endpoint-note">（打分接口，不是聊天模型）</span>
+        </div>
+        <div class="endpoint-note">
+          ${copyable(`${aggBase}/v1/decisions`, '点击复制决策端点')}
+          <span class="endpoint-note">（<code style="font-size:11px">gemini-decision-1</code>，零输出 token）</span>
+        </div>
+        <div class="endpoint-note">
+          请求体是 <code style="font-size:11px">input</code> + <code style="font-size:11px">questions</code>，
+          <b>不是</b> <code style="font-size:11px">messages</code>；支持 noul（是/否）、choice（多选）、score（评分），
+          一次最多 1000 个问题共用同一份材料。
+        </div>
+        <div class="endpoint-note">
+          ⚠️ 故它**不在模型列表里** —— 选中后发 <code style="font-size:11px">messages</code> 必然 400。
+          需要 <b>AI Studio (API Key)</b> 渠道有启用账号。
+          详见 <code style="font-size:11px">docs/gemini-decisions.md</code>。
         </div>
       </div>
     </div>`
@@ -972,6 +1098,17 @@ $('#checkin-all').addEventListener('click', async () => {
     button.disabled = false
     button.textContent = original
   }
+})
+
+// ── 供应商开关面板（2026-11-12）──
+// 用原生 <dialog>：键盘可操作、Esc 自动关闭、焦点管理由浏览器负责。
+for (const id of ['open-switches', 'open-switches-2']) {
+  document.getElementById(id)?.addEventListener('click', () => {
+    document.getElementById('switches-dialog')?.showModal()
+  })
+}
+document.getElementById('switches-close')?.addEventListener('click', () => {
+  document.getElementById('switches-dialog')?.close()
 })
 
 $('#refresh-all').addEventListener('click', async () => {
@@ -1288,18 +1425,83 @@ function renderUsage(data) {
   const avgMs = calls > 0 ? Math.round(totalMs / calls) : 0
 
   const fmtNum = (n) => (n ?? 0).toLocaleString('zh-CN')
+  /** 紧凑数字（圆环中心用）：72,522,728 → 72.5M。 */
+  const fmtShort = (n) => {
+    const v = n ?? 0
+    if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`
+    if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
+    if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`
+    return String(v)
+  }
   const fmtDur = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms ?? 0}ms`)
   const failRate = calls > 0 ? ((failures / calls) * 100).toFixed(1) : '0.0'
   const scope = days <= 0 ? '全部时间' : days === 1 ? '今日' : `近 ${days} 天`
+
+  /**
+   * **token 圆盘图**（2026-11-12 用户要求「数据里面目前只有调用次数统计，
+   * 看是否可以加 token 统计，使用圆盘图」）。
+   *
+   * 用**内联 SVG 手绘**（本项目零外部依赖，见 style.css 文件头「双击即用」约束）：
+   * 两个同心环 —— 内环 = 输入 token 占比，外环 = 输出 token 占比（各自占自己的
+   * 100%？不：那样看不出量级差）。改为**同一把尺子**：两段弧长按「输入 : 输出」
+   * 的真实比例分配，中心显示总量。
+   *
+   * ⚠️ 弧长用 `stroke-dasharray` + `stroke-dashoffset` 实现，不用 path 算角度
+   *    （避免三角函数和浮点误差，也让 hover 动画只需改 CSS 变量）。
+   */
+  const tokenTotal = inputTokens + outputTokens
+  const inputPct = tokenTotal > 0 ? (inputTokens / tokenTotal) * 100 : 0
+  const outputPct = tokenTotal > 0 ? (outputTokens / tokenTotal) * 100 : 0
+  /** 圆环周长（r=42）：2πr ≈ 263.9。两段圆弧共用一条描边，靠 dashoffset 错开。 */
+  const RING_C = 2 * Math.PI * 42
 
   box.innerHTML = `
     <div class="usage-card">
       <div class="usage-num">${fmtNum(calls)}</div>
       <div class="usage-label">${scope}调用次数</div>
     </div>
-    <div class="usage-card">
-      <div class="usage-num">${fmtNum(inputTokens + outputTokens)}</div>
-      <div class="usage-label">总 token（入 ${fmtNum(inputTokens)} / 出 ${fmtNum(outputTokens)}）</div>
+    <div class="usage-card usage-card-token">
+      <div class="token-ring-wrap">
+        <svg class="token-ring" viewBox="0 0 110 110" role="img"
+             aria-label="token 构成：输入 ${fmtNum(inputTokens)}，输出 ${fmtNum(outputTokens)}">
+          <!-- 底环 -->
+          <circle cx="55" cy="55" r="42" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="9"/>
+          ${tokenTotal > 0 ? `
+          <!-- 输入（占起始段） -->
+          <circle cx="55" cy="55" r="42" fill="none" stroke="url(#gradTokenIn)" stroke-width="9"
+                  stroke-linecap="butt"
+                  stroke-dasharray="${(RING_C * inputPct / 100).toFixed(2)} ${RING_C.toFixed(2)}"
+                  stroke-dashoffset="0"
+                  transform="rotate(-90 55 55)"/>
+          <!-- 输出（接在输入之后） -->
+          <circle cx="55" cy="55" r="42" fill="none" stroke="url(#gradTokenOut)" stroke-width="9"
+                  stroke-linecap="butt"
+                  stroke-dasharray="${(RING_C * outputPct / 100).toFixed(2)} ${RING_C.toFixed(2)}"
+                  stroke-dashoffset="${(-RING_C * inputPct / 100).toFixed(2)}"
+                  transform="rotate(-90 55 55)"/>
+          ` : ''}
+          <defs>
+            <linearGradient id="gradTokenIn" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#6b8afd"/>
+              <stop offset="100%" stop-color="#8fa8ff"/>
+            </linearGradient>
+            <linearGradient id="gradTokenOut" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#a06bfd"/>
+              <stop offset="100%" stop-color="#e07bb0"/>
+            </linearGradient>
+          </defs>
+          <text x="55" y="52" text-anchor="middle" class="token-ring-num">${tokenTotal > 0 ? fmtShort(tokenTotal) : '0'}</text>
+          <text x="55" y="67" text-anchor="middle" class="token-ring-unit">token</text>
+        </svg>
+      </div>
+      <div class="token-legend">
+        <span class="token-key token-key-in">
+          <i></i>输入 ${fmtNum(inputTokens)}<em>${inputPct.toFixed(1)}%</em>
+        </span>
+        <span class="token-key token-key-out">
+          <i></i>输出 ${fmtNum(outputTokens)}<em>${outputPct.toFixed(1)}%</em>
+        </span>
+      </div>
     </div>
     <div class="usage-card">
       <div class="usage-num">${fmtDur(avgMs)}</div>

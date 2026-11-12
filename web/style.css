@@ -559,3 +559,358 @@ main { max-width: 1500px; margin: 0 auto; padding: 22px 24px 60px; }
   background: var(--surface-2, rgba(255,255,255,.03));
   font-size: 12.6px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 2026-11-12 视觉改版 —— 「编辑式克制」
+ *
+ * 设计参照（用户给的 StyleKit 示例，只学风格不抄内容）：
+ *   · **衬线大标题** + 无衬线正文的对比（Georgia / Times 用于标题层级）
+ *   · **极克制的中性色**：近黑底 + 一个强调色，图标/图表才用彩色
+ *   · **用细线和留白分层**，不用模糊阴影堆体积（原文明确禁止大范围 box-shadow）
+ *   · 圆角偏小（8–14px），间距宁可大一点，信息不挤
+ *   · 动效短、只动 transform/opacity
+ *
+ * ⚠️ 这一段**追加**在原样式之后，靠后出现即生效（同优先级覆盖）。
+ *    保留原变量名，避免改动 app.js 里的内联 style。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* 更中性、更暗的底色：把彩色让给数据本身 */
+  --bg: #0a0a0b;
+  --surface-1: #101012;
+  --surface-2: #161618;
+  --surface-3: #1c1c1f;
+  --border: #2a2a2e;
+  --border-soft: #1e1e21;
+
+  --text: #ededef;
+  --text-dim: #a0a0a8;
+  --text-faint: #6a6a72;
+
+  --accent: #7c8cff;
+  --accent-2: #b48cff;
+  --accent-soft: #7c8cff1f;
+  --grad: linear-gradient(135deg, #7c8cff 0%, #b48cff 100%);
+
+  --ok: #4ec9a0;
+  --warn: #e0a44a;
+  --err: #e8695f;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  /* 标题字体：本地衬线（不引外部字体 —— 见文件头工程约束） */
+  --font-display: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+  --font-body: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+}
+
+body {
+  background-image:
+    radial-gradient(900px 360px at 10% -6%, #7c8cff0f, transparent 60%),
+    radial-gradient(700px 300px at 92% -10%, #b48cff0a, transparent 62%);
+  font-family: var(--font-body);
+  letter-spacing: .01em;
+}
+
+/* ── 顶栏：去掉磨砂，用一条实线分隔 ── */
+.topbar {
+  background: #0a0a0b;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 14px 28px;
+  gap: 26px;
+}
+/* 原来的 .logo 是渐变方块 —— 改成细线圆环，更贴合编辑式风格 */
+.logo {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: transparent;
+  border: 1.5px solid var(--accent);
+  box-shadow: none;
+}
+.logo::after { display: none; }
+.brand h1 {
+  font-family: var(--font-display);
+  font-size: 17px; font-weight: 600; letter-spacing: .01em;
+  background: none; -webkit-text-fill-color: var(--text); color: var(--text);
+}
+.brand .sub { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+
+/* ── 标签页：文字式，激活态用一条下划线（不用胶囊底） ── */
+.tabs { gap: 2px; }
+.tab {
+  background: transparent; border: none; border-radius: 0;
+  padding: 7px 14px 9px;
+  color: var(--text-faint); font-size: 13px;
+  border-bottom: 1.5px solid transparent;
+  transition: color .18s, border-color .18s;
+}
+.tab:hover { color: var(--text-dim); }
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  background: transparent;
+}
+
+/* ── 页面标题：衬线大字 ── */
+.page-head h2 {
+  font-family: var(--font-display);
+  font-size: 24px; font-weight: 600; letter-spacing: -.01em;
+}
+.page-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.page-head .hint { color: var(--text-faint); font-size: 12.5px; line-height: 1.75; max-width: 74ch; }
+.page-head .hint b { color: var(--text-dim); font-weight: 600; }
+
+/* ── 卡片：细边框 + 极轻的位移反馈，不用大阴影 ── */
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  box-shadow: none;
+  transition: transform .22s cubic-bezier(.2,.7,.3,1), border-color .22s;
+}
+.card:hover {
+  border-color: var(--border);
+  transform: translateY(-1px);
+}
+.card-title { font-family: var(--font-body); }
+
+/* ── 按钮：更收敛，主按钮用强调色描边而非实心 ── */
+.btn {
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  transition: background .18s, border-color .18s, color .18s, transform .12s;
+}
+.btn:active { transform: scale(.98); }
+.btn-primary {
+  background: var(--accent); border-color: var(--accent); color: #0a0a0b; font-weight: 600;
+}
+.btn-primary:hover { background: #8f9dff; border-color: #8f9dff; }
+.btn-accent {
+  border-color: #3a3a52; color: var(--accent);
+  background: #12121a;
+}
+.btn-accent:hover { border-color: var(--accent); background: #16162a; }
+
+/* 文字式链接按钮（页面说明里内联用） */
+.link-btn {
+  background: none; border: none; padding: 0 2px; margin: 0;
+  color: var(--accent); font: inherit; cursor: pointer;
+  border-bottom: 1px solid #7c8cff55; line-height: 1.3;
+}
+.link-btn:hover { border-bottom-color: var(--accent); }
+
+/* ═══════════════ 供应商开关面板（dialog）═══════════════ */
+.dialog {
+  /* 原生 dialog：键盘可操作、Esc 关闭、无需手写焦点管理 */
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-1);
+  color: var(--text);
+  padding: 0;
+  width: min(620px, calc(100vw - 32px));
+  max-height: min(78vh, 720px);
+  box-shadow: 0 24px 64px #00000066;
+}
+.dialog::backdrop { background: #000000a8; }
+.dialog-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  position: sticky; top: 0; background: var(--surface-1); z-index: 1;
+}
+.dialog-head h3 {
+  margin: 0 0 6px; font-family: var(--font-display); font-size: 19px; font-weight: 600;
+}
+.dialog-head .hint { margin: 0; font-size: 12px; color: var(--text-faint); line-height: 1.65; }
+
+.switch-list { padding: 8px 10px 14px; overflow: auto; }
+.switch-row {
+  display: grid;
+  grid-template-columns: 18px 1fr auto 52px 46px;
+  align-items: center; gap: 12px;
+  padding: 11px 10px;
+  border-radius: 9px;
+  transition: background .16s;
+}
+.switch-row:hover { background: var(--surface-2); }
+.switch-row.is-off { opacity: .5; }
+.switch-grip { color: var(--text-faint); font-size: 13px; cursor: default; user-select: none; }
+.switch-name { font-size: 13.5px; font-weight: 500; }
+.switch-meta, .switch-port {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-faint);
+}
+.switch-port { text-align: right; }
+
+/* 迷你开关：轨道 + 圆点，纯 CSS，勾选态由 :checked 驱动 */
+.switch-mini { display: flex; align-items: center; cursor: pointer; }
+.switch-mini input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch-track {
+  width: 40px; height: 22px; border-radius: 11px;
+  background: #2a2a2e; border: 1px solid #34343a;
+  position: relative; transition: background .18s, border-color .18s;
+}
+.switch-track::after {
+  content: ""; position: absolute; left: 2px; top: 2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #86868f;
+  transition: transform .18s cubic-bezier(.2,.7,.3,1), background .18s;
+}
+.switch-mini input:checked + .switch-track { background: var(--accent-soft); border-color: var(--accent); }
+.switch-mini input:checked + .switch-track::after { transform: translateX(18px); background: var(--accent); }
+.switch-mini input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ═══════════════ token 圆盘图 ═══════════════ */
+.usage-card-token {
+  display: flex; align-items: center; gap: 14px;
+  /* 比其它概览卡宽一点：圆环 + 图例并排需要空间 */
+  grid-column: span 2; min-width: 0;
+}
+.token-ring-wrap { flex: none; width: 84px; height: 84px; }
+.token-ring { width: 100%; height: 100%; display: block; }
+.token-ring-num {
+  font-family: var(--font-display);
+  font-size: 17px; font-weight: 600; fill: var(--text);
+}
+.token-ring-unit { font-size: 8px; fill: var(--text-faint); letter-spacing: .08em; text-transform: uppercase; }
+.token-legend { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.token-key {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 11.5px; color: var(--text-dim); white-space: nowrap;
+}
+.token-key i {
+  width: 7px; height: 7px; border-radius: 2px; flex: none;
+  transform: translateY(1px);
+}
+.token-key-in i { background: #6b8afd; }
+.token-key-out i { background: #b48cff; }
+.token-key em {
+  font-style: normal; font-family: var(--font-mono);
+  font-size: 10.5px; color: var(--text-faint);
+}
+
+/* ── 决策端点卡片：与普通端点区分（虚线边框 + 图标前缀） ── */
+.endpoint-decision {
+  border-style: dashed;
+  border-color: #3a3a52;
+  background: #101018;
+}
+.endpoint-decision .endpoint-label { color: var(--accent); }
+
+/* ── 响应式 ── */
+@media (max-width: 720px) {
+  .topbar { flex-wrap: wrap; padding: 12px 16px; gap: 12px; }
+  .topbar-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+  .page-head h2 { font-size: 20px; }
+  .usage-card-token { grid-column: 1 / -1; }
+  .switch-row { grid-template-columns: 18px 1fr auto 46px; }
+  .switch-port { display: none; }
+}
+
+/* ── 尊重「减少动态效果」偏好 ── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}
+
+/* ═══════════════ 视觉修订（同日第二轮，看截图后修的细节）═══════════════
+ *
+ * 上面第一版留下三个实际问题（截图验证发现）：
+ *   ① `.page-head` 是 flex + baseline，标题与说明**并排**在同一行 ——
+ *      衬线大标题挤成一条，完全没起到「编辑式标题」的作用
+ *   ② token 圆盘卡比同排的概览卡矮一截（圆环 84px + 图例两行），网格对齐难看
+ *   ③ 卡片里「停用」按钮是红色实心，7 张卡各一个，视觉噪音太大
+ */
+
+/* ① 标题独占一行，说明在下一行 —— 这是「编辑式」排版的骨架 */
+.page-head {
+  display: block;
+  margin-bottom: 18px;
+}
+.page-head h2 {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -.015em;
+  line-height: 1.25;
+  margin: 0 0 8px;
+  display: block;
+}
+.page-head .hint {
+  display: block;
+  flex: none;
+  margin: 0;
+  max-width: 78ch;
+  line-height: 1.7;
+}
+/* 标题行内右侧的操作按钮（刷新/清空）要保持在同一行右侧 */
+.page-head .head-actions {
+  position: absolute;
+  right: 28px;
+  margin-top: -46px;
+}
+@media (max-width: 720px) {
+  .page-head .head-actions { position: static; margin-top: 12px; justify-content: flex-end; }
+}
+
+/* ② 概览卡统一最低高度，token 圆盘与其它卡等高 */
+.usage-summary { align-items: stretch; }
+.usage-card {
+  min-height: 92px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.usage-card-token {
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+  min-height: 92px;
+}
+
+/* ③ 「停用」按钮：从红色实心降为文字式，只有 hover 才显红 */
+.card-actions .btn-danger,
+.account .btn-danger {
+  background: transparent !important;
+  border-color: #2e2e34 !important;
+  color: var(--text-faint) !important;
+  font-size: 11.5px;
+}
+.card-actions .btn-danger:hover,
+.account .btn-danger:hover {
+  border-color: var(--err) !important;
+  color: var(--err) !important;
+}
+
+/* 卡片头部的状态标签「停用」也弱化一点（7 张卡各一个红字仍然吵） */
+.tag-err, .tag-bad { opacity: .78; }
+
+/* 顶栏按钮组：供应商开关做成唯一带色的，其余保持中性 —— 引导视线 */
+.topbar-actions .btn { border-color: #2a2a30; color: var(--text-dim); }
+.topbar-actions .btn:hover { border-color: #3a3a44; color: var(--text); }
+
+/* 页面标题下方的细分隔线，强化编辑式节奏 */
+.page { padding-top: 30px; }
+.page-head::after {
+  content: "";
+  display: block;
+  height: 1px;
+  background: var(--border-soft);
+  margin-top: 16px;
+}
+
+/* 图例：数字与百分比之间必须有间距（否则读成 "70,533,65797.3%"） */
+.token-key { gap: 7px; }
+.token-key em {
+  margin-left: auto;
+  padding-left: 8px;
+  min-width: 44px;
+  text-align: right;
+}
+.token-legend { flex: 1 1 auto; }
+
+/* 概览卡片：数值与标签之间留白更从容 */
+.usage-num { font-family: var(--font-display); font-size: 26px; letter-spacing: -.01em; }
+.usage-label { font-size: 11.5px; color: var(--text-faint); margin-top: 5px; }
