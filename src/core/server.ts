@@ -8,6 +8,7 @@
  *
  * 这样用户可以"只配一个 baseURL 用全部模型"，也可以"每个供应商单独接"。
  */
+import { createHash } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { readFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -107,6 +108,16 @@ async function readBody(request: IncomingMessage): Promise<string> {
     chunks.push(buf)
   }
   return Buffer.concat(chunks).toString('utf8')
+}
+
+/**
+ * 短哈希（`ETag` 用）。
+ *
+ * ⚠️ 用 `node:crypto` 的 sha1 前 8 位即可 —— 这里只需要「内容变了就变」，
+ *    不需要密码学强度。不引第三方依赖。
+ */
+function hashShort(body: Buffer): string {
+  return createHash('sha1').update(body).digest('hex').slice(0, 8)
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -584,7 +595,34 @@ export class OverviewServer {
       return
     }
     const body = readFileSync(file)
-    response.writeHead(200, { 'content-type': mime, 'content-length': body.length })
+    /**
+     * ⚠️⚠️ **必须显式 `no-cache`，否则浏览器会拿旧 JS**（真实问题，2026-11-12）。
+     *
+     * 原来只发 `content-type` / `content-length`，**没有任何缓存头** ——
+     * 浏览器对这类响应走**启发式缓存**（按 `Last-Modified` 派生的 10% 时长，
+     * 通常几分钟到几小时）。后果：改了 `web/app.js` 并重启服务，
+     * 用户**刷新页面仍然跑旧代码**，表现为「界面一下这样一下那样」的叠加态，
+     * 而且服务端查不出任何异常（接口返回的一直是新数据）。
+     *
+     * `no-cache` 不是「不缓存」，而是「每次用前先向服务器确认」——
+     * 配合 `ETag` 后没变则返回 304，既省流量又保证一致性。
+     * 这里不做 `max-age`：本项目是**本地控制台**，请求量极小，
+     * 确定性远比省一次往返重要。
+     */
+    const etag = `W/"${body.length.toString(16)}-${hashShort(body)}"`
+    const headers: Record<string, string | number> = {
+      'content-type': mime,
+      'content-length': body.length,
+      'cache-control': 'no-cache',
+      etag,
+    }
+    const ifNoneMatch = response.req.headers['if-none-match']
+    if (typeof ifNoneMatch === 'string' && ifNoneMatch === etag) {
+      response.writeHead(304, headers)
+      response.end()
+      return
+    }
+    response.writeHead(200, headers)
     response.end(body)
   }
 
