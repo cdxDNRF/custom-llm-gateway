@@ -68,6 +68,8 @@ export interface VertexAdapterOptions {
 export const VERTEX_DEFAULT_MODELS: readonly string[] = [
   'gemini-4-argon',
   'gemini-4-carbon',
+  // ⚠️ 不带 `-preview`（实测 404）
+  'gemini-4-hydrogen',
   'gemini-3.8-flash',
   'gemini-3.7-flash',
   'gemini-3.6-flash',

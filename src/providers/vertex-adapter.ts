@@ -82,6 +82,9 @@ export interface VertexModelEntry {
 export const VERTEX_MODELS: readonly VertexModelEntry[] = [
   { id: 'gemini-4-argon', name: 'Gemini 4 Argon', contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', contextWindow: 1_048_576, maxTokens: 65_536 },
+  // ⚠️ 模型名是 `gemini-4-hydrogen`，**不带 `-preview`**：
+  //    实测 `-preview` 后缀 404（本机 2026-11-12 验证），别加错。
+  { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, maxTokens: 65_536 },
@@ -295,14 +298,28 @@ function restoreThoughtSignatures(
         messageChanged = true
         return entry
       }
-      // ⚠️ 只给**第一个** tool_call 兜底：Gemini 只校验每步首个 functionCall。
-      if (index === 0) {
-        setThoughtSignature(entry, {
-          google: { thought_signature: SKIP_THOUGHT_SIGNATURE_SENTINEL },
-        })
-        fallback += 1
-        messageChanged = true
-      }
+      /**
+       * ⚠️⚠️ **每个 tool_call 都要兜底，不是只有第一个**（真实缺陷，2026-11-12 实测）。
+       *
+       * 参考实现只给 `index === 0` 注入兜底标记，注释写「Gemini 只校验每步首个
+       * functionCall」。但本机实测**不是这样**：
+       *
+       * | 形态 | 结果 |
+       * |---|---|
+       * | 两个 tool_call，都不带签名 | ❌ 400 `Function call is missing a thought_signature in functionCall parts` |
+       * | 第一个带 skip 标记、第二个不带 | ✅ 200（**侥幸过** —— 见下） |
+       * | 两个都带 skip 标记 | ✅ 200 |
+       *
+       * 第 2 行能过只是因为上游对「同一 assistant 消息里的后续调用」放宽了校验，
+       * 而**跨多轮的场景会重新严格**。故这里对**每个**缺签名的 tool_call 都注入，
+       * 不做 `index === 0` 判断 —— 多注入没有副作用（它只是让上游跳过校验），
+       * 少注入则会 400。
+       */
+      setThoughtSignature(entry, {
+        google: { thought_signature: SKIP_THOUGHT_SIGNATURE_SENTINEL },
+      })
+      fallback += 1
+      messageChanged = true
       return entry
     })
 
@@ -404,7 +421,10 @@ export class VertexAdapter extends LlmAdapter {
       this.signatures,
     )
     if (restored > 0 || fallback > 0) {
-      this.options.warn?.(`[vertex] thought_signature: restored=${restored} fallback=${fallback}`)
+      this.options.warn?.(
+        `[vertex] thought_signature: restored=${restored} fallback=${fallback} `
+        + `cacheSize=${this.signatures.size}`,
+      )
     }
     const finalPayload = withSignatures
 
@@ -452,7 +472,19 @@ export class VertexAdapter extends LlmAdapter {
       { ...(options.signal === undefined ? {} : { signal: options.signal }) },
       {
         label: 'vertex',
-        firstTokenTimeoutMs: 120_000,
+        /*
+         * ⚠️⚠️ **首字超时必须 300 秒**（2026-11-12 用户实测反馈）。
+         *
+         * 原值 120 秒在 ZCode 场景下**会误杀**：上下文 100k–150k tokens
+         * + `reasoning_effort: "high"` 时，旗舰模型（gemini-4-carbon /
+         * gemini-4-hydrogen）冷预填充 + 首发耗时实测 **110–255 秒**，
+         * 经常直接越过 120 秒 ⇒ 表现为「模型不响应 / 莫名中断」。
+         *
+         * 取 300 秒覆盖观测到的上界（255s）并留余量。
+         * ⚠️ 注意 `chunkTimeoutMs` 保持 60 秒 —— 首字慢是预填充慢，
+         *    而**流中途卡住**通常是真的挂了，不该一起放宽。
+         */
+        firstTokenTimeoutMs: 300_000,
         chunkTimeoutMs: 60_000,
         ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
       },
@@ -588,8 +620,26 @@ function toOpenAiBody(options: GenerateOptions): Record<string, unknown> {
 function describeVertexError(status: number, text: string): string {
   let detail = text.trim()
   try {
-    const parsed = JSON.parse(text) as { error?: { message?: string } }
-    if (typeof parsed.error?.message === 'string') detail = parsed.error.message
+    const parsed = JSON.parse(text) as unknown
+    /**
+     * ⚠️⚠️ **错误体是「单元素数组」而不是对象**（真实缺陷，2026-11-12 实测）。
+     *
+     * Vertex `/endpoints/openapi` 出错时返回：
+     * ```json
+     * [{"error":{"code":400,"message":"Expected input to contain field: 'type'."}}]
+     * ```
+     * 原来按 `{ error?: {...} }` 解析 ⇒ `parsed.error` 是 undefined
+     * ⇒ 用户只看到一整段原始 JSON 被截断，**看不到真正的 message**。
+     * （本机就是靠这个错误才定位到 tools 格式问题的，当时只能人肉读 JSON。）
+     */
+    const first = Array.isArray(parsed) ? parsed[0] : parsed
+    if (typeof first === 'object' && first !== null) {
+      const error = (first as Record<string, unknown>).error
+      if (typeof error === 'object' && error !== null) {
+        const message = (error as Record<string, unknown>).message
+        if (typeof message === 'string') detail = message
+      }
+    }
   } catch {
     // 非 JSON（边缘节点 HTML）：原样截断
   }
