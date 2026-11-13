@@ -107,8 +107,20 @@ function noiseAt(x, y) {
 }
 
 /** 亮度 → 四档。 */
+/**
+ * 覆盖率/强度 → 四档线宽索引。
+ *
+ * ⚠️ 阈值**比原示例（0.12 / 0.42 / 0.89）整体下移**（2026-11-13）。
+ *
+ * 原示例量的是「白色标志在黑色底上的亮度」，填充区接近 1；
+ * 而我们量的是 **alpha 覆盖率经过缩放后的值** —— 图标缩到 0.72 又经过
+ * 8×8 平均，实心区域往往只到 0.6~0.9，套用原阈值会让**大片实心区掉到第 2 档**，
+ * 观感「该粗的地方不够粗」。
+ *
+ * 现在的档位：极细（轮廓/抗锯齿）→ 细 → 中 → 粗（实心填充）。
+ */
 function bucketOf(value) {
-  return value < 0.12 ? 0 : value < 0.42 ? 1 : value < 0.89 ? 2 : 3
+  return value < 0.10 ? 0 : value < 0.34 ? 1 : value < 0.68 ? 2 : 3
 }
 
 /**
@@ -148,7 +160,15 @@ async function sampleIcon(src) {
    * 格子不是正方形 ⇒ 标志横向拉宽。现在画布按网格比例（56:34）建，
    * 图标**按短边等比缩放到铺满**（不是居中留白 —— 那样在宽卡上标志太小）。
    */
-  const SS = 5
+  /**
+   * 超采样倍数：每格取 SS×SS 像素**双线性平均**。
+   *
+   * ⚠️ 从 5 提到 **8**（2026-11-13）：图标尺寸差异极大（ZCode 32×32、
+   * magicrew 128×128），32×32 的图标放大到 60 格网格时，5×5 采样会明显
+   * 出现「有的格子全有、有的格子全空」的棋盘跳变 —— 用户看到的「小图标碎成点」
+   * 就是这个。8×8 让每个格子拿到的覆盖率更平滑。
+   */
+  const SS = 8
   const sideW = GRID_W * SS
   const sideH = GRID_H * SS
   const scratch = document.createElement('canvas')
@@ -156,8 +176,18 @@ async function sampleIcon(src) {
   scratch.height = sideH
   const context = scratch.getContext('2d', { willReadFrequently: true })
   if (context === null) return undefined
-  context.fillStyle = '#000'
-  context.fillRect(0, 0, sideW, sideH)
+  /**
+   * ⚠️⚠️ **采样画布要留透明底，不能涂黑**（真实缺陷，2026-11-13）。
+   *
+   * 旧代码先 `fillRect` 涂纯黑再画图标，于是：
+   * - 透明区域读出来是 `rgb(0,0,0)`，**与「图标本身是深黑」无法区分**
+   * - 我们被迫用亮度当判据，深色图标因此被判成空白（标志出现大块缺口）
+   *
+   * 正确做法：**不涂底色**（canvas 默认全透明），让 alpha 通道保留图标的
+   * 真实覆盖率。透明处 alpha=0、图形处 alpha=255、抗锯齿边缘是中间值。
+   * 这样 alpha 就成了干净的「有没有图形」信号，与颜色深浅完全解耦。
+   */
+  // （刻意不 fillRect —— 透明底是这里的关键）
   /**
    * 缩放策略：**铺满短边、长边居中**。
    *
@@ -177,10 +207,30 @@ async function sampleIcon(src) {
    * 下移后标志主体落在标题与箭头之间的净空区。
    */
   const offsetY = sideH * 0.06
+  /**
+   * 放大位图时开最高质量的平滑 —— 小图标（32×32）放大到 480×480 的采样画布
+   * 若用最近邻会出现方块锯齿，进而让 alpha 边缘一格一格地跳。
+   */
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
   context.drawImage(image, (sideW - drawW) / 2, (sideH - drawH) / 2 + offsetY, drawW, drawH)
 
   const pixels = context.getImageData(0, 0, sideW, sideH).data
   const luminance = new Float32Array(COUNT)
+
+  /**
+   * ⚠️⚠️ **必须单独提 alpha 通道，不能只看亮度**（真实缺陷，2026-11-13 用户截图）。
+   *
+   * 我们先把采样画布涂成**纯黑**再画图标，所以透明区域读出来是 `rgb(0,0,0)`、
+   * 亮度 0 —— 与「图标本身是深黑色」无法区分。后果：
+   *
+   * - 深色图标（Qoder 深蓝、ZCode 深绿）的**内部**被判成空白 ⇒ 标志出现缺口
+   * - 边缘半透明像素亮度低 ⇒ 轮廓咔嚓成锯齿
+   *
+   * 正解：把 `alpha` 当「有没有图形」的判据，把 `luminance` 只当「这条线画多粗」。
+   * 两者分工后，深色填充不再丢失，半透明边缘也能按覆盖率正确分档。
+   */
+  const coverage = new Float32Array(COUNT)
 
   /**
    * 主色累计：按「饱和度 × 亮度」加权。
@@ -195,6 +245,7 @@ async function sampleIcon(src) {
   for (let gy = 0; gy < GRID_H; gy += 1) {
     for (let gx = 0; gx < GRID_W; gx += 1) {
       let sum = 0
+      let alphaSum = 0
       for (let sy = 0; sy < SS; sy += 1) {
         for (let sx = 0; sx < SS; sx += 1) {
           const px = Math.min(sideW - 1, gx * SS + sx)
@@ -202,9 +253,12 @@ async function sampleIcon(src) {
           const index = (py * sideW + px) * 4
           // Rec. 709（与原示例一致）
           sum += (0.2126 * pixels[index] + 0.7152 * pixels[index + 1] + 0.0722 * pixels[index + 2]) / 255
+          // alpha 即「该像素有多少是图形」（画布底色黑、图标叠上去后 alpha 保留原值）
+          alphaSum += pixels[index + 3] / 255
         }
       }
       luminance[gy * GRID_W + gx] = sum / (SS * SS)
+      coverage[gy * GRID_W + gx] = alphaSum / (SS * SS)
 
       // 主色：用该格的中心像素（省掉再循环一遍 5×5）
       const cx = Math.min(sideW - 1, gx * SS + Math.floor(SS / 2))
@@ -227,6 +281,173 @@ async function sampleIcon(src) {
     }
   }
   // 显式释放（原示例同款：把尺寸归零，让像素缓冲可回收）
+  /**
+   * ⚠️⚠️ **剥离「整块不透明底图」**（2026-11-13 第二次修正）。
+   *
+   * 图标有两类，alpha 覆盖比例相差 30 倍：
+   *
+   * | 类型 | 例子 | alpha 覆盖率 |
+   * |---|---|---|
+   * | 图形本身透明、只有标志不透明 | buddy 3% / cline 6% | 低 |
+   * | **整块圆角底 + 白/亮色标志** | zcode **95%** / workbuddy 63% / monkeycode 43% | 高 |
+   *
+   * 第二类若直接用 alpha，整张卡被涂成实心方块 —— 标志反而消失（实测翻车）。
+   * 故：**底图是靠「大面积同色」识别的**，用「该格亮度 vs 全图亮度中位数」的
+   * 偏离度来压掉。标志（白字/亮图案）偏离大 ⇒ 保留；底（占多数）⇒ 压到 0。
+   *
+   * 只在「覆盖率中位数偏高」（确实有底图）时才这么做，避免误伤第一类图标。
+   */
+  {
+    const values = []
+    for (let i = 0; i < COUNT; i += 1) {
+      if (coverage[i] > 0.5) values.push(luminance[i])
+    }
+    if (values.length > COUNT * 0.35) {
+      // 有底图：取亮度中位数作为「底色」
+      values.sort((a, b) => a - b)
+      const base = values[Math.floor(values.length / 2)]
+      for (let i = 0; i < COUNT; i += 1) {
+        if (coverage[i] <= 0.5) continue
+        /**
+         * ⚠️⚠️ **必须用 `abs(delta)`，不能用 `(light - base)`**（2026-11-13 实测）。
+         *
+         * 底图与标志的明暗关系有**两种，方向相反**：
+         *
+         * | 图标 | 底 | 标志 | 只取「更亮」会怎样 |
+         * |---|---|---|---|
+         * | ZCode | 深色块 | 亮色 Z | ✅ 正确 |
+         * | CodeBuddy | **浅色**块 | 深色云 | ❌ **标志被整片削掉** ⇒ 云变镂空缺口 |
+         *
+         * 用户截图 1 里 CodeBuddy 那个「明显缺口」正是这个原因 ——
+         * 云的主体比白底**暗**，被 `light - base < 0` 判成"与底同色"压掉了。
+         *
+         * 正解：`Math.abs(delta)` —— 只要与底色有明显差异就是图形，
+         * 不论更亮还是更暗。这样两种配色方向都能完整保留。
+         */
+        const delta = Math.abs(luminance[i] - base) * 2.2
+        coverage[i] = Math.max(0, Math.min(1, delta < 0.16 ? 0 : delta))
+      }
+    }
+  }
+
+  /**
+   * ⚠️ **实心图标的「轮廓化」**（2026-11-13）。
+   *
+   * 有些图标本身就是**纯色实心块**（TRAE 是 `fill="#32F08C"` 的方框 +
+   * 两个菱形，没有任何镂空）。直接把覆盖率画成线 ⇒ 一整块实心方块，
+   * 完全看不出是什么标志（用户截图 1 里 TRAE 卡就是那样）。
+   *
+   * 做法：对**填充率很高**的图标，把 coverage 转成「边缘图」——
+   * 只保留轮廓与内部边界，中间的大片实心区域压淡。这类似图像处理里的
+   * 边缘检测：`|coverage - 邻域平均|` 大的地方就是边界。
+   *
+   * 判据：实心覆盖率 > 55% 才做（避免误伤本来就是线条的图标）。
+   */
+  {
+    /**
+     * ⚠️ 判据不是「填充率 > 55%」—— 实测 TRAE 的填充率只有 **17.5%**
+     *    （它是细边框 + 两个小菱形的组合，不是整体实心块），
+     *    却依然画成了实心方块。真正决定「是否实心观感」的是
+     *    **覆盖率的平均值**：实心图标 avgCov 会明显偏高。
+     *
+     * 实测：TRAE avgCov=0.181、Gemini 那种纯线条 avgCov<0.08。
+     * 故阈值取 **0.14**（在两者之间）。
+     */
+    let filled = 0
+    let covSum = 0
+    for (let i = 0; i < COUNT; i += 1) {
+      if (coverage[i] > 0.6) filled += 1
+      covSum += coverage[i]
+    }
+    const fillRatio = filled / COUNT
+    const avgCoverage = covSum / COUNT
+    if (avgCoverage > 0.14 || fillRatio > 0.45) {
+      const edged = new Float32Array(COUNT)
+      for (let y = 0; y < GRID_H; y += 1) {
+        for (let x = 0; x < GRID_W; x += 1) {
+          const self = coverage[y * GRID_W + x]
+          // 邻域平均（含自身，3×3）
+          let sum = 0
+          let n = 0
+          for (let dy = -1; dy <= 1; dy += 1) {
+            for (let dx = -1; dx <= 1; dx += 1) {
+              const nx = x + dx
+              const ny = y + dy
+              if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue
+              sum += coverage[ny * GRID_W + nx]
+              n += 1
+            }
+          }
+          const avg = sum / n
+          // 与邻域差异越大越像边界；同时保留自身强度做底（避免内部全黑）
+          const edge = Math.abs(self - avg) * 2.4
+          edged[y * GRID_W + x] = Math.min(1, edge + self * 0.18)
+        }
+      }
+      coverage.set(edged)
+    }
+  }
+
+  /**
+   * **剔除孤立噪点**（2026-11-13）。
+   *
+   * 有些图标（尤其带底图的）会在角落残留零星亮点 —— 单独一个格子亮着，
+   * 视觉上就是「标志旁边撒了几粒芝麻」。做法：一个格子的 3×3 邻域里
+   * 有覆盖的邻居少于 2 个，就当噪点清掉（真实的线条/填充不会这么孤）。
+   */
+  {
+    const cleaned = new Float32Array(coverage)
+    for (let y = 0; y < GRID_H; y += 1) {
+      for (let x = 0; x < GRID_W; x += 1) {
+        if (coverage[y * GRID_W + x] <= 0.08) continue
+        let neighbours = 0
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dy === 0) continue
+            const nx = x + dx
+            const ny = y + dy
+            if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue
+            if (coverage[ny * GRID_W + nx] > 0.08) neighbours += 1
+          }
+        }
+        if (neighbours < 2) cleaned[y * GRID_W + x] = 0
+      }
+    }
+    coverage.set(cleaned)
+  }
+
+  /**
+   * **对 coverage 做一次 3×3 邻域平滑**（2026-11-13）。
+   *
+   * 目的：消掉「有的格子 0、相邻格子 1」的棋盘跳变 —— 那是小图标放大后
+   * 最刺眼的观感问题（用户截图 2 的碎片感）。
+   *
+   * ⚠️ 只平滑 coverage（决定画不画、画多粗），**不动 luminance**
+   *    （它只做微观深浅调节，平滑它没有收益）。
+   * ⚠️ 权重 [1,2,1]² 的中心化卷积，总计 16 —— 轻微、不糊掉轮廓。
+   */
+  {
+    const smoothed = new Float32Array(COUNT)
+    for (let y = 0; y < GRID_H; y += 1) {
+      for (let x = 0; x < GRID_W; x += 1) {
+        let sum = 0
+        let weight = 0
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            const nx = x + dx
+            const ny = y + dy
+            if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue
+            const w = (dx === 0 ? 2 : 1) * (dy === 0 ? 2 : 1)
+            sum += coverage[ny * GRID_W + nx] * w
+            weight += w
+          }
+        }
+        smoothed[y * GRID_W + x] = sum / weight
+      }
+    }
+    coverage.set(smoothed)
+  }
+
   scratch.width = 0
   scratch.height = 0
 
@@ -254,7 +475,7 @@ async function sampleIcon(src) {
     }
     accent = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`
   }
-  return { luminance, accent }
+  return { luminance, coverage, accent }
 }
 
 /**
@@ -273,6 +494,8 @@ class LineFieldCard {
     this.ink = options.ink ?? 'rgba(255,255,255,.9)'
     this.detection = options.detection ?? '#267dff'
     this.luminance = undefined
+    /** 图标覆盖率（0..1，来自 alpha 通道）；见 sampleIcon 的注释。 */
+    this.coverage = undefined
     this.reducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
     this.playing = !this.reducedMotion
     this.dpr = 0
@@ -291,6 +514,14 @@ class LineFieldCard {
     const sampled = await sampleIcon(src)
     if (sampled !== undefined) {
       this.luminance = sampled.luminance
+      /**
+       * `coverage`（图标覆盖率，来自 alpha）与 `luminance`（明暗）**分工不同**：
+       * - coverage 决定「这个格子该不该画线」以及基础粗细档位
+       * - luminance 只做微观调节（同色系内部的深浅差异）
+       *
+       * 见 sampleIcon 里那段注释：只用亮度会把深色图标判成空白。
+       */
+      this.coverage = sampled.coverage
       // 主色来自图标本身 ⇒ 线与图标永远同色（用户要求「跟图标一致」）
       if (sampled.accent !== undefined) this.ink = sampled.accent
     }
@@ -380,16 +611,53 @@ class LineFieldCard {
 
     for (let gy = 0; gy < GRID_H - 1; gy += 1) {
       for (let gx = 0; gx < GRID_W; gx += 1) {
-        const top = this.luminance === undefined ? 0 : this.luminance[gy * GRID_W + gx]
-        const bottom = this.luminance === undefined ? 0 : this.luminance[(gy + 1) * GRID_W + gx]
-        let luminance = (top + bottom) / 2
+        const hasIcon = this.coverage !== undefined && this.luminance !== undefined
+        /**
+         * **两个取样上下相邻，拼成一条约两格高的竖线**（与原示例一致）。
+         * 取「上格 + 下格」的平均值作为这条线代表的那片区域的属性。
+         */
+        const cov = hasIcon
+          ? (this.coverage[gy * GRID_W + gx] + this.coverage[(gy + 1) * GRID_W + gx]) / 2
+          : 0
+        const light = hasIcon
+          ? (this.luminance[gy * GRID_W + gx] + this.luminance[(gy + 1) * GRID_W + gx]) / 2
+          : 0
+
+        /**
+         * ⚠️⚠️ **coverage 与 luminance 必须一起用，单用任何一个都会坏**（2026-11-13）。
+         *
+         * 这一步是本文件最容易写错的地方，两次都从截图上翻过车，记清楚：
+         *
+         * | 只用 | 后果 |
+         * |---|---|
+         * | **只看亮度**（旧版 `if (luminance < 0.045)`） | 深色图标填充区亮度低 ⇒ 判成空白 ⇒ **标志出现大块缺口**；半透明抗锯齿边缘也被啃掉 ⇒ **边缘锯齿** |
+         * | **只看 alpha**（本轮的第一次尝试） | 带**整块不透明底图**的图标（实测 ZCode alpha 覆盖 95%、monkeycode 43%）⇒ **整张卡被涂满成实心方块**，标志反而消失 |
+         *
+         * 正解：**alpha 管「边界」、亮度管「内部结构」**：
+         * - `cov` 低 ⇒ 这里确实没有图形（图标外的留白）⇒ 不画
+         * - `cov` 高但 `light` 低 ⇒ 有图形且是深色填充 ⇒ **照样要画**（这正是旧版的缺口来源）
+         * - `cov` 高且 `light` 高 ⇒ 亮色图形 ⇒ 画粗线
+         *
+         * 故取「覆盖率 × (亮度与一个下限的最大值)」：深色区域不会归零，
+         * 而空白区域仍被 coverage 挡掉。
+         */
+        if (!hasIcon || cov < 0.06) continue
+
+        /**
+         * 内部结构信号：
+         * - `cov` 提供「有图形」的基础量
+         * - `light` 提供同色系内部的深浅层次
+         *
+         * ⚠️ 深色填充要保底：`Math.max(light, 0.35)` —— 否则 ZCode 那种
+         *    深绿底（light≈0.1）会被压成接近 0，又回到「缺口」问题。
+         */
+        let signal = cov * (0.45 + Math.max(light, 0.35) * 0.75)
 
         // ── 缓慢下流的噪声（x: 列*0.15 + seed，y: 行*0.16 - 时间*0.17）──
         const noise = noiseAt(gx * 0.15 + this.seed, gy * 0.16 - this.time * 0.17)
-        luminance = luminance * 0.94 + noise * 0.12 * (0.25 + luminance * 0.75)
-
-        // 图标为空白处不画线（否则整张卡是均匀噪声，看不出是什么标志）
-        if (luminance < 0.045) continue
+        /** 噪声只做**轻微呼吸**，不能破坏轮廓。 */
+        signal = signal * (0.94 + noise * 0.07)
+        if (signal < 0.05) continue
 
         let x = originX + gx * cellW + cellW / 2
         let y0 = originY + gy * cellH + (cellH - cellW * 0.6) / 2
@@ -409,7 +677,7 @@ class LineFieldCard {
           }
         }
 
-        buckets[bucketOf(luminance)].push(x, y0, y1)
+        buckets[bucketOf(signal)].push(x, y0, y1)
       }
     }
 
