@@ -980,11 +980,29 @@ export class OverviewServer {
       try {
         const models = await provider.adapter.listModels(provider.id)
         for (const model of models) {
+          /**
+           * **档位能力要暴露给客户端**（2026-11-13 用户要求给 hydrogen 加 Extra 档）。
+           *
+           * 约定（见 `vendor/src/reasoning-ladder.ts` 文件头）：
+           * ```json
+           * { "reasoning": { "openai_efforts": ["low","medium","high","max"] } }
+           * ```
+           * DSH / CC Switch 之类的客户端读 `openai_efforts` 才知道该模型有档位可选，
+           * 否则只显示一个没有下拉的干条目 —— **上游明明支持，界面却看不到**。
+           *
+           * ⚠️ 绝大多数 vendor 适配器**不声明** `effortOptions`（它们的档位走
+           *    模型名后缀，已拆成独立条目）⇒ 那种情况不带 `reasoning` 字段，
+           *    不能塞一个空数组（客户端会显示一个空下拉）。
+           */
+          const effortOptions = (model as { effortOptions?: readonly string[] }).effortOptions
           data.push({
             id: `${provider.id}/${model.id}`,
             object: 'model',
             created,
             owned_by: provider.id,
+            ...(effortOptions === undefined || effortOptions.length === 0
+              ? {}
+              : { reasoning: { openai_efforts: [...effortOptions] } }),
           })
         }
       } catch (error) {

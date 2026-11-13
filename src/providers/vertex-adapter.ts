@@ -70,6 +70,15 @@ export interface VertexModelEntry {
   name: string
   contextWindow: number
   maxTokens: number
+  /**
+   * 该模型支持的**思考档位**（上游 `reasoning_effort` 的合法值）。
+   *
+   * ⚠️ 与 agy 渠道不同：vertex 走 **OpenAI 协议**，档位是**请求参数**
+   *    （`reasoning_effort: "high"`）而**不是**模型名后缀。
+   *    实测 `gemini-4-hydrogen-low/-medium/-high/-extra` 一律 **404**
+   *    （2026-11-13 本机验证）—— 故这里绝不能学 agy 那样拆成独立条目。
+   */
+  effortOptions?: readonly string[]
 }
 
 /**
@@ -84,7 +93,16 @@ export const VERTEX_MODELS: readonly VertexModelEntry[] = [
   { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', contextWindow: 1_048_576, maxTokens: 65_536 },
   // ⚠️ 模型名是 `gemini-4-hydrogen`，**不带 `-preview`**：
   //    实测 `-preview` 后缀 404（本机 2026-11-12 验证），别加错。
-  { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', contextWindow: 1_048_576, maxTokens: 65_536 },
+  //
+  // 档位实测（2026-11-13）：裸名 + `reasoning_effort` 参数可用，
+  // 合法值 **low / medium / high / max**（`max` 即 DSH 界面的 **Extra**）。
+  // ⚠️ `extra` / `extra_high` / `xhigh` 都返回 **400** —— 上游不认这些词，
+  //    别照 DSH 的界面名往上游传。
+  {
+    id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen',
+    contextWindow: 1_048_576, maxTokens: 65_536,
+    effortOptions: ['low', 'medium', 'high', 'max'],
+  },
   { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1_048_576, maxTokens: 65_536 },
@@ -352,12 +370,22 @@ export class VertexAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    return this.models.map((m) => ({ provider: 'vertex', id: m.id, name: m.name }))
+    return this.models.map((m) => ({
+      provider: 'vertex',
+      id: m.id,
+      name: m.name,
+      ...(m.effortOptions === undefined ? {} : { effortOptions: m.effortOptions }),
+    }))
   }
 
   /** 完整目录（不套黑名单），供 Web UI「模型管理」用；**必须同步**。 */
-  listAllModels(): readonly { id: string; name: string }[] {
-    return this.models.map((m) => ({ id: m.id, name: m.name }))
+  listAllModels(): readonly { id: string; name: string; effortOptions?: readonly string[] }[] {
+    return this.models.map((m) => ({
+      id: m.id,
+      name: m.name,
+      // 档位下拉的数据源（见 provider-common.ts 的透传注释）
+      ...(m.effortOptions === undefined ? {} : { effortOptions: m.effortOptions }),
+    }))
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -376,6 +404,7 @@ export class VertexAdapter extends LlmAdapter {
       contextWindow: entry.contextWindow,
       maxTokens: entry.maxTokens,
       inputModalities: ['text', 'image'],
+      ...(entry.effortOptions === undefined ? {} : { effortOptions: entry.effortOptions }),
     } as LlmResolvedModelInfo
   }
 

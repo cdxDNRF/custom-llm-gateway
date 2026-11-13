@@ -38,7 +38,20 @@ function extractResetTimeFromMessage(message: string | undefined): number | unde
 
 /** 适配器里 `listAllModels()` 的返回形状（不受黑名单影响）。 */
 interface AdapterWithAllModels {
-  listAllModels?(): readonly { id: string; name: string; contextWindow?: number; credits?: string }[]
+  listAllModels?(): readonly {
+    id: string
+    name: string
+    contextWindow?: number
+    credits?: string
+    /**
+     * 该模型支持的思考档位（上游合法值）。
+     *
+     * ⚠️ 只有**走请求参数**表达档位的渠道才有（如 vertex 的
+     * `reasoning_effort`）；走**模型名后缀**的渠道（agy 的 `-low/-medium/-high`）
+     * 不需要它 —— 那些档位已经拆成独立模型条目了。
+     */
+    effortOptions?: readonly string[]
+  }[]
 }
 
 /**
@@ -91,6 +104,15 @@ export async function listModelsWithState(
     enabled: disabled[model.id] !== true,
     ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
     ...(model.credits !== undefined ? { credits: model.credits } : {}),
+    /**
+     * ⚠️ **档位下拉必须透传**（2026-11-13 用户要求给 hydrogen 加 Extra 档时发现）。
+     *
+     * 白名单式挑字段（只认 id/name/contextWindow/credits）会把
+     * `effortOptions` 静默丢掉 ⇒ 上游明明支持 Low/Medium/High/Extra，
+     * 前端却只显示一个没有下拉的模型条目。
+     * 症状极隐蔽：接口返回 200、列表也正常，就是少了个下拉。
+     */
+    ...(model.effortOptions === undefined ? {} : { effortOptions: model.effortOptions }),
   }))
 }
 

@@ -813,6 +813,17 @@ async function renderExtra(provider, box, kind) {
               if (price === undefined) return ''
               return `<span class="tag ${price.free ? 'tag-ok' : ''}">${escapeHtml(price.text)}</span>`
             })()}
+            ${/*
+              * 档位标记（2026-11-13）：该模型支持**思考档位**时显示可选档，
+              * 让用户在「模型管理」里一眼看出哪些能调强度。
+              * ⚠️ 只有「档位走请求参数」的渠道会有（vertex 的 reasoning_effort）；
+              *    「档位走模型名后缀」的渠道（agy）已拆成独立条目，不会进这个分支。
+              */''}
+            ${Array.isArray(m.effortOptions) && m.effortOptions.length > 0
+              ? `<span class="tag tag-accent" title="可选思考档位：${escapeHtml(m.effortOptions.join(' / '))}">${
+                  escapeHtml(m.effortOptions.join('/'))
+                }</span>`
+              : ''}
           </label>
         `).join('')}
       </div>

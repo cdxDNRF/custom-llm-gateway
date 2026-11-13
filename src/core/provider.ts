@@ -227,6 +227,14 @@ export interface ModelView {
   contextWindow?: number
   /** 上游下发的倍率文案（如 `x0.29`）。 */
   credits?: string
+  /**
+   * 该模型支持的**思考档位**（上游 wire 值，如 `['low','medium','high','max']`）。
+   *
+   * ⚠️ 只有「档位是请求参数」的渠道才有（vertex 的 `reasoning_effort`）。
+   *    「档位是模型名后缀」的渠道（agy 的 `-low/-medium/-high`）不填 ——
+   *    那些档位已经拆成独立模型条目了。
+   */
+  effortOptions?: readonly string[]
 }
 
 /** 重测结果（对齐 vendor 的 ProbeAccountResult）。 */
