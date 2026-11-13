@@ -121,6 +121,169 @@ function hashShort(body: Buffer): string {
   return createHash('sha1').update(body).digest('hex').slice(0, 8)
 }
 
+/**
+ * 从任意异常里挖出「应该返回给客户端的 HTTP 状态码」。
+ *
+ * ⚠️⚠️ **这是把上游错误原样传给客户端的关键**（2026-11-13 用户报障）。
+ *
+ * 症状：ZCode 对 `vertex/gemini-4-carbon` 报
+ * `reason=unknown retryable=false` —— 它拿到的是 **HTTP 200 + SSE 里塞错误**，
+ * 无法识别成「限流可重试」，于是直接放弃、不再重试。
+ *
+ * `LlmError` 的真实状态码藏在两个地方，**都要看**：
+ * - `error.failure.status`（DSH 的正式字段，`LlmError` 构造时的 `options.status`）
+ * - `error.status`（部分适配器直接挂在实例上）
+ *
+ * 兜底：按 `code` 推断（QUOTA_EXCEEDED→429、FORBIDDEN→403、INVALID_REQUEST→400…）。
+ * 再兜底才用 502（确实是我们这边的传输问题）。
+ */
+function errorHttpStatus(error: unknown): number {
+  const record = (typeof error === 'object' && error !== null ? error : {}) as Record<string, unknown>
+  // ① 正式字段
+  const failure = record.failure
+  if (typeof failure === 'object' && failure !== null) {
+    const status = (failure as Record<string, unknown>).status
+    if (typeof status === 'number' && status >= 400 && status <= 599) return status
+  }
+  // ② 实例上的 status
+  const direct = record.status
+  if (typeof direct === 'number' && direct >= 400 && direct <= 599) return direct
+  // ③ 按 code 推断
+  const code = typeof record.code === 'string' ? record.code : ''
+  const byCode: Record<string, number> = {
+    QUOTA_EXCEEDED: 429,
+    RATE_LIMIT: 429,
+    AUTH: 401,
+    FORBIDDEN: 403,
+    INVALID_REQUEST: 400,
+    NOT_FOUND: 404,
+    TIMEOUT: 504,
+    EMPTY_RESPONSE: 502,
+    SERVER: 502,
+  }
+  if (byCode[code] !== undefined) return byCode[code]!
+  return 502
+}
+
+/** 上游要求的重试等待（毫秒）。有就透传成 `Retry-After`，客户端才知道等多久。 */
+function errorRetryAfterMs(error: unknown): number | undefined {
+  const record = (typeof error === 'object' && error !== null ? error : {}) as Record<string, unknown>
+  const failure = record.failure
+  if (typeof failure === 'object' && failure !== null) {
+    const ms = (failure as Record<string, unknown>).providerRetryAfterMs
+    if (typeof ms === 'number' && Number.isFinite(ms) && ms > 0) return ms
+  }
+  const direct = record.providerRetryAfterMs
+  if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) return direct
+  return undefined
+}
+
+/**
+ * 把异常包成**标准 OpenAI 错误体**（客户端普遍认这一套）。
+ *
+ * ⚠️ 429 必须给 `type: 'rate_limit_error'` / `code: 'rate_limit_exceeded'` ——
+ *    这是 OpenAI 官方口径，ZCode / DSH / Cline 等客户端据此判定「可重试」。
+ *    只写 `{ message }` 会被当成未知错误（`reason=unknown, retryable=false`）。
+ */
+function openAiErrorBody(error: unknown, status: number): Record<string, unknown> {
+  const message = error instanceof Error ? error.message : String(error)
+  const typeByStatus: Record<number, string> = {
+    400: 'invalid_request_error',
+    401: 'authentication_error',
+    403: 'permission_error',
+    404: 'not_found_error',
+    429: 'rate_limit_error',
+    500: 'server_error',
+    502: 'server_error',
+    503: 'server_error',
+    504: 'server_error',
+  }
+  const codeByStatus: Record<number, string> = {
+    400: 'invalid_request_error',
+    401: 'invalid_api_key',
+    403: 'permission_denied',
+    404: 'model_not_found',
+    429: 'rate_limit_exceeded',
+    500: 'server_error',
+    502: 'bad_gateway',
+    503: 'service_unavailable',
+    504: 'gateway_timeout',
+  }
+  return {
+    error: {
+      message,
+      type: typeByStatus[status] ?? 'server_error',
+      code: codeByStatus[status] ?? 'server_error',
+      // ⚠️ 带 status 字段：有些客户端（如 ZCode）直接读它做判断
+      status,
+    },
+  }
+}
+
+/** 发一个带 OpenAI 错误体 + `Retry-After` 的错误响应。 */
+function sendOpenAiError(response: ServerResponse, error: unknown): void {
+  const status = errorHttpStatus(error)
+  const body = openAiErrorBody(error, status)
+  const text = JSON.stringify(body)
+  const headers: Record<string, string | number> = {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'access-control-allow-origin': '*',
+  }
+  // 限流时透传等待时间：客户端据此做退避，而不是盲目重试
+  const retryAfterMs = errorRetryAfterMs(error)
+  if (retryAfterMs !== undefined) {
+    headers['retry-after'] = String(Math.max(1, Math.ceil(retryAfterMs / 1000)))
+  }
+  response.writeHead(status, headers)
+  response.end(text)
+}
+
+/**
+ * Anthropic 协议的错误 `type` 映射。
+ *
+ * Anthropic 的 error type 与 OpenAI 不同名（`rate_limit_error` 两边都有，
+ * 但鉴权叫 `authentication_error`、参数叫 `invalid_request_error`）。
+ */
+function anthropicErrorType(status: number): string {
+  const map: Record<number, string> = {
+    400: 'invalid_request_error',
+    401: 'authentication_error',
+    403: 'permission_error',
+    404: 'not_found_error',
+    413: 'request_too_large',
+    429: 'rate_limit_error',
+    500: 'api_error',
+    502: 'api_error',
+    503: 'overloaded_error',
+    504: 'api_error',
+  }
+  return map[status] ?? 'api_error'
+}
+
+/** 首帧前失败时的 Anthropic 风格错误响应（含 `Retry-After`）。 */
+function sendAnthropicAggregateError(response: ServerResponse, error: unknown): void {
+  const status = errorHttpStatus(error)
+  const text = JSON.stringify({
+    type: 'error',
+    error: {
+      type: anthropicErrorType(status),
+      message: error instanceof Error ? error.message : String(error),
+    },
+  })
+  const headers: Record<string, string | number> = {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'access-control-allow-origin': '*',
+  }
+  const retryAfterMs = errorRetryAfterMs(error)
+  if (retryAfterMs !== undefined) {
+    headers['retry-after'] = String(Math.max(1, Math.ceil(retryAfterMs / 1000)))
+  }
+  response.writeHead(status, headers)
+  response.end(text)
+}
+
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body)
   response.writeHead(status, {
@@ -1218,8 +1381,57 @@ export class OverviewServer {
           at: startedAt, provider: providerId, model: modelId, api: 'openai', stream: false,
           ok: false, error: String(error), tap, startedAt,
         })
-        sendJson(response, 502, { error: { message: String(error) } })
+        /**
+         * ⚠️ **非流式同样要透传真实状态码**（2026-11-13，与流式同一缺陷的另一处）。
+         *
+         * 原先固定 502 + 只有 `message` —— 客户端无法区分「模型不存在(404)」
+         * 与「限流(429)」，一律当成网关故障。
+         */
+        sendOpenAiError(response, error)
       }
+      return
+    }
+
+    /**
+     * ⚠️⚠️ **必须先预拉首帧，再决定要不要发 200**（2026-11-13 用户报障修复）。
+     *
+     * ## 原来的缺陷
+     *
+     * 旧代码无条件先 `writeHead(200, ...)`，然后才 `for await` 消费流。
+     * 但适配器的上游错误（429 / 400 / 404）**恰恰是在拉第一帧时才抛出的** ——
+     * 那时 200 已经发出去了，catch 里只能往 SSE 里塞一行 error：
+     *
+     * ```
+     * HTTP/1.1 200 OK
+     * data: {"error":{"message":"LlmError: vertex: HTTP 429 ..."}}
+     * ```
+     *
+     * 客户端看到的是「成功的流」，于是 ZCode 报
+     * `reason=unknown retryable=false` —— 它**无法识别这是限流**，
+     * 直接放弃而不是退避重试。用户表现为「模型直接报错」。
+     *
+     * ## 现在的做法
+     *
+     * 用 `Iterator.next()` **手动拉第一帧**：
+     * - 首帧成功拿到 → 说明上游确实开始出数据了，这时才 `writeHead(200)`，
+     *   然后把这一帧连同后续一起转发
+     * - 首帧就抛错 → **不发 200**，按 `LlmError` 的真实状态码回标准 JSON 错误体
+     *   （含 `Retry-After`），客户端就能正确识别为可重试限流
+     *
+     * 📌 这也是 OpenAI / Anthropic 官方行为：错误必须在「流开始」之前以
+     *    HTTP 状态码表达，一旦进了 SSE 就只能靠流内 error 事件。
+     */
+    const sseFrames = streamChunksToSse(tapped, { id, model: raw, created })[Symbol.asyncIterator]()
+    let firstFrame: IteratorResult<string>
+    try {
+      firstFrame = await sseFrames.next()
+    } catch (error) {
+      // 首帧前就失败 ⇒ 用真实状态码回普通 JSON（不是 SSE）
+      sendOpenAiError(response, error)
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'openai', stream,
+        ok: false, error: String(error), tap, startedAt,
+      })
       return
     }
 
@@ -1231,8 +1443,12 @@ export class OverviewServer {
       'x-accel-buffering': 'no',
     })
     try {
-      for await (const frame of streamChunksToSse(tapped, { id, model: raw, created })) {
-        response.write(frame)
+      // 先写回已经拉到手的第一帧（它可能是 value，也可能一开始就 done）
+      if (firstFrame.done !== true) response.write(firstFrame.value)
+      while (true) {
+        const next = await sseFrames.next()
+        if (next.done === true) break
+        response.write(next.value)
       }
       response.write('data: [DONE]\n\n')
       response.end()
@@ -1241,7 +1457,15 @@ export class OverviewServer {
         ok: true, tap, startedAt,
       })
     } catch (error) {
-      response.write(`data: ${JSON.stringify({ error: { message: String(error) } })}\n\n`)
+      /**
+       * **真正的中途断流**（200 已发，无法再改状态码）。
+       *
+       * ⚠️ 这里不再只塞 `{ message }`：补上 `type` / `code` / `status`，
+       *    客户端能识别出「这是服务端错误」而不是未知异常
+       *    （ZCode 原先就是因为只有 message 才报 `reason=unknown`）。
+       */
+      const midStatus = errorHttpStatus(error)
+      response.write(`data: ${JSON.stringify(openAiErrorBody(error, midStatus))}\n\n`)
       response.write('data: [DONE]\n\n')
       response.end()
       this.recordUsage({
@@ -1410,8 +1634,68 @@ export class OverviewServer {
           at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream: false,
           ok: false, error: String(error), tap, startedAt,
         })
-        sendAnthropicError(502, 'api_error', String(error))
+        /** 同 OpenAI 非流式：透传真实状态码（见那里的注释）。 */
+        sendAnthropicAggregateError(response, error)
       }
+      return
+    }
+
+    /**
+     * ⚠️⚠️ **与 `aggregateChat` 同一缺陷：必须预拉首帧再发 200**（2026-11-13）。
+     *
+     * Anthropic 客户端（Claude Code / Cline）同样靠 HTTP 状态码判断可重试性。
+     * 上游 429 在首帧时才抛出，旧代码先发 200 ⇒ 客户端只看到一个
+     * `event: error` 的「成功流」，无法识别成限流。
+     *
+     * 详见 `aggregateChat` 里那段完整说明。
+     */
+    /**
+     * ⚠️⚠️ **这里不能只预拉「翻译后的第一帧」**（真实缺陷，2026-11-13 实测）。
+     *
+     * `streamChunksToAnthropicSse` 会**立即 yield `message_start`** ——
+     * 那一帧是在**消费上游之前**就产出的（Anthropic 协议要求先发它来初始化
+     * 客户端状态机）。于是只看它的 first next() 永远成功，上游的 429/404
+     * 根本没机会暴露 ⇒ 仍然回 HTTP 200（实测：不存在的模型也返回 200 +
+     * `message_start`）。
+     *
+     * 正确顺序：**先探一下上游本身**（`tapped` 的第一个 chunk），
+     * 成功后才开始翻译。这样适配器抛出的 LlmError 能在发 200 之前被抓到。
+     */
+    const upstreamIterator = tapped[Symbol.asyncIterator]()
+    let firstUpstream: IteratorResult<never>
+    try {
+      firstUpstream = await upstreamIterator.next()
+    } catch (error) {
+      sendAnthropicAggregateError(response, error)
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream,
+        ok: false, error: String(error), tap, startedAt,
+      })
+      return
+    }
+    /** 把「已拉出的第一帧」重新接回迭代器，交给翻译层完整消费。 */
+    async function* upstreamWithFirst(): AsyncGenerator<never> {
+      if (firstUpstream.done !== true) yield firstUpstream.value
+      while (true) {
+        const next = await upstreamIterator.next()
+        if (next.done === true) break
+        yield next.value
+      }
+    }
+    const anthropicFrames = streamChunksToAnthropicSse(
+      upstreamWithFirst() as AsyncIterable<never>,
+      { id, model: raw },
+    )[Symbol.asyncIterator]()
+    let firstAnthropicFrame: IteratorResult<string>
+    try {
+      firstAnthropicFrame = await anthropicFrames.next()
+    } catch (error) {
+      // 翻译阶段仍可能失败（如首帧结构异常）⇒ 同样按真实状态码回
+      sendAnthropicAggregateError(response, error)
+      this.recordUsage({
+        at: startedAt, provider: providerId, model: modelId, api: 'anthropic', stream,
+        ok: false, error: String(error), tap, startedAt,
+      })
       return
     }
 
@@ -1424,8 +1708,11 @@ export class OverviewServer {
       'x-accel-buffering': 'no',
     })
     try {
-      for await (const frame of streamChunksToAnthropicSse(tapped, { id, model: raw })) {
-        response.write(frame)
+      if (firstAnthropicFrame.done !== true) response.write(firstAnthropicFrame.value)
+      while (true) {
+        const next = await anthropicFrames.next()
+        if (next.done === true) break
+        response.write(next.value)
       }
       response.end()
       this.recordUsage({
@@ -1433,10 +1720,18 @@ export class OverviewServer {
         ok: true, tap, startedAt,
       })
     } catch (error) {
-      // 流已开始，无法改状态码；按 Anthropic 的 error 事件下发。
+      /**
+       * 流已开始，无法改状态码；按 Anthropic 的 error 事件下发。
+       * ⚠️ 补 `status` 字段，让客户端能分辨限流/鉴权/服务端错误。
+       */
+      const midStatus = errorHttpStatus(error)
       response.write(`event: error\ndata: ${JSON.stringify({
         type: 'error',
-        error: { type: 'api_error', message: String(error) },
+        error: {
+          type: anthropicErrorType(midStatus),
+          message: error instanceof Error ? error.message : String(error),
+          status: midStatus,
+        },
       })}\n\n`)
       response.end()
       this.recordUsage({

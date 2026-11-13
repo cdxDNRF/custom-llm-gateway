@@ -123,6 +123,55 @@ export interface VertexAdapterOptions {
   warn?: (message: string) => void
 }
 
+/**
+ * 解析 `Retry-After`（RFC 7231 允许两种形态：秒数 / HTTP 日期）。
+ *
+ * @returns 毫秒；无法解析返回 `undefined`（调用方回退到自己的退避策略）。
+ */
+function parseRetryAfterMs(header: string | null): number | undefined {
+  if (header === null || header.trim() === '') return undefined
+  const raw = header.trim()
+  // 形态一：秒数（最常见）
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.max(0, seconds * 1000)
+  // 形态二：HTTP 日期
+  const at = Date.parse(raw)
+  if (Number.isFinite(at)) return Math.max(0, at - Date.now())
+  return undefined
+}
+
+/**
+ * 判断 signal 是否已中止。
+ *
+ * ⚠️ 抽成函数而不是内联 `signal?.aborted === true`：内联写法在
+ *    `if (x) return` 之后会被 TS 收窄成 `false | undefined`，
+ *    再比较就报 TS2367（本次实际踩到）。
+ */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal !== undefined && signal.aborted
+}
+
+/**
+ * 可被 `AbortSignal` 打断的 `sleep`。
+ *
+ * ⚠️ 不能用裸 `setTimeout`：客户端可能在等待期间断开，
+ *    那样这会变成一次「等完再发现已经没意义」的幽灵等待。
+ */
+function sleepWithSignal(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (isAborted(signal)) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      resolve()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /** 官方兜底标记：让上游跳过签名校验（用于缓存未命中的历史会话）。 */
 const SKIP_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator'
 /** 缓存上限（与参考实现一致）。 */
@@ -457,11 +506,11 @@ export class VertexAdapter extends LlmAdapter {
     }
     const finalPayload = withSignatures
 
-    let response = await this.post(url, account.credential, finalPayload, options.signal)
+    let response = await this.postWithRetry(url, account.credential, finalPayload, options.signal)
     // 401：token 可能被提前吊销 ⇒ 强制刷新后重试一次（**只重试一次**）。
     if (response.status === 401) {
       this.tokens.invalidate()
-      response = await this.post(url, account.credential, finalPayload, options.signal)
+      response = await this.postWithRetry(url, account.credential, finalPayload, options.signal)
     }
 
     if (response.status !== 200) {
@@ -518,6 +567,61 @@ export class VertexAdapter extends LlmAdapter {
         ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
       },
     )
+  }
+
+  /**
+   * **带指数退避的重试**（2026-11-13 用户报障后加，对应诊断第 3 点）。
+   *
+   * ## 为什么需要
+   *
+   * Vertex 的 429（Resource exhausted）在旗舰模型（carbon / hydrogen）上
+   * **偶发且短暂** —— 单次限流如果直接透传给客户端，用户看到的就是
+   * 「模型报错」（ZCode 那边 `retryable=false`，不会自己重试）。
+   * 在适配器层重试 1~2 次能把大部分瞬时抖动吃掉。
+   *
+   * ## 规则
+   *
+   * - 只重试 **429 / 500 / 502 / 503 / 504**（可重试类）；
+   *   400 / 401 / 403 / 404 是确定性错误，重试无意义。
+   * - **尊重 `Retry-After`**（秒或毫秒两种形态都兼容）—— 上游说等多久就等多久。
+   * - 指数退避 + 抖动：`base * 2^n * (1 + random*0.3)`，
+   *   抖动避免多个客户端同时重试形成新的尖峰。
+   * - **尊重 `options.signal`**：客户端断开时立刻中止，不做「幽灵重试」。
+   * - 最多 **2 次重试**（共 3 次尝试）—— 再多会显著拉长用户等待。
+   */
+  private async postWithRetry(
+    url: string,
+    account: VertexServiceAccount,
+    payload: unknown,
+    signal: AbortSignal | undefined,
+  ): Promise<Response> {
+    const MAX_RETRIES = 2
+    const RETRYABLE = new Set([429, 500, 502, 503, 504])
+    let response = await this.post(url, account, payload, signal)
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+      if (!RETRYABLE.has(response.status)) return response
+      // 客户端已断开就别再重试了（省上游额度，也避免幽灵请求）
+      if (isAborted(signal)) return response
+
+      // 优先用上游给的 Retry-After
+      const retryAfter = parseRetryAfterMs(response.headers.get('retry-after'))
+      /** 指数退避 + 抖动：500ms、1s，各带 30% 抖动。 */
+      const backoff = 500 * 2 ** attempt * (1 + Math.random() * 0.3)
+      const waitMs = retryAfter ?? backoff
+
+      /** 上限 10 秒：再长就不该由网关替用户等了（客户端自己有超时）。 */
+      const cappedMs = Math.min(waitMs, 10_000)
+      this.options.warn?.(
+        `[vertex] 上游 ${response.status}，${Math.round(cappedMs)}ms 后重试`
+        + `（第 ${attempt + 1}/${MAX_RETRIES} 次）${retryAfter !== undefined ? '［尊重 Retry-After］' : ''}`,
+      )
+      // 丢弃这次的响应体（连接需要释放）
+      await response.body?.cancel().catch(() => undefined)
+      await sleepWithSignal(cappedMs, signal)
+      if (isAborted(signal)) return response
+      response = await this.post(url, account, payload, signal)
+    }
+    return response
   }
 
   /** 发一次 POST（带 token）。 */
