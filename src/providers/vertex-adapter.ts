@@ -551,19 +551,50 @@ export class VertexAdapter extends LlmAdapter {
       {
         label: 'vertex',
         /*
-         * ⚠️⚠️ **首字超时必须 300 秒**（2026-11-12 用户实测反馈）。
+         * ⚠️⚠️ **两个超时都必须放宽到 300 秒**（2026-11-13 第二次修正）。
          *
-         * 原值 120 秒在 ZCode 场景下**会误杀**：上下文 100k–150k tokens
-         * + `reasoning_effort: "high"` 时，旗舰模型（gemini-4-carbon /
-         * gemini-4-hydrogen）冷预填充 + 首发耗时实测 **110–255 秒**，
-         * 经常直接越过 120 秒 ⇒ 表现为「模型不响应 / 莫名中断」。
+         * ## firstTokenTimeoutMs：首字慢（2026-11-12 定的）
          *
-         * 取 300 秒覆盖观测到的上界（255s）并留余量。
-         * ⚠️ 注意 `chunkTimeoutMs` 保持 60 秒 —— 首字慢是预填充慢，
-         *    而**流中途卡住**通常是真的挂了，不该一起放宽。
+         * 上下文 100k–150k + `reasoning_effort: "high"` 时，旗舰模型
+         * （carbon / hydrogen）冷预填充 + 首发实测 **110–255 秒**，
+         * 原 120 秒会误杀。
+         *
+         * ## chunkTimeoutMs：流中途停顿（本次修正，我上次的判断是错的）
+         *
+         * 我上次写「流中途卡住通常是真的挂了，不该一起放宽」—— **不成立**。
+         * ZCode 实测（210 条消息 + high 思考）：
+         * ```
+         * 20.75s 收到首帧、输出了 2 个 tool-input-delta
+         * → 模型进入长思考/生成大工具参数，60 秒无新字节
+         * → 触发 "vertex: sse chunk timeout after 60000ms"
+         * ```
+         * **首帧之后照样会有长停顿**：思考模型的输出是「思考完一大段才吐下一段」，
+         * 中间的空闲期可能远超 60 秒。这与「连接真的挂了」在流层面无法区分，
+         * 但把活着的连接误杀代价更大（用户丢掉整轮回答）。
+         *
+         * 参照同仓库 `astudio-product.ts` 对同类思考流的设置：
+         * `chunkTimeoutMs: 300_000`（fact 378 明确要求 ≥300s）。
+         *
+         * ⇒ 两个超时对齐 300 秒。代价是「真挂住的连接」要 5 分钟才被回收，
+         *    但 `options.signal` 在客户端断开时会立刻中止（见 postWithRetry），
+         *    故不会长期占用。
+         *
+         * ## 为什么不用「直接断 TCP」让客户端重试（诊断第 2 点）
+         *
+         * ZCode 对 **TCP 异常断开**会识别成 `network_error` 并自动重试，
+         * 对 **SSE 内嵌 error 帧**则判为不可重试的 `ProviderBusinessError`。
+         * 看起来断连接更"划算"，但：
+         * - **会丢掉具体错误文案**（用户只看到「连接断了」，无法判断是限流、
+         *   鉴权还是模型问题，也没法反馈给我们排查）
+         * - 断连接对**非流式**响应不适用；两种协议要维护两套行为
+         * - 真正的修复是**别误杀**（本改动）；误杀消灭后，SSE error 帧只在
+         *   真出故障时出现，那时「让用户看到原因」比「盲目重试」更有价值
+         *
+         * ⇒ **保留 SSE error 帧**（并已补 `type`/`code`/`status`，见
+         *    `aggregateChat` 的注释），不做「主动断连接」。
          */
         firstTokenTimeoutMs: 300_000,
-        chunkTimeoutMs: 60_000,
+        chunkTimeoutMs: 300_000,
         ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
       },
     )
