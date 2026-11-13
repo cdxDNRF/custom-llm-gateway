@@ -331,60 +331,60 @@ async function sampleIcon(src) {
   }
 
   /**
-   * ⚠️ **实心图标的「轮廓化」**（2026-11-13）。
+   * **实心图标：保留实心感，只做轻度匀化**（2026-11-13 第三版，用户定稿）。
    *
-   * 有些图标本身就是**纯色实心块**（TRAE 是 `fill="#32F08C"` 的方框 +
-   * 两个菱形，没有任何镂空）。直接把覆盖率画成线 ⇒ 一整块实心方块，
-   * 完全看不出是什么标志（用户截图 1 里 TRAE 卡就是那样）。
+   * ## 三版迭代记录（照抄会走回头路，必须记）
    *
-   * 做法：对**填充率很高**的图标，把 coverage 转成「边缘图」——
-   * 只保留轮廓与内部边界，中间的大片实心区域压淡。这类似图像处理里的
-   * 边缘检测：`|coverage - 邻域平均|` 大的地方就是边界。
+   * TRAE 是 `fill-rule="evenodd"` 的**粗实心方框 + 两个实心菱形**，
+   * 它本来就是一块亮绿实心图形。三版处理方式：
    *
-   * 判据：实心覆盖率 > 55% 才做（避免误伤本来就是线条的图标）。
+   * | 版本 | 做法 | 用户反馈 |
+   * |---|---|---|
+   * | v1 | 亮度判据（自然就是实心块） | 有缺口/锯齿，但**形状完整** |
+   * | v2 | 边缘检测 `|cov - 邻域均值|` | 「不如原来的」—— 变成**双层描边**，更糊 |
+   * | v3 | 形态学腐蚀 + 边界提取 | 变成**细线框**，失去实心体积感 |
+   *
+   * ## 结论：**不该把实心图标"线条化"**
+   *
+   * 这个动效的本质是「把图标变成同色的竖线阵列」。对**线条型图标**（如
+   * Qoder 的 Q、Gemini 的星）线条化后轮廓分明；但对**实心块图标**
+   * （TRAE、ZCode 的底块），线条化会破坏它原本的识别性 ——
+   * 用户认得的是那个"实心形状"，不是它的轮廓。
+   *
+   * ⇒ 实心图标**保留实心**，只做两件事：
+   * 1. **轻度匀化**内部（去掉采样引入的斑点，让它看起来是干净的色块）
+   * 2. 保持覆盖率满格（这样画出来是密集竖线 = 实心观感）
    */
   {
-    /**
-     * ⚠️ 判据不是「填充率 > 55%」—— 实测 TRAE 的填充率只有 **17.5%**
-     *    （它是细边框 + 两个小菱形的组合，不是整体实心块），
-     *    却依然画成了实心方块。真正决定「是否实心观感」的是
-     *    **覆盖率的平均值**：实心图标 avgCov 会明显偏高。
-     *
-     * 实测：TRAE avgCov=0.181、Gemini 那种纯线条 avgCov<0.08。
-     * 故阈值取 **0.14**（在两者之间）。
-     */
-    let filled = 0
     let covSum = 0
-    for (let i = 0; i < COUNT; i += 1) {
-      if (coverage[i] > 0.6) filled += 1
-      covSum += coverage[i]
-    }
-    const fillRatio = filled / COUNT
+    for (let i = 0; i < COUNT; i += 1) covSum += coverage[i]
     const avgCoverage = covSum / COUNT
-    if (avgCoverage > 0.14 || fillRatio > 0.45) {
-      const edged = new Float32Array(COUNT)
+    /**
+     * 判据：平均覆盖率 > 0.14（实测 TRAE 0.181、ZCode 带底时更高；
+     * 纯线条图标 < 0.08）。
+     */
+    if (avgCoverage > 0.14) {
+      /**
+       * 对「明显是内部」的格子（5×5 邻域都 >0.5）**拉满到 1**：
+       * 采样会让实心区在 0.6~0.95 之间抖动，拉满后是干净的实心块。
+       * 边缘（邻域不全）保持原值 ⇒ 边界仍平滑。
+       */
+      const E = 2
       for (let y = 0; y < GRID_H; y += 1) {
         for (let x = 0; x < GRID_W; x += 1) {
-          const self = coverage[y * GRID_W + x]
-          // 邻域平均（含自身，3×3）
-          let sum = 0
-          let n = 0
-          for (let dy = -1; dy <= 1; dy += 1) {
-            for (let dx = -1; dx <= 1; dx += 1) {
+          if (coverage[y * GRID_W + x] < 0.5) continue
+          let allFilled = true
+          for (let dy = -E; dy <= E && allFilled; dy += 1) {
+            for (let dx = -E; dx <= E; dx += 1) {
               const nx = x + dx
               const ny = y + dy
               if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue
-              sum += coverage[ny * GRID_W + nx]
-              n += 1
+              if (coverage[ny * GRID_W + nx] < 0.45) { allFilled = false; break }
             }
           }
-          const avg = sum / n
-          // 与邻域差异越大越像边界；同时保留自身强度做底（避免内部全黑）
-          const edge = Math.abs(self - avg) * 2.4
-          edged[y * GRID_W + x] = Math.min(1, edge + self * 0.18)
+          if (allFilled) coverage[y * GRID_W + x] = 1
         }
       }
-      coverage.set(edged)
     }
   }
 
