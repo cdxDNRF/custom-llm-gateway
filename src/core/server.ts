@@ -9,6 +9,7 @@
  * 这样用户可以"只配一个 baseURL 用全部模型"，也可以"每个供应商单独接"。
  */
 import { createHash } from 'node:crypto'
+import { catalogEntry as lookupCatalogEntry } from '../providers/catalog.js'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { readFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -646,6 +647,8 @@ export class OverviewServer {
             baseUrl: null,
             accounts: [],
             permanentLocked: false,
+            // 上游已停用 ⇒ 前端据此隐藏入口（见 ProviderCatalogEntry.hidden）
+            ...(entry.hidden === true ? { hidden: true } : {}),
           }
         }
         return this.describeProvider(p)
@@ -701,6 +704,14 @@ export class OverviewServer {
           baseUrl: port !== undefined ? `http://127.0.0.1:${port}/v1` : null,
           accounts,
           ...(accountsError ? { accountsError } : {}),
+          /**
+           * ⚠️ **运行中的渠道也要带 `hidden`**（2026-11-13）。
+           *
+           * 用户配置里可能还留着 `build: {enabled: true}`（他之前开过）。
+           * 若只在不运行的分支里带 hidden，那这条会「照常显示」——
+           * 用户看到的仍是一个点了就 400 的渠道。故两个分支都要带。
+           */
+          ...(isCatalogHidden(p.id) ? { hidden: true } : {}),
         }
       }
     }
@@ -1533,4 +1544,15 @@ function stripSearchTools<T>(tools: T[] | undefined, searchToolName: string): T[
     return name !== searchToolName
   })
   return kept.length > 0 ? kept : undefined
+}
+
+/**
+ * 该供应商是否已被标记为「上游不可用 ⇒ 前端隐藏」。
+ *
+ * ⚠️ 单独抽成函数（而不是内联 `lookupCatalogEntry(id)?.hidden`）：
+ * ① 这里有静态 import，`describeProvider` 是热路径，避免每次再动态 import；
+ * ② 语义集中在一处，将来加「临时隐藏」等规则只需改这里。
+ */
+function isCatalogHidden(id: string): boolean {
+  return lookupCatalogEntry(id)?.hidden === true
 }

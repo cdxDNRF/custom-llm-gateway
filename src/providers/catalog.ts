@@ -15,6 +15,16 @@ export interface ProviderCatalogEntry {
   defaultEnabled: boolean
   /** 一句话说明（控制台显示）。 */
   note: string
+  /**
+   * **上游已不可用 ⇒ 从界面上隐藏**（2026-11-13）。
+   *
+   * ⚠️ 与 `defaultEnabled: false` 不同：那个是「还没开」，这个是「开了也没用」。
+   *    对这类渠道**保留全部代码**（上游恢复时改一个布尔即可回来），
+   *    只是不在 UI 上出现 —— 免得用户点了开关、配了 App 链接、最后只拿到 400。
+   */
+  hidden?: boolean
+  /** 隐藏原因（仅开发/诊断用，不进界面）。 */
+  hiddenReason?: string
 }
 
 export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
@@ -41,7 +51,24 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   //    gemini = 反重力 OAuth（Antigravity 额度）
   //    aistudio = 普通 API Key（API Key 免费层额度）—— 门槛最低，一个 AIza 密钥即可
   { id: 'aistudio',   displayName: 'AI Studio (API Key)',   defaultPort: 3918, defaultEnabled: false, note: '填 AIza… 开头的 API Key 即可；额度与「Gemini (Google)」独立；需 Clash 代理' },
-  { id: 'build',      displayName: 'Build (AI Studio)',     defaultPort: 3917, defaultEnabled: false, note: '需浏览器常开 AI Studio App 页面；实测 5 个 flash 模型（含 3.5/3.6/3.7）' },
+  /**
+   * ⚠️⚠️ **Build 渠道已被上游关停**（2026-11-13 实测确认）。
+   *
+   * 全部模型（3.1/3.5/3.8-flash、gemma-4-31b）调用都返回：
+   * ```
+   * HTTP 400 PROXY_GENERATION_DISABLED: generateContent is not supported
+   * ```
+   * 这是 Google 在服务端关掉了「经 AI Studio App 代理生成」的能力，
+   * 不是我们的接线问题 —— 连上了（connected=true）也转发不出去（relays=0）。
+   *
+   * 故从界面隐藏：代码全部保留，上游若恢复把 `hidden` 去掉即可。
+   */
+  {
+    id: 'build', displayName: 'Build (AI Studio)', defaultPort: 3917, defaultEnabled: false,
+    note: '需浏览器常开 AI Studio App 页面（上游已停用该能力）',
+    hidden: true,
+    hiddenReason: 'PROXY_GENERATION_DISABLED: generateContent is not supported（2026-11-13 实测，全部模型）',
+  },
   // ⚠️ vertex 是**第三条 Google 渠道**，与前两条的差别是「协议 + 认证」：
   //    gemini   = 反重力 OAuth + `/v1internal:*`（私有协议）
   //    aistudio = API Key        + `generativelanguage`

@@ -1020,7 +1020,17 @@ async function load() {
      *    刚改完配置还没重启时二者会不一致。判据用 **running** —— 卡片上的按钮
      *    （登录/查积分/模型管理）都依赖进程真的在跑，否则点了只会报错。
      */
-    const runningProviders = providers.filter((p) => p.running === true)
+    /**
+     * **上游已停用的渠道从界面隐藏**（2026-11-13）。
+     *
+     * `hidden` 由后端按 `PROVIDER_CATALOG[].hidden` 下发。这类渠道不是
+     * 「还没启用」，而是**开了也没用**（build 现在全部模型都返回
+     * `PROXY_GENERATION_DISABLED`）。留着入口只会让用户白配一通。
+     *
+     * ⚠️ 隐藏在前端做、不删后端渠道：上游若恢复，后端去掉标记即回来。
+     */
+    const visibleProviders = providers.filter((p) => p.hidden !== true)
+    const runningProviders = visibleProviders.filter((p) => p.running === true)
     const box = $('#providers')
     box.innerHTML = ''
     for (const provider of runningProviders) box.appendChild(renderProvider(provider))
@@ -1028,11 +1038,20 @@ async function load() {
       box.innerHTML = '<div class="empty">还没有启用任何供应商 —— 点右上角「供应商开关」开启。</div>'
     }
 
-    renderProviderSwitches(providers)
-    renderEndpoints(providers, lan)
+    /**
+     * **Build 专属页面/标签也跟着隐藏**：整个「Build 渠道」页只服务那一个
+     * 已停用的渠道，渠道不显示时页签留着是死的。
+     */
+    const buildVisible = visibleProviders.some((p) => p.id === 'build')
+    for (const node of document.querySelectorAll('.tab[data-page="build"], .page[data-page="build"]')) {
+      node.hidden = !buildVisible
+    }
+
+    renderProviderSwitches(visibleProviders)
+    renderEndpoints(visibleProviders, lan)
 
     $('#conn').className = 'pill pill-ok'
-    $('#conn').textContent = `正常 · ${runningProviders.length}/${providers.length} 家已启用`
+    $('#conn').textContent = `正常 · ${runningProviders.length}/${visibleProviders.length} 家已启用`
   } catch {
     $('#conn').className = 'pill pill-err'
     $('#conn').textContent = '网关无响应'
@@ -2152,7 +2171,17 @@ $('#build-refresh')?.addEventListener('click', () => { void loadBuild() })
 // 三页：供应商 / 网关 / 数据。用 `hidden` 属性切换（CSS 里已确保 [hidden] 生效）。
 // 选择记在 localStorage，刷新后停在原页；URL hash 也同步，便于分享直链。
 function showPage(name) {
-  const target = ['providers', 'gateway', 'data', 'build'].includes(name) ? name : 'providers'
+  /**
+   * ⚠️ **Build 页可能已隐藏**（上游停用，见 catalog 的 `hidden` 标记）。
+   * 用户书签 / localStorage 里可能还留着 `#build`，此时要回退到供应商页，
+   * 否则会看到一个空白页（页签都不在了）。
+   */
+  const buildTab = document.querySelector('.tab[data-page="build"]')
+  const buildAvailable = buildTab !== null && buildTab.hidden !== true
+  const allowed = buildAvailable
+    ? ['providers', 'gateway', 'data', 'build']
+    : ['providers', 'gateway', 'data']
+  const target = allowed.includes(name) ? name : 'providers'
   for (const section of document.querySelectorAll('.page')) {
     section.hidden = section.dataset.page !== target
   }
