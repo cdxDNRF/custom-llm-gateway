@@ -943,7 +943,12 @@ export async function createGeminiProvider(
 
   return new GenericImpl({
     id: 'gemini',
-    displayName: 'Gemini (Google)',
+    /**
+     * ⚠️ 与 `catalog.ts` 的名字**必须一致**（2026-11-14 订正为 Code Assist）。
+     * 这里曾写 `Gemini (Google)`，与 catalog 的 `Gemini Code Assist` 冲突 ——
+     * 运行时用这个名字，所以只改 catalog 不会生效。
+     */
+    displayName: 'Gemini Code Assist',
     capabilities: {
       login: true, dailyCheckin: false, balance: true,
       permanentLock: false, multiAccount: true, refresh: true,
@@ -1192,7 +1197,7 @@ export async function createGeminiProvider(
                *
                * 原代码 `if (!response.ok) continue` 把两者混为一谈 ⇒ 两个名字都"失败"
                * ⇒ 判定「模型已下线」⇒ **从目录里永久剔除**。
-               * 后果：配额恢复后目录也不会自己长回来，用户看到「agy 只剩 3 个模型」。
+               * 后果：配额恢复后目录也不会自己长回来，用户看到「Code Assist 只剩 3 个模型」。
                *
                * 正确做法：**遇到 429 / 5xx 直接放弃本次探测，并保留原目录里该模型的条目**
                * （`abort: true` 让外层不再尝试下一个名字、也不剔除）。
@@ -1672,7 +1677,7 @@ export async function createOfficeAceProvider(
  *
  * | 渠道 | 认证 | 额度池 | 需浏览器 |
  * |---|---|---|---|
- * | `gemini`（反重力） | OAuth（Google 账号） | Antigravity 额度 | 否 |
+ * | `gemini`（Code Assist） | OAuth（Google 账号） | Code Assist 额度 | 否 |
  * | **`aistudio`**（本函数） | **API Key** | **API Key 免费层** | **否** |
  * | `build` | 宿主页代劳 | Build 独立额度 | **是** |
  *
@@ -1683,7 +1688,7 @@ export async function createOfficeAceProvider(
  * Google 域名在本机网络环境**不可直连**（实测 `daily-cloudcode-pa`：直连超时
  * 15s、经 Clash 0.8s）。本渠道用全局裸 `fetch`，由 `gemini-proxy.ts` 的
  * host 路由拦截器接管（`*.googleapis.com` 已在其匹配列表），故这里只需
- * **安装该拦截器**（与反重力渠道同一个）。
+ * **安装该拦截器**（与 Code Assist 渠道同一个）。
  */
 /**
  * 探测阶段的**暂时性失败**（429 限流 / 5xx 服务端错误）。
@@ -1830,7 +1835,7 @@ export async function createAiStudioProvider(
  *
  * | 渠道 | 认证 | 端点 | 额度池 |
  * |---|---|---|---|
- * | `gemini`（反重力） | OAuth Bearer（浏览器登录） | `/v1internal:*`（私有协议） | Antigravity |
+ * | `gemini`（Code Assist） | OAuth Bearer（浏览器登录） | `/v1internal:*`（私有协议） | Code Assist |
  * | `aistudio` | `x-goog-api-key` | `generativelanguage` | API Key 免费层 |
  * | **`vertex`** | **服务账号 JWT → OAuth** | **`/endpoints/openapi`（OpenAI 兼容）** | GCP 按项目计费 |
  *

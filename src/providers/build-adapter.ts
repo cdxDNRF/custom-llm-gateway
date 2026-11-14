@@ -5,7 +5,7 @@
  *
  * 两者**协议不同**：
  *
- * | | 反重力渠道（gemini-adapter） | **Build 渠道（本文件）** |
+ * | | Code Assist 渠道（gemini-adapter） | **Build 渠道（本文件）** |
  * |---|---|---|
  * | 端点 | `cloudcode-pa.googleapis.com/v1internal:*` | **`generativelanguage.googleapis.com/v1beta/*`** |
  * | 认证 | OAuth Bearer + 五个身份头 | **无**（App 服务端自带密钥） |

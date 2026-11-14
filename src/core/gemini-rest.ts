@@ -8,11 +8,11 @@
  *
  * | 渠道 | 端点 | 认证 | 传输 |
  * |---|---|---|---|
- * | `gemini`（反重力） | `daily-cloudcode-pa` + `/v1internal:*` | OAuth Bearer + 身份头 | fetch |
+ * | `gemini`（Code Assist） | `daily-cloudcode-pa` + `/v1internal:*` | OAuth Bearer + 身份头 | fetch |
  * | **`aistudio`**（本模块的主要使用者） | `generativelanguage/v1beta/models/*` | `x-goog-api-key` | fetch |
  * | `build`（AI Studio App 反代） | 同 aistudio | 由宿主页代劳 | WebSocket 中继 |
  *
- * 反重力那个用的是 **cloudcode 信封**（`{model, project, request:{...}}`，
+ * Code Assist 那个用的是 **cloudcode 信封**（`{model, project, request:{...}}`，
  * 见 vendor 的 `translateGeminiRequest`），与本模块的**裸 REST** 不同，
  * 故不复用。
  *

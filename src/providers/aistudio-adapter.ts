@@ -6,7 +6,7 @@
  *
  * | 渠道 | 端点 | 认证 | 额度 |
  * |---|---|---|---|
- * | `gemini`（反重力） | `daily-cloudcode-pa` + `/v1internal:*` | OAuth Bearer | Antigravity 额度 |
+ * | `gemini`（Code Assist） | `daily-cloudcode-pa` + `/v1internal:*` | OAuth Bearer | Code Assist 额度 |
  * | **`aistudio`**（本文件） | `generativelanguage/v1beta/models/*` | **`x-goog-api-key`** | **API Key 免费层额度** |
  * | `build` | 同 aistudio | 由 AI Studio 宿主页代劳 | **Build 独立额度** |
  *

@@ -345,11 +345,29 @@ export function withManualFamilies(
  */
 export function expandTiers(models: readonly GeminiCatalogModel[]): GeminiCatalogModel[] {
   const out: GeminiCatalogModel[] = []
-  for (const model of models) {
+  for (const raw of models) {
     /**
      * **丢掉用户不要的历史族**（见 `EXCLUDED_FAMILY_PATTERNS`）。
      */
-    if (!isKeptFamily(model.id)) continue
+    if (!isKeptFamily(raw.id)) continue
+    /**
+     * ⚠️ **展示名统一清洗**（2026-11-14 用户要求）。
+     *
+     * 上游 `displayName` 里带**档位括注**（实测 `Claude Opus 5.5 (Low)`、
+     * `GPT-OSS 120B (Medium)`）。回退成「一族一条」后，档位已经改由**下拉**表达，
+     * 名字里再挂一个 `(Low)` 就变成「名字说 Low、下拉选 High」的矛盾形态。
+     *
+     * 两条清洗规则：
+     * 1. 剥掉 `(Low)` / `(Medium)` / `(High)` / `(Tiered)` / `(Extra Low)` 括注
+     * 2. 名字如果就是小写 id（如 `gemini-3.8-flash`），转成标题式
+     *    （`Gemini-3.8-Flash`）—— 与 `Claude Opus 5.5` 这类并列时不刺眼
+     *
+     * ⚠️ 只改**展示名**，`id` 一个字都不动（它是上游准入钥匙）。
+     */
+    const model: GeminiCatalogModel = {
+      ...raw,
+      name: prettifyModelName(raw.name, raw.id),
+    }
     /**
      * ⚠️ **兼容旧缓存**：老缓存里存的是**已展开**的条目（带 `pinnedTier`，
      * id 形如 `claude-opus-5-5-high`）。回退后要把它们**折叠回族**，
@@ -405,7 +423,27 @@ export function expandTiers(models: readonly GeminiCatalogModel[]): GeminiCatalo
  *    `Claude Opus 5.5 (High)` 而 id 是 `claude-opus-5-5` 的不一致形态。
  */
 function stripTierSuffix(name: string): string {
-  return name.replace(/\s*\((?:low|medium|high|tiered|extra-low)\)\s*$/i, '').trim() || name
+  return name.replace(/\s*\((?:low|medium|high|tiered|extra[\s-]?low)\)\s*$/i, '').trim() || name
+}
+
+/**
+ * 模型**展示名**清洗（不改 id）。
+ *
+ * @param name 上游给的 displayName
+ * @param id   模型 id（判断"名字是不是就是 id"用）
+ *
+ * ⚠️ 「名字就是小写 id」的判据很重要：上游对某些模型直接返回 id 当 displayName
+ *    （`gemini-3.8-flash`），混在 `Claude Opus 5.5` 里显得像漏了格式化。
+ *    只在**与 id 完全相同**且小写开头时才转标题式 —— 避免动到
+ *    `gemini-4-hydrogen` 这种本来就该保留形态的（它也是 id）。
+ */
+function prettifyModelName(name: string, id: string): string {
+  const stripped = stripTierSuffix(name)
+  if (stripped === '') return id
+  if (stripped !== id) return stripped
+  if (!/^[a-z]/.test(stripped)) return stripped
+  // `gemini-3.8-flash` → `Gemini-3.8-Flash`（只把词首大写，数字段原样）
+  return stripped.replace(/(^|[-\s])([a-z])/g, (_m, sep: string, ch: string) => sep + ch.toUpperCase())
 }
 
 /** 探测结果缓存文件（落盘，避免每次启动都重新探测）。 */

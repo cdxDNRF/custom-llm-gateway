@@ -40,7 +40,27 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   { id: 'raccoon',    displayName: 'Raccoon (商汤)',        defaultPort: 3910, defaultEnabled: false, note: '本地页承载微信/短信登录' },
   { id: 'minimax',    displayName: 'MiniMax Code',          defaultPort: 3911, defaultEnabled: false, note: 'Anthropic Messages 协议；不支持图片输入' },
   { id: 'zcode',      displayName: 'ZCode (智谱)',          defaultPort: 3912, defaultEnabled: false, note: '每次请求需浏览器产 captcha；需设 ZCODE_CHROME_PATH' },
-  { id: 'gemini',     displayName: 'Gemini (Google)',       defaultPort: 3913, defaultEnabled: false, note: 'OAuth 登录；需设 CMDC_PAK_GOOGLE_CLIENT_ID/SECRET' },
+  /**
+   * ⚠️⚠️ **渠道身份是「Gemini Code Assist」，不是 Antigravity**（2026-11-14 订正）。
+   *
+   * 之前的注释与内部叫法写成「反重力 / antigravity / agy」—— 那是**错的**：
+   *
+   * | 依据 | 事实 |
+   * |---|---|
+   * | 上游端点 | `daily-cloudcode-pa.googleapis.com` = **Cloud Code Assist** |
+   * | 账号规格 | `loadCodeAssist` 返回 `currentTier`（本账号 = Pro） |
+   * | 配额池 | `Gemini Models` / `Claude and GPT models`（Code Assist 的分组） |
+   * | vendor 源码 | `vendor/src/gemini-adapter.ts` 首行即写「Gemini（Cloud Code Assist）」 |
+   *
+   * `antigravity` **只是我们伪装用的 header/UA 值**（`x-client-name` 等），
+   * 不是这个渠道的身份。把两者混为一谈会让人误以为这里有 Antigravity 的额度，
+   * 进而误判「为什么没有 gemini-4-* 模型」。
+   *
+   * 这也解释了此前的疑问：`gemini-4-hydrogen` 在本渠道**没有**，因为它属于
+   * **Vertex 后端**的模型表（我们的 `vertex` 渠道有）；Code Assist 的
+   * `fetchAvailableModels` 只返回 12 个基础族。
+   */
+  { id: 'gemini',     displayName: 'Gemini Code Assist',   defaultPort: 3913, defaultEnabled: false, note: 'OAuth 登录（Google 账号）；Cloud Code Assist 后端；需设 CMDC_PAK_GOOGLE_CLIENT_ID/SECRET' },
   { id: 'opencode',   displayName: 'OpenCode (Zen)',         defaultPort: 3914, defaultEnabled: true,  note: '匿名通道免登录；有 7 个免费模型，按账号可配代理出口' },
   { id: 'accio',      displayName: 'Accio (阿里)',           defaultPort: 3915, defaultEnabled: false, note: 'PKCE 登录 + 免签名推理（未测试稳定性）' },
   { id: 'officeace',  displayName: 'OfficeAce (果办)',       defaultPort: 3916, defaultEnabled: false, note: '多模态 + 自动领每日签到福利（未测试稳定性）' },
@@ -48,7 +68,7 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   //    AI Studio App，由你浏览器里的页面主动连回本网关。故默认关闭，且连接/断开是
   //    显式动作（见 Web UI 的「Build 渠道」页）。
   // ⚠️ aistudio 与 gemini 是**两条独立额度**的渠道：
-  //    gemini = 反重力 OAuth（Antigravity 额度）
+  //    gemini = OAuth 登录（Gemini Code Assist 额度）
   //    aistudio = 普通 API Key（API Key 免费层额度）—— 门槛最低，一个 AIza 密钥即可
   { id: 'aistudio',   displayName: 'AI Studio (API Key)',   defaultPort: 3918, defaultEnabled: false, note: '填 AIza… 开头的 API Key 即可；额度与「Gemini (Google)」独立；需 Clash 代理' },
   /**
@@ -70,7 +90,7 @@ export const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     hiddenReason: 'PROXY_GENERATION_DISABLED: generateContent is not supported（2026-11-13 实测，全部模型）',
   },
   // ⚠️ vertex 是**第三条 Google 渠道**，与前两条的差别是「协议 + 认证」：
-  //    gemini   = 反重力 OAuth + `/v1internal:*`（私有协议）
+  //    gemini   = OAuth + `/v1internal:*`（Code Assist 私有协议）
   //    aistudio = API Key        + `generativelanguage`
   //    vertex   = 服务账号 OAuth + **OpenAI 兼容端点** `/endpoints/openapi`
   //    ⇒ 三者额度池互不相同；vertex 的模型表也最宽（含 gemini-4-argon/carbon）
