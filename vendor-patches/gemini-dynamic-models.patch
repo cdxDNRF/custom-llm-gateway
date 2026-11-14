@@ -321,3 +321,35 @@ diff --git a/vendor/src/gemini-credits.ts b/vendor/src/gemini-credits.ts
  }
  
  /**
+diff --git a/vendor/src/gemini-adapter.ts b/vendor/src/gemini-adapter.ts
+index b1dbb09..e470987 100644
+--- a/vendor/src/gemini-adapter.ts
++++ b/vendor/src/gemini-adapter.ts
+@@ -372,8 +372,25 @@ export class GeminiAdapter extends LlmAdapter {
+    * ⚠️ **2026-10-08 Task 7b**：该同步契约（连同上面这条缺陷史）已在
+    * `src/model-catalog.ts` 的 `syncCatalog` 上统一持有；此处只剩委托。
+    */
+-  listAllModels(): readonly { id: string; name: string }[] {
+-    return this.catalog.listAllModels()
++  listAllModels(): readonly { id: string; name: string; effortOptions?: readonly string[] }[] {
++    /**
++     * ⚠️⚠️ **必须补上 `effortOptions`**（2026-11-14 回退档位展开时发现）。
++     *
++     * `this.catalog.listAllModels()` 走的是共享骨架（`model-catalog.ts`），
++     * 那里只透传 id/name/isFree，把档位信息丢掉了 ⇒ 模型列表没有档位下拉。
++     *
++     * 这里按 id 从**本家静态/动态条目**补回来（本家目录里 `effortOptions`
++     * 是权威来源，见 `geminiModelEntry` 的构造）。
++     */
++    const withEffort = new Map(
++      this.loadModels().map((entry) => [entry.id, entry.effortOptions] as const),
++    )
++    return this.catalog.listAllModels().map((model) => {
++      const effortOptions = withEffort.get(model.id)
++      return effortOptions === undefined || effortOptions.length === 0
++        ? model
++        : { ...model, effortOptions }
++    })
+   }
+ 
+   /**

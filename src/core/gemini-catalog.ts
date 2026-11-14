@@ -82,8 +82,27 @@ export interface GeminiCatalogModel {
   pinnedTier?: 'low' | 'medium' | 'high'
 }
 
-/** 已知档位后缀（与 vendor 的 `GEMINI_EFFORT_IDS` 一致）。 */
+/**
+ * 已知档位后缀（用于**剥名字**）。
+ *
+ * ⚠️ 比 `GEMINI_EFFORT_IDS` 多一个 `extra-low`：上游历史上出现过
+ * `gemini-3.5-flash-extra-low` 这类名字，**剥离**时需要认得它
+ * （否则会被当成模型名的一部分）。
+ */
 const EFFORT_IDS = ['low', 'medium', 'high', 'tiered', 'extra-low'] as const
+
+/**
+ * **向客户端暴露的档位**（档位下拉里的选项）。
+ *
+ * ⚠️ 必须与 `vendor/src/gemini.ts` 的 `GEMINI_EFFORT_IDS` 一致 ——
+ * 那边是**上游真正接受**的集合（`low/medium/high/tiered`）。
+ * 之前这里误用了 `EFFORT_IDS`（含 `extra-low`）⇒ 下拉里会出现一个
+ * 上游不认的选项（用户选了必然 404 或降级到 medium，且无从判断）。
+ *
+ * ⚠️ `tiered`：只发 `includeThoughts`、不发 `thinkingBudget`，由上游自适应
+ * （见 gemini.ts 的 `GEMINI_BUDGET_TIERED = -1`）。
+ */
+const CLIENT_EFFORT_OPTIONS = ['low', 'medium', 'high', 'tiered'] as const
 
 /**
  * 剥掉档位后缀（`gemini-3.8-flash-tiered` → `gemini-3.8-flash`）。
@@ -136,7 +155,7 @@ export function parseAvailableModels(payload: unknown): GeminiCatalogModel[] {
       // 档位选项：上游声明支持思考就给全档（与静态表同口径 —— 档位是自由旋钮，
       // 名字只是标签，见 gemini.ts 文件头的实测结论）。
       ...(meta.supportsThinking === true
-        ? { effortOptions: EFFORT_IDS, defaultEffort: 'medium' }
+        ? { effortOptions: CLIENT_EFFORT_OPTIONS, defaultEffort: 'medium' }
         : {}),
       // ⚠️ 缺省 true（与"唯一模型 gemini-3.8-flash 需要后缀"的旧行为一致）；
       //    探测阶段会按实测改成 false（claude / gemini-2.5 等）。
@@ -200,75 +219,193 @@ export function parseAvailableModels(payload: unknown): GeminiCatalogModel[] {
  * ⚠️ 这是**用户偏好**，不是技术约束 —— 想恢复全部模型，删掉这个过滤即可
  * （`parseAvailableModels` 拿到的仍是上游全集）。
  */
-const KEPT_FAMILIES: readonly string[] = [
-  'gemini-3.8-flash',
-  'claude-opus-5-5',
-  'claude-sonnet-5-5',
-  'gpt-oss-120b',
+/**
+ * **只排除这些历史族**（2026-11-14 从白名单改为黑名单）。
+ *
+ * ## 为什么改
+ *
+ * 原来是 `KEPT_FAMILIES` 白名单（只留 4 个族）。问题是**白名单会挡住新模型**：
+ * 上游后来上线的 `gemini-4-argon`、`gemini-4-hydrogen` 都不在名单里，
+ * 于是**永远不显示** —— 用户反馈「gemini-4-hydrogen 响应不了？CPA 反代倒是有」。
+ * 实测经 CPA 调用 `gemini-4-hydrogen-xhigh` **200 正常**，上游确实支持，
+ * 纯粹是被我们自己的白名单挡掉了。
+ *
+ * ## 现在：黑名单只排「明确的历史噪音」
+ *
+ * 用户原始诉求是「老的 3 / 3.1 / 3.5 没必要了，去掉就好」——
+ * 那是个**排除**需求，不是「只留这 4 个」。改用黑名单后：
+ * - 历史噪音仍然被排掉（用户看到的界面不变干净）
+ * - **上游新加的模型自动出现**，不需要每次改代码
+ *
+ * ⚠️ 黑名单的固有风险是「上游加新的历史族会漏」—— 但这些族的特征很稳定
+ *    （`gemini-2.5-*` / `gemini-3.1-*` / `gemini-3.5-*` / `*-flash-lite`），
+ *    用前缀正则覆盖即可，不必逐条列。
+ */
+const EXCLUDED_FAMILY_PATTERNS: readonly RegExp[] = [
+  // 2.5 / 3.0 / 3.1 / 3.5 代：用户明确说不要的历史族
+  /^gemini-2\.5-/,
+  /^gemini-3-flash$/,
+  /^gemini-3\.1-/,
+  /^gemini-3\.5-/,
+  // flash-lite 系列（各代都有，且上游 displayName 互相串）
+  /-flash-lite$/,
 ]
 
 /** 该模型族是否保留（按去掉档位后缀的裸 id 判）。 */
 export function isKeptFamily(id: string): boolean {
-  return KEPT_FAMILIES.includes(stripEffortSuffix(id))
+  const family = stripEffortSuffix(id)
+  return !EXCLUDED_FAMILY_PATTERNS.some((pattern) => pattern.test(family))
 }
 
+/**
+ * **用户手动追加的模型族**（2026-11-14）。
+ *
+ * ## ⚠️ 实测结论：cloudcode 后端确实没有 gemini-4-* 这些新模型
+ *
+ * 用户报障「gemini-4-hydrogen 响应不了？CPA 反代倒是有」。查证链路：
+ *
+ * | 检查 | 结果 |
+ * |---|---|
+ * | 我们的 `fetchAvailableModels`（cloudcode） | 12 个族，**无** hydrogen/argon |
+ * | `loadCodeAssist` 的 capabilityHints | 本账号**无此字段**（free-tier） |
+ * | 直接打 cloudcode 的 `gemini-4-hydrogen{,-high,-xhigh,-medium}` | **全 404** |
+ * | CPA 反代调 `gemini-4-hydrogen-xhigh` | ✅ 200 |
+ * | **我们的 vertex 渠道调 `gemini-4-hydrogen`** | ✅ **200 "OK"** |
+ *
+ * ⇒ 根因：**CPA 的 antigravity 走 Vertex 后端**（二进制里有
+ *   `aiplatform.googleapis.com` + `global`），而 agy 渠道走 cloudcode。
+ *   同一账号在 Vertex 上有这批模型，在 cloudcode 上没有。
+ *
+ * 故这里**留空**（cloudcode 上确实不存在）。要 `gemini-4-*` 请用 **vertex 渠道**，
+ * 它本来就支持（含档位 low/medium/high/max）。
+ */
+const MANUAL_FAMILIES: readonly string[] = []
+
+/**
+ * **必须带特定后缀才能调用的族**（2026-11-14 实测）。
+ *
+ * 用户报障后逐个试出来的：这些族的**裸名与 low/medium/high 全 404**，
+ * 只有 **`-xhigh`**（hydrogen）/ **`-high`**（argon）可用 ——
+ * 与 CPA 反代一致（它暴露的正是 `gemini-4-hydrogen-xhigh` / `gemini-4-argon-high`）。
+ *
+ * ⚠️ 与 `needsEffortSuffix` 的区别：那个表示「要不要展开 low/medium/high 三档」；
+ *    这个表示「**只有一个固定档位可用**」。故它们**不展开**，直接作为单条目。
+ */
+const FIXED_TIER_BY_FAMILY: Readonly<Record<string, string>> = {
+  // 留空 —— cloudcode 上没有可用的 gemini-4-* 族（见上面的实测表）。
+  // 若将来上游在 cloudcode 上线，在这里加 `'gemini-4-xxx': '档位'` 即可。
+}
+
+/** 把手动追加的族并进候选列表（已存在的跳过）。 */
+export function withManualFamilies(
+  models: readonly GeminiCatalogModel[],
+): GeminiCatalogModel[] {
+  const known = new Set(models.map((m) => m.id))
+  const extras = MANUAL_FAMILIES
+    .filter((id) => !known.has(id))
+    .map((id) => ({ id, name: id } as GeminiCatalogModel))
+  if (extras.length === 0) return [...models]
+  /**
+   * 把固定档位**拼进 id**（`gemini-4-hydrogen` → `gemini-4-hydrogen-xhigh`）：
+   * 探测与上游调用都用这个完整名，裸名本身就是 404。
+   */
+  const withTier = extras.map((model) => {
+    const tier = FIXED_TIER_BY_FAMILY[model.id]
+    if (tier === undefined) return model
+    return { ...model, id: `${model.id}-${tier}` } as GeminiCatalogModel
+  })
+  return [...models, ...withTier]
+}
+
+/**
+ * **整理模型目录：过滤噪音，但不再按档位展开**（2026-11-14 用户要求回退）。
+ *
+ * ## 为什么回退
+ *
+ * 用户原话：「目前 gemini agy 里的这个是按照 high，low 这种思考等级来的，
+ * 回退到以前不用这个的情况，把这一套逻辑删除掉」。
+ *
+ * 之前（2026-11-09）把每个「必须带档位后缀」的模型族展开成 low/medium/high
+ * 三个独立条目，12 条目录里有 9 条是同一批模型的档位变体 —— 模型列表变得很长
+ * 且难以浏览。回退后：**一族一个条目**，档位改为**模型自带的档位下拉**
+ * （`effortOptions`），用户在客户端里选档。
+ *
+ * ## 函数名保留但语义已变
+ *
+ * ⚠️ 名字仍叫 `expandTiers` 是**故意的**：调用点有两处（启动读缓存、
+ *    重拉后写缓存），改名要同步改两处+缓存迁移，收益为零。但**它现在不展开任何东西**
+ *    —— 只做「过滤历史噪音族」。新代码请按「normalize/sanitize」理解它。
+ *
+ * ## 关键：`needsEffortSuffix` 仍然必须保留
+ *
+ * 回退的是「目录里显示几条」，**不是**「上游怎么拼名字」。上游对
+ * `gemini-3.8-flash` / `claude-opus-5-5` 这些族**只认带后缀的名字**
+ * （裸名 404），故 `needsEffortSuffix: true` 必须留着 ——
+ * `vendor/src/gemini.ts` 的 `geminiModelSpec` 靠它决定是否拼 `-${tier}`。
+ */
 export function expandTiers(models: readonly GeminiCatalogModel[]): GeminiCatalogModel[] {
-  /** 要展开的档位（`tiered` / `extra-low` 不在用户要求的三档里）。 */
-  const TIERS = ['low', 'medium', 'high'] as const
   const out: GeminiCatalogModel[] = []
   for (const model of models) {
     /**
-     * **丢掉用户不要的历史族**（见 `KEPT_FAMILIES`）。
-     * ⚠️ 放在幂等判断**之前**：已展开的旧族条目（带 `pinnedTier`）也要能滤掉，
-     *    否则老缓存里的 `gemini-3.5-flash-lite` 会一直显形。
+     * **丢掉用户不要的历史族**（见 `EXCLUDED_FAMILY_PATTERNS`）。
      */
     if (!isKeptFamily(model.id)) continue
     /**
-     * ⚠️⚠️ **幂等：已经展开过的条目不能再展开一次**（否则
-     * `claude-opus-5-5-high` 会变成 `claude-opus-5-5-high-low`）。
-     * 判据是 `pinnedTier` 已存在 —— 展开出来的条目都带它。
+     * ⚠️ **兼容旧缓存**：老缓存里存的是**已展开**的条目（带 `pinnedTier`，
+     * id 形如 `claude-opus-5-5-high`）。回退后要把它们**折叠回族**，
+     * 否则用户升级后会看到 12 条旧展开条目一直留着（直到手动重拉）。
+     *
+     * 折叠规则：`pinnedTier` 存在 ⇒ 剥掉档位后缀取裸 id；同族的后续条目跳过。
      */
     if (model.pinnedTier !== undefined) {
-      out.push(model)
-      continue
-    }
-    // 只有「必须带后缀」的族才展开（见上方实测对照表）。
-    if (model.needsEffortSuffix !== true) {
-      out.push(model)
+      const baseId = stripEffortSuffix(model.id)
+      if (out.some((m) => m.id === baseId)) continue
+      /**
+       * 恢复成「裸 id + 档位下拉」形态：
+       * - `id` 用裸名（客户端看到的模型名）
+       * - `effortOptions` 给回三档（上游实际支持的就是这三档）
+       * - `needsEffortSuffix: true`（上游仍要后缀，见函数头注释）
+       */
+      const baseName = stripTierSuffix(model.name)
+      out.push({
+        ...model,
+        id: baseId,
+        name: baseName,
+        needsEffortSuffix: true,
+        effortOptions: [...CLIENT_EFFORT_OPTIONS],
+        defaultEffort: 'medium',
+        pinnedTier: undefined,
+      })
       continue
     }
     /**
-     * 展示名去掉上游附带的 `(Medium)` 之类括号，再由我们统一拼档位。
+     * 已经是「族」形态的条目：保留，并**补上档位下拉**（若该族需要后缀）。
      *
-     * ⚠️ `gemini-3.8-flash` 的上游 displayName 是**小写开头**（就是 id 本身），
-     * 混在 `Claude Opus 5.5` / `GPT-OSS 120B` 里很扎眼 ⇒ 归一成标题式。
-     * 只影响展示，不改 id。
+     * ⚠️ 只给 `needsEffortSuffix === true` 的族补 —— 那些「只认裸名」的族
+     *    （`gemini-3-flash` / `gemini-2.5-*`）加后缀会 404，给它们档位下拉
+     *    等于让用户选一个必然失败的组合。
      */
-    const rawName = model.name.replace(/\s*\((?:low|medium|high|tiered|extra-low)\)\s*$/i, '').trim()
-      || model.id
-    const baseName = rawName === model.id && /^[a-z]/.test(rawName)
-      ? rawName.replace(/(^|[-\s])([a-z])/g, (_m, sep: string, ch: string) => sep + ch.toUpperCase())
-      : rawName
-    for (const tier of TIERS) {
+    if (model.needsEffortSuffix === true && (model.effortOptions === undefined || model.effortOptions.length === 0)) {
       out.push({
         ...model,
-        // ⚠️ id 带档位后缀：它同时是「模型唯一标识」和「上游准入钥匙」。
-        id: `${model.id}-${tier}`,
-        name: `${baseName} (${tier[0]!.toUpperCase()}${tier.slice(1)})`,
-        // ⚠️ **必须清掉 `effortOptions`**：档位已经写进模型名了，
-        //    再留一个下拉就是「同一件事两处可选」且可能互相矛盾
-        //    （用户选 `-high` 的模型、下拉又选 low，症状极难解释）。
-        effortOptions: undefined,
-        defaultEffort: undefined,
-        /**
-         * **固定档位**：适配器据此拼 upstream，忽略（或不许）外部 effort。
-         * 见 `vendor/src/gemini.ts` 的 `pinnedTier` 支持。
-         */
-        pinnedTier: tier,
+        effortOptions: [...CLIENT_EFFORT_OPTIONS],
+        defaultEffort: model.defaultEffort ?? 'medium',
       })
+      continue
     }
+    out.push(model)
   }
   return out
+}
+
+/**
+ * 从展示名里剥掉档位括注（`Claude Opus 5.5 (High)` → `Claude Opus 5.5`）。
+ *
+ * ⚠️ 用于把旧缓存里的**展开条目**折叠回族时恢复原名，避免显示成
+ *    `Claude Opus 5.5 (High)` 而 id 是 `claude-opus-5-5` 的不一致形态。
+ */
+function stripTierSuffix(name: string): string {
+  return name.replace(/\s*\((?:low|medium|high|tiered|extra-low)\)\s*$/i, '').trim() || name
 }
 
 /** 探测结果缓存文件（落盘，避免每次启动都重新探测）。 */

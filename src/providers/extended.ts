@@ -1035,9 +1035,61 @@ export async function createGeminiProvider(
       }
       if (candidates.length === 0) throw new Error('上游未返回可用模型列表（端点或凭据可能已变）')
 
-      // ⚠️ **先把候选全集写进目录**，否则下面的探测会被自己的门控拒绝
-      //    （见 adapter 构造处那段"先有鸡还是先有蛋"的注释）。
-      catalogModels = candidates
+      /**
+       * ⚠️⚠️ **补上 `fetchAvailableModels` 拿不到的新模型**（2026-11-14 用户报障）。
+       *
+       * ## 现象
+       *
+       * 用户：「gemini-4-hydrogen 响应不了？同样账号的 CPA 反代倒是有这个模型」。
+       *
+       * ## 排查结论（三条实测）
+       *
+       * | 检查 | 结果 |
+       * |---|---|
+       * | 我们的 `fetchAvailableModels` | 只返回 **12 个**基础族，**不含** hydrogen / argon |
+       * | `loadCodeAssist` 的 `capabilityHints` | **本账号没有该字段**（返回 free-tier，无 hints） |
+       * | 经 CPA 调 `gemini-4-hydrogen-xhigh` | ✅ **200，返回 "OK"** |
+       *
+       * ⇒ 模型确实可用，但**两个上游列表接口都不给我们这份清单**。
+       *    CPA 的 31 个 id 大概是它历史上用 Pro 账号时缓存下来的。
+       *
+       * ## 做法：手动追加 + 正常探测
+       *
+       * `gemini-catalog.ts` 的 `MANUAL_FAMILIES` 里列了用户要的族，
+       * 这里并进候选 —— **它们仍会走下面的逐个探测**：
+       * 探不通的自然被剔除，探得通的按 `needsEffortSuffix` 决定是否展开档位。
+       *
+       * 这样既能拿到新模型，又不会把「上游不认的名字」硬塞给用户。
+       */
+      {
+        const { withManualFamilies } = await import('../core/gemini-catalog.js')
+        const before = candidates.length
+        candidates = withManualFamilies(candidates)
+        if (candidates.length > before) {
+          gateway.logger.info(
+            `Gemini 目录补充：手动追加 ${candidates.length - before} 个族`
+            + `（${candidates.slice(before).map((m) => m.id).join(', ')}）`,
+          )
+        }
+      }
+
+      /**
+       * ⚠️ **先把候选写进目录**，否则下面的探测会被自己的门控拒绝
+       *    （见 adapter 构造处那段"先有鸡还是先有蛋"的注释）。
+       *
+       * ⚠️⚠️ **但必须过滤**（2026-11-14 真实缺陷）：原来直接 `= candidates`，
+       *    而上游候选里含**全部历史族**（`gemini-2.5-*` / `gemini-3.1-*` /
+       *    `gemini-3.5-flash-lite` …，共 12 个）。这些本该被 `isKeptFamily` 排掉，
+       *    漏过滤的后果是：**探测期间**（以及探测失败时）界面会短暂/持续显示
+       *    一堆用户明确说不要的旧模型。
+       *
+       * 用 `expandTiers` 做同样的归一（它现在是「过滤 + 折叠」，
+       * 不再展开档位）—— 保证「探测期目录」与「最终目录」用同一套规则。
+       */
+      {
+        const { expandTiers } = await import('../core/gemini-catalog.js')
+        catalogModels = expandTiers(candidates)
+      }
 
       /**
        * 逐个探测可用性。
@@ -1076,7 +1128,34 @@ export async function createGeminiProvider(
            * 故策略：**先裸名、失败再试 `-medium`**（两个都不行才剔除）。
            * 每条探测最多两次请求，但正确性远比省一次请求重要。
            */
-          const candidateNames = [model.id, `${model.id}-medium`]
+          /**
+           * ⚠️ **固定档位的族（hydrogen/argon）不能按常规试名**（2026-11-14）。
+           *
+           * 它们的**裸名与 low/medium/high 全 404，只有 `-xhigh` / `-high` 可用**
+           * （与 CPA 暴露的一致）。而下面「先裸名、再试 -medium」的常规策略
+           * 对它们只会试两个必然失败的名字。
+           *
+           * 故：带 `-xhigh`/`-high` 后缀的 id **只试它自己**，且用**对应的档位**
+           * （xhigh→high tier、high→high tier）—— 档位与后缀不匹配时上游可能
+           * 直接 404（实测：`-xhigh` + tier=medium ⇒ 失败）。
+           */
+          const fixedTier = /-xhigh$/.test(model.id)
+            ? 'high'
+            : /-high$/.test(model.id) && /^gemini-4-/.test(model.id) ? 'high' : undefined
+          /**
+           * ⚠️ **固定档位族要试「裸名」**（2026-11-14 实测补齐）。
+           *
+           * 对照：CPA 反代调用 `gemini-4-hydrogen-xhigh` 成功后，**响应里的
+           * `model` 字段是 `gemini-4-hydrogen`（裸名）** —— 说明它发给上游的
+           * 模型名可能不带后缀，档位靠 `thinkingLevel` 之类参数表达。
+           *
+           * 故对这些族试三个名字：裸名 / 原 id / 裸名+medium，
+           * 全部失败才剔除（多一次请求换正确性）。
+           */
+          const baseId = fixedTier === undefined ? undefined : model.id.replace(/-(xhigh|high)$/, '')
+          const candidateNames = fixedTier === undefined
+            ? [model.id, `${model.id}-medium`]
+            : [baseId!, model.id, `${baseId!}-medium`]
           let text = ''
           let probed = false
           /** 实测哪个名字成功 ⇒ 据此决定"是否要档位后缀"（见 needsEffortSuffix）。 */
@@ -1086,7 +1165,7 @@ export async function createGeminiProvider(
             //    API 文档明示 "maxOutputTokens must be GREATER than thinkingBudget"）。
             const envelope = translateGeminiRequest({
               modelId: model.id,
-              spec: { upstream, tier: 'medium', thinkingBudget: 2000, includeThoughts: true },
+              spec: { upstream, tier: fixedTier ?? 'medium', thinkingBudget: 2000, includeThoughts: true },
               messages: [{ role: 'user', content: [{ type: 'text', text: 'Reply exactly: OK' }] }],
               project,
               sessionLane: 'probe',
