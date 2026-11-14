@@ -1151,6 +1151,17 @@ export class OverviewServer {
     const data: unknown[] = []
     const created = Math.floor(Date.now() / 1000)
     for (const provider of this.liveProviders()) {
+      /**
+       * ⚠️⚠️ **已隐藏的渠道不能出现在模型列表里**（真实缺陷，2026-11-14 用户报障）。
+       *
+       * 之前只在 `apiOverview`（供应商卡片）和前端页签上做了隐藏，
+       * 漏了 `/v1/models` —— 于是 build 虽然卡片不见了，
+       * **14 个 `build/*` 模型仍然出现在客户端的模型选择列表里**
+       * （用户截图：编辑 OpenCode 时列表里有 7 个 build/* 条目）。
+       *
+       * 客户端按 `/v1/models` 渲染可选项，所以这里才是「源头」。
+       */
+      if (isCatalogHidden(provider.id)) continue
       try {
         const models = await provider.adapter.listModels(provider.id)
         for (const model of models) {

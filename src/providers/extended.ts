@@ -1100,7 +1100,34 @@ export async function createGeminiProvider(
               signal: AbortSignal.timeout(30_000),
             })
             if (!response.ok) {
-              await response.text().catch(() => '')
+              const errorText = await response.text().catch(() => '')
+              /**
+               * ⚠️⚠️ **429 / 5xx 不是「模型不可用」，是「现在问不了」**（真实缺陷，2026-11-14）。
+               *
+               * 实测（本机直接探上游，绕开目录）：
+               *
+               * | 名字 | 状态 | 含义 |
+               * |---|---|---|
+               * | `claude-opus-5-5` | 404 | 裸名确实不存在（要加档位后缀） |
+               * | `claude-opus-5-5-medium` | **429** `Individual quota reached` | **模型在，只是配额用完了** |
+               *
+               * 原代码 `if (!response.ok) continue` 把两者混为一谈 ⇒ 两个名字都"失败"
+               * ⇒ 判定「模型已下线」⇒ **从目录里永久剔除**。
+               * 后果：配额恢复后目录也不会自己长回来，用户看到「agy 只剩 3 个模型」。
+               *
+               * 正确做法：**遇到 429 / 5xx 直接放弃本次探测，并保留原目录里该模型的条目**
+               * （`abort: true` 让外层不再尝试下一个名字、也不剔除）。
+               */
+              const transient = response.status === 429
+                || response.status === 500
+                || response.status === 502
+                || response.status === 503
+                || response.status === 504
+              if (transient) {
+                throw new TransientProbeError(
+                  `上游 ${response.status}（暂时不可用，保留原条目）：${errorText.slice(0, 120)}`,
+                )
+              }
               continue
             }
             const body = response.body
@@ -1127,6 +1154,19 @@ export async function createGeminiProvider(
           //    否则 claude / gemini-2.5 系会被拼上后缀而 404。
           usable.push({ ...model, needsEffortSuffix: usedSuffix ?? true })
         } catch (error) {
+          if (error instanceof TransientProbeError) {
+            /**
+             * **暂时性失败（429/5xx）：保留原条目，不剔除。**
+             *
+             * 为什么保留而不是丢弃：目录是「用户能看到哪些模型」的唯一来源，
+             * 因为一次配额耗尽就永久删掉条目，配额恢复后也不会自己回来 ——
+             * 用户只能手动点「重拉」碰运气。保留原条目最多是「暂时用不了」，
+             * 而删除是「彻底看不见」。
+             */
+            gateway.logger.info(`Gemini 模型 ${model.id} 暂时不可用，保留原条目（${error.message}）`)
+            usable.push(model)
+            continue
+          }
           gateway.logger.warn(`Gemini 模型 ${model.id} 探测失败，已剔除:`, error)
         }
       }
@@ -1566,6 +1606,19 @@ export async function createOfficeAceProvider(
  * host 路由拦截器接管（`*.googleapis.com` 已在其匹配列表），故这里只需
  * **安装该拦截器**（与反重力渠道同一个）。
  */
+/**
+ * 探测阶段的**暂时性失败**（429 限流 / 5xx 服务端错误）。
+ *
+ * ⚠️ 与「模型不存在」严格区分：这个异常表示「模型可能是好的，但现在问不了」，
+ *    调用方应**保留原目录条目**而不是剔除。详见 catch 处的注释。
+ */
+class TransientProbeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'TransientProbeError'
+  }
+}
+
 export async function createAiStudioProvider(
   dataDir: string,
   logLevel?: 'debug' | 'info' | 'warn' | 'error',
